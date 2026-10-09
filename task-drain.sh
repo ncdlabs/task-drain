@@ -1095,13 +1095,74 @@ cmd_watch() { # [renderer] -- live alternate-screen display, q quits
 	trap - EXIT INT TERM WINCH
 }
 
+# Autoscale supervisor: watches queue depth, scales workers to match.
+# Runs as a daemon via `drain autoscale`. Stops on SIGTERM or STOP file.
+autoscale_supervisor() {
+	local min_w="${DRAIN_MIN_WORKERS:-1}"
+	local max_w="${DRAIN_MAX_WORKERS:-8}"
+	local interval="${DRAIN_AUTOSCALE_INTERVAL:-30}"
+	local tasks_per_worker="${DRAIN_TASKS_PER_WORKER:-2}"
+	log "autoscaler starting (min=$min_w max=$max_w interval=${interval}s)"
+
+	trap 'log "autoscaler stopping"; exit 0' TERM INT
+
+	while true; do
+		# Stop if kill switch tripped
+		if [ -e "$STOP_FILE" ]; then
+			log "autoscaler: STOP file present, exiting"
+			exit 0
+		fi
+
+		# Sync and count eligible tasks
+		$TASK sync >/dev/null 2>&1 || log "autoscaler: sync failed, using local state"
+		local eligible
+		eligible=$(tq +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed count 2>/dev/null || echo "0")
+		[[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
+
+		# Count running workers
+		local running
+		running=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | wc -l | tr -d ' ')
+		[[ "$running" =~ ^[0-9]+$ ]] || running=0
+		# Exclude ourselves from the count
+		running=$(( running > 0 ? running - 1 : 0 ))
+
+		# Desired workers: enough to cover eligible tasks, clamped to [min, max]
+		local desired=$(( (eligible + tasks_per_worker - 1) / tasks_per_worker ))
+		[ "$desired" -lt "$min_w" ] && desired="$min_w"
+		[ "$desired" -gt "$max_w" ] && desired="$max_w"
+		# If nothing eligible and min is 0, scale to zero
+		if [ "$eligible" -eq 0 ] && [ "$min_w" -eq 0 ]; then desired=0; fi
+
+		if [ "$desired" -gt "$running" ]; then
+			local to_start=$(( desired - running ))
+			log "autoscaler: eligible=$eligible running=$running -> starting $to_start worker(s)"
+			for _i in $(seq 1 "$to_start"); do
+				local logf="$LOG_DIR/worker-$(date '+%Y%m%d-%H%M%S')-autoscale-$_.log"
+				nohup bash "$DRAIN_SCRIPT" >>"$logf" 2>&1 &
+			done
+		elif [ "$desired" -lt "$running" ]; then
+			local to_stop=$(( running - desired ))
+			log "autoscaler: eligible=$eligible running=$running -> stopping $to_stop worker(s) gracefully"
+			# Signal excess workers via per-worker STOP files (they finish current task)
+			local pids
+			pids=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | grep -v "^$$$" | head -"$to_stop")
+			for pid in $pids; do
+				touch "$DRAIN_HOME/STOP.$pid" 2>/dev/null
+			done
+		fi
+
+		sleep "$interval"
+	done
+}
+
 case "${1:-run}" in
 run) run_worker ;;
+autoscale) autoscale_supervisor ;;
 status) cmd_status ;;
 watch) cmd_watch ;;
 workers) cmd_watch cmd_workers ;;
 *)
-	echo "usage: bash $0 [run|status|watch|workers]" >&2
+	echo "usage: bash $0 [run|status|watch|workers|autoscale]" >&2
 	exit 2
 	;;
 esac

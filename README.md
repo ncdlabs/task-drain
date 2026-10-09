@@ -98,12 +98,33 @@ drain status --workers         # live per-worker view
 drain logs [-f]                # tail worker logs
 drain stop                     # graceful stop (finish current task, then exit)
 drain kill                     # immediate stop (claims released to pending)
+drain autoscale [project]      # supervisor daemon: auto-scale workers to queue depth
+drain autoscale-stop           # stop the autoscaler (workers keep running)
 drain resume                   # clear the STOP file (doesn't start workers)
 drain docs                     # pickup rules, tags, kill switch, safety dials
 ```
 
 The kill switch also works by hand: `touch ~/.task-drain/STOP` stops workers
 gracefully; `pkill -TERM -f task-drain.sh` stops them immediately.
+
+## Autoscaling
+
+`drain autoscale` starts a supervisor daemon that watches queue depth and
+scales workers automatically:
+
+- **Scale up:** when eligible tasks exceed `workers × DRAIN_TASKS_PER_WORKER`
+- **Scale down:** when workers exceed what's needed (graceful — workers finish
+  their current task via per-worker STOP files)
+- Clamped to [`DRAIN_MIN_WORKERS`, `DRAIN_MAX_WORKERS`]
+- Checks every `DRAIN_AUTOSCALE_INTERVAL` seconds
+
+```bash
+drain autoscale                  # min 1, max 8, all projects
+drain autoscale myproject --min 2 --max 4
+drain autoscale-stop             # stop supervisor, leave workers running
+```
+
+The supervisor respects the global STOP file and exits cleanly on SIGTERM.
 
 ## Tags
 
@@ -132,6 +153,10 @@ Environment variables (export them before `drain start`, or edit the top of
 | `PROJECT_FILTER` | (unset) | Limit one worker run to a single project |
 | `STALE_AFTER_SEC` | `14400` (4h) | Release worker claims older than this |
 | `TASK_TIMEOUT_SEC` | `14400` (4h) | Per-task wall clock (needs `gtimeout`) |
+| `DRAIN_MIN_WORKERS` | `1` | Autoscaler: minimum workers |
+| `DRAIN_MAX_WORKERS` | `8` | Autoscaler: maximum workers |
+| `DRAIN_AUTOSCALE_INTERVAL` | `30` | Autoscaler: seconds between queue checks |
+| `DRAIN_TASKS_PER_WORKER` | `2` | Autoscaler: eligible tasks per worker before scaling up |
 | `DRAIN_RETRY_FAILED` | `0` | `1` = reprocess `drain-failed` instead of the regular queue (normally set via `drain start --failed`) |
 
 **Project → repo mapping.** `repo_for_project()` in `task-drain.sh` maps

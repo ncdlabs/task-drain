@@ -28,6 +28,13 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #                        N = stop N workers (newest first).
 #   drain kill           immediate stop: TERM workers mid-task (in-flight
 #                        tasks are released back to pending, cleanly)
+#   drain autoscale [project] [--min N] [--max N]
+#                        supervisor daemon: watches queue depth and scales
+#                        workers up/down automatically. Defaults: --min 1,
+#                        --max 8. Env: DRAIN_MIN_WORKERS, DRAIN_MAX_WORKERS,
+#                        DRAIN_AUTOSCALE_INTERVAL (sec, default 30),
+#                        DRAIN_TASKS_PER_WORKER (default 2).
+#   drain autoscale-stop stop the autoscaler (workers keep running)
 #   drain resume         clear the STOP file (does not start workers)
 #   drain logs [-f]      tail worker logs (follow with -f)
 #   drain help
@@ -160,6 +167,57 @@ cmd_start() { # [N] [project|all] [--failed]
   else
     echo "They'll work until the queue is empty, then exit. 'drain stop' to halt."
   fi
+}
+
+cmd_autoscale() { # [project] [--min N] [--max N]
+  # Supervisor daemon: watches queue depth and scales workers up/down.
+  need_script
+  local project="" min_w="" max_w="" a
+  for a in "$@"; do
+    case "$a" in
+      --min) shift; min_w="$1"; shift ;;
+      --max) shift; max_w="$1"; shift ;;
+      --min=*) min_w="${a#--min=}" ;;
+      --max=*) max_w="${a#--max=}" ;;
+      "") ;;
+      -*) die "unknown autoscale option: $a (try: drain help)" ;;
+      *) [ -z "$project" ] || die "unexpected argument: $a"; project="$a" ;;
+    esac
+  done
+  [ "$project" = "all" ] && project=""
+  min_w="${min_w:-${DRAIN_MIN_WORKERS:-1}}"
+  max_w="${max_w:-${DRAIN_MAX_WORKERS:-8}}"
+  [[ "$min_w" =~ ^[0-9]+$ ]] || die "--min must be a non-negative integer"
+  [[ "$max_w" =~ ^[1-9][0-9]*$ ]] || die "--max must be a positive integer"
+  [ "$min_w" -le "$max_w" ] || die "--min cannot exceed --max"
+
+  local pidfile="$DRAIN_HOME/autoscale.pid"
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    die "autoscaler already running (pid $(cat "$pidfile")). 'drain autoscale-stop' first."
+  fi
+
+  mkdir -p "$LOG_DIR"
+  [ -n "$project" ] && export PROJECT_FILTER="$project"
+  export DRAIN_MIN_WORKERS="$min_w" DRAIN_MAX_WORKERS="$max_w"
+
+  echo "starting autoscaler (min=$min_w max=$max_w${project:+ project=$project})..."
+  nohup bash "$DRAIN_SCRIPT" autoscale >>"$LOG_DIR/autoscale.log" 2>&1 &
+  echo $! > "$pidfile"
+  echo "autoscaler running (pid $!). 'drain autoscale-stop' to halt."
+}
+
+cmd_autoscale_stop() {
+  local pidfile="$DRAIN_HOME/autoscale.pid"
+  if [ ! -f "$pidfile" ]; then echo "no autoscaler running."; return 0; fi
+  local pid
+  pid=$(cat "$pidfile")
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null
+    echo "autoscaler (pid $pid) stopping..."
+  else
+    echo "autoscaler pid $pid not running; cleaning up."
+  fi
+  rm -f "$pidfile"
 }
 
 cmd_stop() { # [N|all] -- default all
@@ -329,6 +387,8 @@ case "${1:-}" in
   start)  shift; cmd_start "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   kill)   cmd_kill ;;
+  autoscale) shift; cmd_autoscale "$@" ;;
+  autoscale-stop) cmd_autoscale_stop ;;
   resume) cmd_resume ;;
   logs)   shift; cmd_logs "${1:-}" ;;
   help|--help|-h) cmd_help ;;
