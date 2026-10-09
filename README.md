@@ -39,10 +39,12 @@ waiting, blocked, or tagged `noauto` / `drain-failed`.
 ```bash
 git clone https://github.com/ncdlabs/task-drain.git
 cd task-drain
-chmod +x task-drain.sh drain
-# put them somewhere on your PATH, e.g.:
-cp task-drain.sh drain ~/bin/
+./install.sh
 ```
+
+This symlinks (not copies) `task-drain.sh` and `drain` into `~/bin/`,
+so `git pull` in the repo updates your install. Set `PREFIX=/usr/local`
+to install into `/usr/local/bin` instead.
 
 Both scripts are executable; invoke `drain` directly (no `bash` prefix needed).
 
