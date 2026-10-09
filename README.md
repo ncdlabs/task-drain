@@ -11,8 +11,19 @@ waiting, blocked, or tagged `noauto` / `drain-failed`.
 ## Prerequisites
 
 - **Taskwarrior 3.x** with [TaskChampion sync](https://github.com/GothenburgBitFactory/taskchampion)
-  configured (the scripts expect a shared sync pool; plain local Taskwarrior
-  works too, minus the multi-machine story)
+  configured against a sync server. This is a hard requirement — workers abort
+  if the initial sync fails ("never work offline"). The shared sync pool is
+  what makes multi-machine workers possible.
+- **A TaskChampion sync server.** Self-host
+  [taskchampion-sync-server](https://github.com/GothenburgBitFactory/taskchampion-sync-server)
+  (Rust; `cargo install --path .` from that repo, or use their Docker image),
+  then point Taskwarrior at it:
+  ```
+  task config sync.server.url https://your-sync-server.example
+  task config sync.server.client_id $(uuidgen)
+  ```
+  Each machine needs its own `client_id` and its own `data.location`.
+  There is currently no public hosted TaskChampion sync service.
 - **OpenCode CLI v2** (`opencode`) on PATH — workers invoke `opencode run`
   with `--standalone --dangerously-skip-permissions`
 - **jq** (queue queries are parsed with `jq`)
