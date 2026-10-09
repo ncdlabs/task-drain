@@ -38,6 +38,9 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #   drain autoscale-stop stop the autoscaler (workers keep running)
 #   drain resume         clear the STOP file (does not start workers)
 #   drain logs [-f]      tail worker logs (follow with -f)
+#   drain projects       list configured project → repo mappings
+#   drain projects merge <destination> <source...>
+#                        merge source projects into destination (moves all tasks)
 #   drain help
 #
 # Workers log to ~/.task-drain/logs/worker-<timestamp>-<pid>-N.log.
@@ -284,6 +287,128 @@ cmd_logs() { # [-f]
   fi
 }
 
+cmd_projects() { # list configured project → repo mappings
+  local conf="$HOME/.task-drain/repos.conf"
+  local GIT_ROOT="${GIT_ROOT:-$HOME/git}"
+  local DRAIN_SCRIPT="$SCRIPT_DIR/task-drain.sh"
+  local TASK="${TASK:-$(command -v task 2>/dev/null || echo /opt/homebrew/bin/task)}"
+  echo "Configured project → repo mappings:"
+  echo
+  # 1. repos.conf entries
+  if [ -f "$conf" ]; then
+    echo "  ~/.task-drain/repos.conf:"
+    while IFS='=' read -r proj path; do
+      case "$proj" in '' | \#*) continue ;; esac
+      path="${path/#\~/$HOME}"
+      path="${path//\$HOME/$HOME}"
+      if [ -d "$path" ]; then
+        echo "    $proj → $path"
+      else
+        echo "    $proj → $path (missing)"
+      fi
+    done <"$conf"
+    echo
+  fi
+  # 2. Built-in table from task-drain.sh
+  echo "  Built-in table (from task-drain.sh):"
+  local projs=(attendeesync ncdlabs ncdlabs-assure ncdlabs-changepress ncdlabs-site-access-policies agentx innercircles gitseer meridian solfoundation)
+  for proj in "${projs[@]}"; do
+    local repo="$GIT_ROOT/$proj"
+    case "$proj" in
+      ncdlabs) repo="$GIT_ROOT/ncdlabs.com" ;;
+      solfoundation) repo="$GIT_ROOT/wp-solfoundation-plugin" ;;
+    esac
+    if [ -d "$repo" ]; then
+      echo "    $proj → $repo"
+    else
+      echo "    $proj → $repo (missing)"
+    fi
+  done
+  echo
+  # 3. Auto-detected from GIT_ROOT
+  echo "  Auto-detected repos in $GIT_ROOT:"
+  local found=0
+  for dir in "$GIT_ROOT"/*/; do
+    [ -d "$dir" ] || continue
+    local name
+    name=$(basename "$dir")
+    # Skip if already listed above
+    if [ -f "$conf" ] && grep -q "^${name}=" "$conf"; then continue; fi
+    case " ${projs[*]} " in *" $name "*) continue ;; esac
+    echo "    $name → $dir"
+    found=1
+  done
+  [ "$found" = 0 ] && echo "    (none)"
+  echo
+  # 4. Projects with tasks
+  echo "  Projects with pending tasks:"
+  local tasks_projs
+  tasks_projs=$("$TASK" _projects 2>/dev/null 2>/dev/null || echo "")
+  if [ -n "$tasks_projs" ]; then
+    for proj in $tasks_projs; do
+      local count
+      count=$("$TASK" "project:$proj" +PENDING -ACTIVE -WAITING count 2>/dev/null || echo "0")
+      [ "$count" -gt 0 ] && echo "    $proj ($count pending)"
+    done
+  else
+    echo "    (none)"
+  fi
+}
+
+cmd_projects_merge() { # <destination> <source...>
+  if [ $# -lt 2 ]; then
+    die "usage: drain projects merge <destination> <source...> — needs at least 2 projects"
+  fi
+  local dest="$1"; shift
+  local sources=("$@")
+  # Safety: prevent merging a project into itself
+  for src in "${sources[@]}"; do
+    if [ "$src" = "$dest" ]; then
+      die "cannot merge project '$dest' into itself"
+    fi
+  done
+  local conf="$HOME/.task-drain/repos.conf"
+  echo "Merging projects into '$dest':"
+  echo "  destination: $dest"
+  echo "  sources: ${sources[*]}"
+  echo
+  # Safety: confirm destination doesn't already have tasks (unless --force)
+  local dest_count
+  dest_count=$("$TASK" "project:$dest" +PENDING -ACTIVE -WAITING count 2>/dev/null || echo "0")
+  local total_moved=0
+  for src in "${sources[@]}"; do
+    local src_count
+    src_count=$("$TASK" "project:$src" +PENDING -ACTIVE -WAITING count 2>/dev/null || echo "0")
+    if [ "$src_count" -eq 0 ]; then
+      echo "  $src: no pending tasks, skipping"
+      continue
+    fi
+    echo "  moving $src_count task(s) from $src → $dest ..."
+    # Move pending, active, waiting, and completed tasks
+    "$TASK" "project:$src" modify project:"$dest" 2>/dev/null || true
+    total_moved=$((total_moved + src_count))
+  done
+  echo
+  echo "Moved $total_moved total task(s) into '$dest'."
+  # Update repos.conf if any source had a mapping
+  if [ -f "$conf" ]; then
+    local needs_update=0
+    for src in "${sources[@]}"; do
+      if grep -q "^${src}=" "$conf"; then
+        needs_update=1
+        break
+      fi
+    done
+    if [ "$needs_update" = 1 ]; then
+      echo
+      echo "Note: some source projects have repo mappings in $conf."
+      echo "Review and update: $conf"
+    fi
+  fi
+  echo
+  echo "Run 'task sync' to sync the changes."
+}
+
 cmd_help() {
   if [ $# -gt 0 ]; then
     help_for "$1"
@@ -448,6 +573,37 @@ OPTIONS
 Logs are at ~/.task-drain/logs/worker-<timestamp>-<pid>-N.log
 HELP
       ;;
+    projects)
+      cat <<'HELP'
+drain projects — list configured project → repo mappings
+
+USAGE
+  drain projects
+
+Shows all project → repo mappings from:
+  1. ~/.task-drain/repos.conf (primary)
+  2. Built-in table in task-drain.sh
+  3. Auto-detected repos in $GIT_ROOT
+  4. Projects with pending tasks
+HELP
+      ;;
+    projects-merge)
+      cat <<'HELP'
+drain projects merge — merge source projects into a destination
+
+USAGE
+  drain projects merge <destination> <source...>
+
+Moves all tasks from each source project into the destination project.
+At least 2 projects required (1 destination + 1+ sources).
+
+EXAMPLES
+  drain projects merge myproject old-project-a old-project-b
+  drain projects merge solfoundation solfoundation.brevo-cleanup
+
+After merging, run: task sync
+HELP
+      ;;
     docs)
       cat <<'HELP'
 drain docs — extended documentation
@@ -604,6 +760,21 @@ case "${1:-}" in
   autoscale-stop) cmd_autoscale_stop ;;
   resume) cmd_resume ;;
   logs)   shift; cmd_logs "${1:-}" ;;
+  projects)
+    shift
+    if [ $# -gt 0 ] && [ "$1" = "merge" ]; then
+      shift
+      if [ $# -gt 0 ] && [ "$1" = "help" ]; then
+        help_for projects-merge
+      else
+        cmd_projects_merge "$@"
+      fi
+    elif [ $# -gt 0 ] && [ "$1" = "help" ]; then
+      help_for projects
+    else
+      cmd_projects "$@"
+    fi
+    ;;
   help|--help|-h)
     if [ $# -ge 2 ] && [ -n "$2" ]; then cmd_help "$2"; else cmd_help; fi
     ;;
