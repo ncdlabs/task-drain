@@ -165,16 +165,16 @@ cmd_start() { # [N] [project|all] [--failed]
 cmd_autoscale() { # [project] [--min N] [--max N]
   # Supervisor daemon: watches queue depth and scales workers up/down.
   need_script
-  local project="" min_w="" max_w="" a
-  for a in "$@"; do
-    case "$a" in
-      --min) shift; min_w="$1"; shift ;;
-      --max) shift; max_w="$1"; shift ;;
-      --min=*) min_w="${a#--min=}" ;;
-      --max=*) max_w="${a#--max=}" ;;
-      "") ;;
-      -*) die "unknown autoscale option: $a (try: drain help)" ;;
-      *) [ -z "$project" ] || die "unexpected argument: $a"; project="$a" ;;
+  local project="" min_w="" max_w=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --min) [ $# -ge 2 ] || die "--min requires a value"; min_w="$2"; shift 2 ;;
+      --max) [ $# -ge 2 ] || die "--max requires a value"; max_w="$2"; shift 2 ;;
+      --min=*) min_w="${1#--min=}" ;;
+      --max=*) max_w="${1#--max=}" ;;
+      "") shift ;;
+      -*) die "unknown autoscale option: $1 (try: drain help autoscale)" ;;
+      *) [ -z "$project" ] || die "unexpected argument: $1"; project="$1"; shift ;;
     esac
   done
   [ "$project" = "all" ] && project=""
@@ -285,7 +285,200 @@ cmd_logs() { # [-f]
 }
 
 cmd_help() {
-  awk 'NR<2{next} /^#/||/^$/{print; next} {exit}' "$0" | sed 's/^# //; s/^#//'
+  if [ $# -gt 0 ]; then
+    help_for "$1"
+  else
+    awk 'NR==1{next} found{ if(/^#/||/^$/) print; else exit } /^#/{found=1; print}' "$0" | sed 's/^# //; s/^#//'
+  fi
+}
+
+help_for() {
+  case "$1" in
+    status)
+      cat <<'HELP'
+drain status — show worker pool status
+
+USAGE
+  drain status [project] [-w|--watch] [--workers] [--verbose]
+
+ARGUMENTS
+  project          Limit to one project (e.g. drain status attendeesync)
+                   'all' or no argument = all projects
+
+OPTIONS
+  -w, --watch      Live display, refreshes every DRAIN_WATCH_INTERVAL sec
+  --workers        Live per-worker view: each worker's current task and
+                   time-budget meter
+  -v, --verbose    Show full task lists instead of the capped summary
+
+EXAMPLES
+  drain status
+  drain status attendeesync
+  drain status --watch
+  drain status attendeesync --workers --verbose
+HELP
+      ;;
+    start)
+      cat <<'HELP'
+drain start — start background workers
+
+USAGE
+  drain start [N] [project|all] [--failed]
+
+ARGUMENTS
+  N                Number of workers to start (default 2, max 8)
+  project          Limit to one project (e.g. drain start 3 attendeesync)
+                   'all' or no argument = take tasks from any project
+
+OPTIONS
+  --failed         Reprocess drain-failed tasks instead of the regular queue
+
+EXAMPLES
+  drain start
+  drain start 4
+  drain start 3 attendeesync
+  drain start 2 --failed
+  drain start 2 attendeesync --failed
+
+Workers loop: sync -> pick highest-urgency eligible task -> claim it ->
+run `opencode run` -> verify -> repeat until queue is empty, then exit.
+HELP
+      ;;
+    stop)
+      cat <<'HELP'
+drain stop — graceful stop
+
+USAGE
+  drain stop [N|all] [--force]
+
+ARGUMENTS
+  N                Stop N workers (newest first). N >= running stops all.
+  all              Stop all workers (default)
+
+OPTIONS
+  --force          Immediate stop (TERM mid-task, like drain kill)
+
+EXAMPLES
+  drain stop
+  drain stop all
+  drain stop 2
+  drain stop --force
+
+With no --force: workers finish their current task, pick up nothing new,
+then exit. With --force: workers are killed immediately; in-flight tasks
+are released back to pending.
+HELP
+      ;;
+    kill)
+      cat <<'HELP'
+drain kill — immediate stop
+
+USAGE
+  drain kill
+
+TERM workers mid-task. In-flight tasks are released back to pending.
+Same as `drain stop --force`.
+HELP
+      ;;
+    autoscale)
+      cat <<'HELP'
+drain autoscale — supervisor daemon that scales workers to queue depth
+
+USAGE
+  drain autoscale [project] [--min N] [--max N]
+
+ARGUMENTS
+  project          Limit to one project (e.g. drain autoscale attendeesync)
+                   'all' or no argument = all projects
+
+OPTIONS
+  --min N          Minimum workers to keep running (default 1)
+  --max N          Maximum workers to start (default 8)
+
+ENVIRONMENT
+  DRAIN_MIN_WORKERS         Default for --min (default 1)
+  DRAIN_MAX_WORKERS         Default for --max (default 8)
+  DRAIN_AUTOSCALE_INTERVAL  Seconds between checks (default 30)
+  DRAIN_TASKS_PER_WORKER    Eligible tasks per worker (default 2)
+
+EXAMPLES
+  drain autoscale
+  drain autoscale attendeesync
+  drain autoscale --min 2 --max 6
+  drain autoscale attendeesync --min 0 --max 10
+
+The autoscaler counts eligible tasks, computes desired workers as
+ceil(eligible / DRAIN_TASKS_PER_WORKER), clamps to [--min, --max], then
+starts or stops workers to match. If eligible=0 and min=0, it scales to
+zero. Stop with: drain autoscale-stop
+HELP
+      ;;
+    autoscale-stop)
+      cat <<'HELP'
+drain autoscale-stop — stop the autoscaler
+
+USAGE
+  drain autoscale-stop
+
+Stops the autoscaler daemon. Workers already running are NOT affected —
+they keep working until the queue is empty or they are stopped.
+HELP
+      ;;
+    resume)
+      cat <<'HELP'
+drain resume — clear the kill switch
+
+USAGE
+  drain resume
+
+Removes ~/.task-drain/STOP and all per-worker STOP.<pid> files. Does not
+start workers — use `drain start` to launch them.
+HELP
+      ;;
+    logs)
+      cat <<'HELP'
+drain logs — view worker logs
+
+USAGE
+  drain logs [-f]
+
+OPTIONS
+  -f               Follow (tail -f) all worker logs
+
+Logs are at ~/.task-drain/logs/worker-<timestamp>-<pid>-N.log
+HELP
+      ;;
+    docs)
+      cat <<'HELP'
+drain docs — extended documentation
+
+USAGE
+  drain docs
+
+Shows detailed docs on pickup rules, tags (noauto, drain-failed,
+drain-claimed), retrying failed tasks, the agent prompt, stopping, and
+safety dials.
+HELP
+      ;;
+    help)
+      cat <<'HELP'
+drain help — show help
+
+USAGE
+  drain help              List all commands
+  drain help <command>     Detailed help for one command
+  drain <command> help    Same as above
+
+EXAMPLES
+  drain help
+  drain help autoscale
+  drain autoscale help
+HELP
+      ;;
+    *)
+      die "no help for unknown command: $1"
+      ;;
+  esac
 }
 
 cmd_docs() {
@@ -390,6 +583,16 @@ SAFETY DIALS (env vars, or edit at the top of task-drain.sh)
 DOCS_EOF
 }
 
+# Second-level help: drain <cmd> help
+if [ $# -ge 2 ]; then
+  case "$2" in
+    help|--help|-h)
+      cmd_help "$1"
+      exit 0
+      ;;
+  esac
+fi
+
 case "${1:-}" in
   "") cmd_help ;;
   status) shift; cmd_status "$@" ;;
@@ -401,6 +604,8 @@ case "${1:-}" in
   autoscale-stop) cmd_autoscale_stop ;;
   resume) cmd_resume ;;
   logs)   shift; cmd_logs "${1:-}" ;;
-  help|--help|-h) cmd_help ;;
+  help|--help|-h)
+    if [ $# -ge 2 ] && [ -n "$2" ]; then cmd_help "$2"; else cmd_help; fi
+    ;;
   *)      die "unknown command: $1 (try: drain help)" ;;
 esac

@@ -213,3 +213,38 @@ load_functions() {
     [[ " ${OPENCODE_RUN_FLAGS[*]} " == *"--dangerously-skip-permissions"* ]]
     unset DRAIN_SKIP_PERMISSIONS
 }
+
+# --- drain CLI help system ---
+
+@test "drain help produces output" {
+    run "$SCRIPT_DIR/drain" help
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+    [[ "$output" == *"autoscale"* ]]
+    [[ "$output" == *"status"* ]]
+}
+
+@test "drain help autoscale shows autoscale help" {
+    run "$SCRIPT_DIR/drain" help autoscale
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--min"* ]]
+    [[ "$output" == *"--max"* ]]
+    [[ "$output" == *"DRAIN_AUTOSCALE_INTERVAL"* ]]
+}
+
+@test "drain autoscale help shows autoscale help" {
+    run "$SCRIPT_DIR/drain" autoscale help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--min"* ]]
+    [[ "$output" == *"--max"* ]]
+}
+
+@test "drain help unknown command fails" {
+    run "$SCRIPT_DIR/drain" help nonexistent
+    [ "$status" -ne 0 ]
+}
+
+@test "drain autoscale --min 2 --max 4 parses correctly" {
+    run "$SCRIPT_DIR/drain" autoscale --min 2 --max 4
+    [[ "$output" != *"unexpected argument"* ]]
+}

@@ -170,13 +170,14 @@ on_signal() {
 }
 trap on_signal INT TERM
 
-# EDIT THIS: map your Taskwarrior project names to repo paths.
-# The entries below are examples -- replace them with your own projects.
-# You can also (or instead) add overrides in ~/.task-drain/repos.conf,
-# one per line:   myproject=$HOME/git/myrepo   (or ~/git/myrepo)
-# Entries in repos.conf take precedence over the built-in table.
+# Project → repo mapping:
+# 1. repos.conf (~/.task-drain/repos.conf) is PRIMARY — one per line:
+#      myproject=$HOME/git/myrepo   (or ~/git/myrepo)
+# 2. Auto-detect: scan $GIT_ROOT for a directory matching the project name
+# 3. Built-in table below is the fallback (for backwards compatibility)
 repo_for_project() {
 	local conf="$HOME/.task-drain/repos.conf" proj path
+	# 1. repos.conf (primary)
 	if [ -f "$conf" ]; then
 		while IFS='=' read -r proj path; do
 			case "$proj" in '' | \#*) continue ;; esac
@@ -188,6 +189,12 @@ repo_for_project() {
 			fi
 		done <"$conf"
 	fi
+	# 2. Auto-detect: look for a directory matching the project name
+	if [ -d "$GIT_ROOT/${1:-}" ]; then
+		echo "$GIT_ROOT/${1:-}"
+		return 0
+	fi
+	# 3. Built-in fallback table
 	case "${1:-}" in
 	attendeesync) echo "$GIT_ROOT/attendeesync" ;;
 	ncdlabs) echo "$GIT_ROOT/ncdlabs.com" ;;
