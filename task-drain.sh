@@ -494,10 +494,10 @@ cmd_status() {
 	drain_terminal_setup
 	local B="$DRAIN_B" C="$DRAIN_C" G="$DRAIN_G" Y="$DRAIN_Y" R="$DRAIN_R" M="$DRAIN_M" DIM="$DRAIN_DIM" RESET="$DRAIN_RESET"
 	local cols="$DRAIN_COLS"
-	alias divider=drain_divider
-	alias section=drain_section
-	alias trunc_str=drain_trunc_str
-	alias bar=drain_bar
+	divider() { drain_divider "$@"; }
+	section() { drain_section "$@"; }
+	trunc_str() { drain_trunc_str "$@"; }
+	bar() { drain_bar "$@"; }
 
 	# Optional project scoping (`drain status <project>` sets PROJECT_FILTER).
 	# tq = task query with the scope applied; plain $TASK stays global (sync).
@@ -828,10 +828,10 @@ cmd_workers() {
 	drain_terminal_setup
 	local B="$DRAIN_B" C="$DRAIN_C" G="$DRAIN_G" Y="$DRAIN_Y" R="$DRAIN_R" M="$DRAIN_M" DIM="$DRAIN_DIM" RESET="$DRAIN_RESET"
 	local cols="$DRAIN_COLS"
-	alias divider=drain_divider
-	alias trunc_str=drain_trunc_str
-	alias meter=drain_meter
-	alias fmt_dur=drain_fmt_dur
+	divider() { drain_divider "$@"; }
+	trunc_str() { drain_trunc_str "$@"; }
+	meter() { drain_meter "$@"; }
+	fmt_dur() { drain_fmt_dur "$@"; }
 	fit() { # $1=text $2=fixed-overhead -> text truncated to fit $cols (min 10)
 		local s="$1" max=$((cols - $2))
 		[ "$max" -ge 10 ] || max=10
