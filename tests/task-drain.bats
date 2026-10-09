@@ -43,7 +43,23 @@ setup() {
 if [ "${MOCK_SYNC_FAIL:-0}" = "1" ] && [ -z "${MOCK_SUDO_OK:-}" ]; then
     exit 1
 fi
-echo "mock-task $@"
+# Return valid JSON for export commands so cmd_status sections render.
+case "$*" in
+    *"export"*)
+        if [[ "$*" == *"+COMPLETED end.after:today export"* ]]; then
+            # For the PENDING REVIEW query: return tasks with and without drain claims.
+            if [ "${MOCK_REVIEW_DATA:-0}" = "1" ]; then
+                echo '[{"uuid":"aaaa1111-1111-1111-1111-111111111111","project":"testproj","description":"drain completed task A","status":"completed","end":"20261009T120000Z","annotations":[{"description":"claimed by drain-9999 at 20261009T100000Z"}]},{"uuid":"bbbb2222-2222-2222-2222-222222222222","project":"otherproj","description":"manually completed task","status":"completed","end":"20261009T120000Z","annotations":[{"description":"some other note"}]}]'
+            else
+                echo '[]'
+            fi
+        else
+            echo '[]'
+        fi
+        ;;
+    *"count"*) echo "0" ;;
+    *) echo "mock-task $@" ;;
+esac
 MOCK
     chmod +x "$TASK"
 
@@ -301,4 +317,47 @@ FAKESUDO
     echo $$ > "$HOME/.task-drain/autoscale.pid"
     run "$SCRIPT_DIR/drain" autoscale --min 2 --max 4
     [[ "$output" != *"unexpected argument"* ]]
+}
+
+# --- PENDING REVIEW section in drain status ---
+
+@test "cmd_status shows PENDING REVIEW section when drain completed tasks exist" {
+    load_functions
+    export MOCK_REVIEW_DATA=1
+    run cmd_status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PENDING REVIEW"* ]]
+    [[ "$output" == *"drain completed task A"* ]]
+    # Task without drain annotation should NOT appear
+    [[ "$output" != *"manually completed task"* ]]
+    unset MOCK_REVIEW_DATA
+}
+
+@test "cmd_status omits PENDING REVIEW section when no drain completed tasks" {
+    load_functions
+    export MOCK_REVIEW_DATA=0
+    run cmd_status
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"PENDING REVIEW"* ]]
+    unset MOCK_REVIEW_DATA
+}
+
+@test "cmd_status PENDING REVIEW section shows count in header" {
+    load_functions
+    export MOCK_REVIEW_DATA=1
+    run cmd_status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"(1 completed today)"* ]]
+    unset MOCK_REVIEW_DATA
+}
+
+@test "cmd_status PENDING REVIEW section respects fail_max limit" {
+    load_functions
+    export MOCK_REVIEW_DATA=1
+    export DRAIN_VERBOSE=0
+    run cmd_status
+    [ "$status" -eq 0 ]
+    # Only 1 drain task in mock data, should not show overflow message
+    [[ "$output" != *"+1 more"* ]]
+    unset MOCK_REVIEW_DATA
 }

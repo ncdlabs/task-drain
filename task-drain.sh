@@ -589,10 +589,12 @@ cmd_status() {
 	}
 
 	# --- data exports (single shot each; tag exports scoped to +PENDING) ---
-	local eligible_json active_json failed_json
+	local eligible_json active_json failed_json review_json
 	eligible_json=$(tq +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed export 2>/dev/null || echo '[]')
 	active_json=$(tq +ACTIVE export 2>/dev/null || echo '[]')
 	failed_json=$(tq +PENDING +drain-failed export 2>/dev/null || echo '[]')
+	review_json=$(tq +COMPLETED end.after:today export 2>/dev/null |
+		jq '[.[] | select((.annotations // []) | map(.description) | any(test("claimed by drain-")))]' 2>/dev/null || echo '[]')
 
 	local desc_max=$((cols - 34))
 	[ "$desc_max" -ge 30 ] || desc_max=30
@@ -802,6 +804,27 @@ cmd_status() {
 			printf '  • [%s] %s  %s(%s)%s\n' "$pproj" "$(trunc_str "$pdesc" "$desc_max")" "$DIM" "$short" "$RESET"
 		done <<<"$failed_lines"
 		printf '  %sre-queue: task <uuid> modify -drain-failed%s\n' "$DIM" "$RESET"
+	fi
+
+	# ================= pending review =================
+	local n_review
+	n_review=$(printf '%s' "$review_json" | jq 'length' 2>/dev/null || echo 0)
+	[[ "$n_review" =~ ^[0-9]+$ ]] || n_review=0
+	if [ "$n_review" -gt 0 ]; then
+		section "PENDING REVIEW  (${n_review} completed today)"
+		local review_lines
+		review_lines=$(printf '%s' "$review_json" | jq -r 'sort_by(.end // "") | reverse | .[] | "\(.uuid // "?")\t\(.project // "-")\t\((.description // "?") | gsub("[\t\n]"; " "))"' 2>/dev/null || true)
+		local _rshown=0 _ruuid _rproj _rdesc _rshort
+		while IFS=$'\t' read -r _ruuid _rproj _rdesc; do
+			[ -n "$_rdesc" ] || continue
+			_rshown=$((_rshown + 1))
+			if [ "$_rshown" -gt "$fail_max" ]; then
+				printf '  %s… +%d more (use --verbose)%s\n' "$DIM" "$((n_review - fail_max))" "$RESET"
+				break
+			fi
+			_rshort=${_ruuid:0:8}
+			printf '  • [%s] %s  %s(%s)%s\n' "$_rproj" "$(trunc_str "$_rdesc" "$desc_max")" "$DIM" "$_rshort" "$RESET"
+		done <<<"$review_lines"
 	fi
 
 	# ================= by project (verbose only) =================
