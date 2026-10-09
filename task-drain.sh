@@ -1123,7 +1123,7 @@ autoscale_supervisor() {
 
 		# Count running workers
 		local running
-		running=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | wc -l | tr -d ' ')
+		running=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | wc -l | tr -d ' ' || true)
 		[[ "$running" =~ ^[0-9]+$ ]] || running=0
 		# Exclude ourselves from the count
 		running=$((running > 0 ? running - 1 : 0))
