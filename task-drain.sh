@@ -98,6 +98,18 @@ TASK_TIMEOUT_SEC="${TASK_TIMEOUT_SEC:-14400}" # 4 hours per task (gtimeout only)
 _DRAIN_DEFAULT_TIMEOUT=14400
 PROJECT_FILTER="${PROJECT_FILTER:-}"
 DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-0}" # 1 = reprocess drain-failed tasks instead of the regular queue
+
+# Wrapper for task sync with retry. The TaskChampion sync endpoint flakes
+# intermittently; a single failed sync must not abort a worker or fail a task.
+sync_with_retry() {
+	local attempt=1 delay=3
+	while [ $attempt -le 3 ]; do
+		if "$TASK" sync >/dev/null 2>&1; then return 0; fi
+		[ $attempt -lt 3 ] && sleep $delay
+		attempt=$((attempt + 1)); delay=$((delay * 2))
+	done
+	return 1
+}
 RETRY_SNAPSHOT=""                             # temp file holding retry UUIDs for this run
 GIT_ROOT="${GIT_ROOT:-$HOME/git}"
 STOP_FILE="$HOME/.task-drain/STOP"
@@ -146,7 +158,7 @@ claim_task() { # $1 = uuid
 		report_error "claim_task: failed to start task $1"
 		return 1
 	fi
-	$TASK sync >/dev/null 2>&1 || report_error "claim_task: sync failed after claiming $1"
+	sync_with_retry || report_error "claim_task: sync failed after claiming $1"
 }
 
 release_claim() { # $1 = uuid, $2 = reason annotation
@@ -262,7 +274,7 @@ reclaim_stale() {
 		log "releasing stale claim: $uuid"
 		release_claim "$uuid" "drain worker: released stale claim (active > $((STALE_AFTER_SEC / 3600))h, no completion)"
 	done
-	$TASK sync >/dev/null 2>&1 || report_error "reclaim_stale: sync failed after releasing stale claims"
+	sync_with_retry || report_error "reclaim_stale: sync failed after releasing stale claims"
 }
 
 build_prompt() { # $1 uuid $2 project $3 priority $4 description $5 annotations $6 repo
@@ -284,7 +296,7 @@ ENVIRONMENT
 
 DISCIPLINE (non-negotiable)
 - Taskwarrior is the only system of record. Run '$TASK sync' at session start, after every change, and at session end.
-- If sync fails: stop, annotate the failure on the task, report it, do not continue offline.
+- The sync endpoint is intermittently flaky: if sync fails, wait 5s and retry, up to 3 attempts total. Only if all 3 fail: stop, annotate the failure on the task, report it, do not continue offline.
 - Keep annotations current as you work. Search for duplicates before creating any task.
 - Durable decisions go in the repo's docs/DECISIONS.md, not in tasks.
 
@@ -404,7 +416,7 @@ run_one() { # $1 = task export JSON
 		report_error "run_one: failed to tag $uuid as drain-failed (task may be re-picked)"
 	fi
 	release_claim "$uuid" "drain worker $WORKER_ID: agent exited (rc=$rc) without completing; tagged drain-failed, not auto-retried"
-	$TASK sync >/dev/null 2>&1 || report_error "run_one: sync failed after marking $uuid as drain-failed"
+	sync_with_retry || report_error "run_one: sync failed after marking $uuid as drain-failed"
 	return 1
 }
 
@@ -432,8 +444,8 @@ run_worker() {
 		exit 0
 	fi
 	log "worker starting (filter: ${PROJECT_FILTER:-all projects})"
-	$TASK sync || {
-		log "ERROR: initial sync failed -- aborting, never work offline"
+	sync_with_retry || {
+		log "ERROR: initial sync failed after 3 attempts -- aborting, never work offline"
 		exit 1
 	}
 
@@ -1067,6 +1079,17 @@ cmd_watch() { # [renderer] -- live alternate-screen display, q quits
 # Autoscale supervisor: watches queue depth, scales workers to match.
 # Runs as a daemon via `drain autoscale`. Stops on SIGTERM or STOP file.
 autoscale_supervisor() {
+	: "${DRAIN_SCRIPT:=$0}"
+	: "${LOG_DIR:=$HOME/.task-drain/logs}"
+	mkdir -p "$LOG_DIR" 2>/dev/null || true
+	# tq: task query helper (mirrors cmd_status's local one; not in scope here)
+	tq() {
+		if [ -n "${PROJECT_FILTER:-}" ]; then
+			"$TASK" "project:${PROJECT_FILTER}" "$@"
+		else
+			"$TASK" "$@"
+		fi
+	}
 	local min_w="${DRAIN_MIN_WORKERS:-1}"
 	local max_w="${DRAIN_MAX_WORKERS:-8}"
 	local interval="${DRAIN_AUTOSCALE_INTERVAL:-30}"
@@ -1106,8 +1129,9 @@ autoscale_supervisor() {
 			local to_start=$((desired - running))
 			log "autoscaler: eligible=$eligible running=$running -> starting $to_start worker(s)"
 			for _i in $(seq 1 "$to_start"); do
-				local logf="$LOG_DIR/worker-$(date '+%Y%m%d-%H%M%S')-autoscale-$_.log"
+				local logf="$LOG_DIR/worker-$(date '+%Y%m%d-%H%M%S')-autoscale-$_i.log"
 				nohup bash "$DRAIN_SCRIPT" >>"$logf" 2>&1 &
+				sleep 5 # stagger spawns: concurrent initial syncs overwhelm taskserver
 			done
 		elif [ "$desired" -lt "$running" ]; then
 			local to_stop=$((running - desired))
