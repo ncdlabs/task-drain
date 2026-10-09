@@ -46,6 +46,14 @@ This symlinks (not copies) `task-drain.sh` and `drain` into `~/bin/`,
 so `git pull` in the repo updates your install. Set `PREFIX=/usr/local`
 to install into `/usr/local/bin` instead.
 
+The installer also clones and builds the
+[opencode-tasks](https://github.com/ncdlabs/opencode-tasks) plugin
+into `~/git/opencode-tasks` (override with `PLUGIN_DIR=`, skip with
+`SKIP_PLUGIN=1`). Add its path to your `opencode.json` under `"plugin"`
+to give agents native Taskwarrior tools. The drain workers don't require
+it -- they use direct `task` shell commands -- but it's useful for
+interactive sessions.
+
 Both scripts are executable; invoke `drain` directly (no `bash` prefix needed).
 
 ## Usage
