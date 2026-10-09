@@ -510,7 +510,7 @@ cmd_status() {
 	local ks_dot
 	if stop_requested; then
 		ks_dot="${R}■ STOPPED${RESET}"
-	elif [ -f "$DRAIN_HOME/autoscale.pid" ] && kill -0 "$(cat "$DRAIN_HOME/autoscale.pid" 2>/dev/null)" 2>/dev/null; then
+	elif [ -f "$HOME/.task-drain/autoscale.pid" ] && kill -0 "$(cat "$HOME/.task-drain/autoscale.pid" 2>/dev/null)" 2>/dev/null; then
 		ks_dot="${C}◈ AUTOSCALE${RESET}"
 	else
 		ks_dot="${G}● LIVE${RESET}"
@@ -1149,7 +1149,7 @@ autoscale_supervisor() {
 			local pids
 			pids=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | grep -v "^$$$" | head -"$to_stop")
 			for pid in $pids; do
-				touch "$DRAIN_HOME/STOP.$pid" 2>/dev/null
+				touch "$HOME/.task-drain/STOP.$pid" 2>/dev/null
 			done
 		fi
 
