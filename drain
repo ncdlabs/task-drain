@@ -26,6 +26,7 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #                        pick up nothing new, then exit.
 #                        No arg (or 'all') = stop ALL workers.
 #                        N = stop N workers (newest first).
+#                        --force = immediate stop (TERM mid-task, like drain kill)
 #   drain kill           immediate stop: TERM workers mid-task (in-flight
 #                        tasks are released back to pending, cleanly)
 #   drain autoscale [project] [--min N] [--max N]
@@ -220,19 +221,32 @@ cmd_autoscale_stop() {
   rm -f "$pidfile"
 }
 
-cmd_stop() { # [N|all] -- default all
-  local target="${1:-all}"
-  [ $# -le 1 ] || die "usage: drain stop [N|all]"
-  case "$target" in
-    all|"") target="all" ;;
-    *) [[ "$target" =~ ^[1-9][0-9]*$ ]] || die "usage: drain stop [N|all] (N = positive integer)" ;;
-  esac
+cmd_stop() { # [N|all] [--force] -- default all
+  local target="all" force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      "") ;;
+      all) target="all" ;;
+      *)
+        [[ "$a" =~ ^[1-9][0-9]*$ ]] || die "usage: drain stop [N|all] [--force]"
+        [ "$target" = "all" ] || die "drain stop: only one positional argument allowed (got '$a' after '$target')"
+        target="$a"
+        ;;
+    esac
+  done
+  if [ "$force" = 1 ] && [ "$target" != "all" ]; then
+    die "drain stop --force: N is not compatible with --force (force stops all workers)"
+  fi
   mkdir -p "$DRAIN_HOME"
   prune_stale_stops
   local running pids pid stopped=0
   running=$(worker_count)
   [ "$running" -gt 0 ] || { echo "no workers running."; return 0; }
-  if [ "$target" = "all" ]; then
+  if [ "$force" = 1 ]; then
+    pkill -TERM -f "(^|[^A-Za-z0-9_-])task-drain\.sh$"
+    echo "force stop: TERM sent to all $running worker(s). In-flight tasks released to pending."
+  elif [ "$target" = "all" ]; then
     touch "$STOP_FILE"
     echo "graceful stop requested for all $running worker(s). They'll exit after their current task."
   elif [ "$target" -ge "$running" ]; then
@@ -249,7 +263,7 @@ cmd_stop() { # [N|all] -- default all
     done <<<"$pids"
     echo "$stopped of $running worker(s) stopping. Check with: drain status"
   fi
-  echo "Check with: drain status"
+  [ "$force" = 1 ] || echo "Check with: drain status"
 }
 
 cmd_kill() {
@@ -355,6 +369,8 @@ STOPPING
   drain stop all    same as bare 'drain stop'
   drain stop N      graceful: stop N workers (newest first); each finishes its
                     current task, then exits. N >= running stops all.
+  drain stop --force  immediate: TERM workers mid-task; claims released to pending
+                    (same as drain kill, but via the stop command)
   drain kill    immediate: workers die mid-task; claims released to pending
   drain resume  clear the STOP file (doesn't start workers)
 
