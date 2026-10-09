@@ -22,3 +22,7 @@ bash ~/bin/drain stop           # graceful stop
 - `drain-claimed` -- in-flight by a worker (auto-released after 4h if stale)
 
 Kill switch: `~/.task-drain/STOP`
+
+## Related
+
+- [opencode-tasks](https://github.com/ncdlabs/opencode-tasks) -- OpenCode plugin exposing Taskwarrior lifecycle tools as native agent tools. Optional companion; the drain workers use direct `task` shell commands and don't require it.
