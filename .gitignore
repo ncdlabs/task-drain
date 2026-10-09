@@ -1,2 +1,4 @@
 .task-drain/
 *.log
+node_modules/
+dist/

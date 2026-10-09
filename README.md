@@ -14,14 +14,20 @@ waiting, blocked, or tagged `noauto` / `drain-failed`.
 
 ## Prerequisites
 
+`./install.sh` handles all of these for you (macOS and Linux; see
+[Installation](#installation)). The list below is what it sets up, for
+reference or manual installs:
+
 - **Taskwarrior 3.x** with [TaskChampion sync](https://github.com/GothenburgBitFactory/taskchampion)
   configured against a sync server. This is a hard requirement — workers abort
   if the initial sync fails ("never work offline"). The shared sync pool is
   what makes multi-machine workers possible.
-- **A TaskChampion sync server.** Self-host
+- **A TaskChampion sync server.** The installer spins up a local one via
+  Docker (`ghcr.io/gothenburgbitfactory/taskchampion-sync-server`) when
+  available, or you can self-host
   [taskchampion-sync-server](https://github.com/GothenburgBitFactory/taskchampion-sync-server)
-  (Rust; `cargo install --path .` from that repo, or use their Docker image),
-  then point Taskwarrior at it:
+  yourself (binary release, Docker image, or `cargo build --release`) and
+  point Taskwarrior at it:
   ```
   task config sync.server.url https://your-sync-server.example
   task config sync.server.client_id $(uuidgen)
@@ -51,18 +57,32 @@ cd task-drain
 ./install.sh
 ```
 
-This symlinks (not copies) `task-drain.sh` and `drain` into `~/bin/`,
-so `git pull` in the repo updates your install. Set `PREFIX=/usr/local`
-to install into `/usr/local/bin` instead.
+The installer handles the full setup (idempotent — safe to re-run):
 
-The installer also clones and builds
-[opencode-tasks](https://github.com/ncdlabs/opencode-tasks)
-into `~/git/opencode-tasks` (override with `PLUGIN_DIR=`, skip with
-`SKIP_PLUGIN=1`). It provides native Taskwarrior tools for agents —
-as an OpenCode plugin *and* as an MCP server (`taskwarrior-mcp`) for
-Claude Code, Cursor, and Codex. The drain workers don't require it —
-they use direct `task` shell commands — but it's useful for interactive
-sessions. See that repo's README for per-client setup.
+1. **Dependencies** — installs Taskwarrior 3.x (Homebrew on macOS;
+   apt/dnf/pacman on Linux) and `jq` if missing; verifies `task --version`
+   is 3.x. Warns if no agent CLI (`opencode`/`claude`/`codex`) is on PATH.
+2. **Sync server** — starts a local TaskChampion sync server via Docker if
+   available, then configures `task` with `sync.server.url` and generates a
+   `sync.server.client_id` if you don't have one. Honors `TASKCHAMPION_URL`
+   to use a remote server instead, or `TASKCHAMPION_LOCAL=0` to skip.
+3. **Scripts** — symlinks (not copies) `task-drain.sh` and `drain` into
+   `~/bin/`, so `git pull` in the repo updates your install. Set
+   `PREFIX=/usr/local` to install into `/usr/local/bin` instead.
+4. **Task plugin** — builds the bundled `plugin/` (`npm install` +
+   `npm run build`). Skip with `SKIP_PLUGIN=1`, override the path with
+   `PLUGIN_DIR=`.
+
+Installer knobs:
+
+| Variable | Effect |
+|----------|--------|
+| `PREFIX` | Install scripts to `$PREFIX/bin` instead of `~/bin` |
+| `SKIP_DEPS=1` | Skip dependency installation |
+| `SKIP_PLUGIN=1` | Skip the plugin build |
+| `TASKCHAMPION_URL` | Use this sync server URL instead of starting a local one |
+| `TASKCHAMPION_LOCAL=0` | Don't set up a local sync server |
+| `PLUGIN_DIR` | Plugin location (default: `<repo>/plugin`) |
 
 Both scripts are executable; invoke `drain` directly (no `bash` prefix needed).
 
@@ -157,10 +177,68 @@ Two implementation details worth knowing:
   `--standalone` — its default service mode hangs the same way.)
 - The working directory is set via subshell `cd` before invoking the agent.
 
-## Related
+## Task plugin (`plugin/`)
 
-- [opencode-tasks](https://github.com/ncdlabs/opencode-tasks) —
-  Taskwarrior lifecycle tools as native agent tools: an OpenCode plugin
-  *and* an MCP server (`taskwarrior-mcp`) for Claude Code, Cursor, and Codex.
-  Optional companion; the drain workers use direct `task` shell commands and
-  don't require it.
+The repo bundles Taskwarrior lifecycle tools as native agent tools —
+22 tools (`task sync`, `task claim`, `task start`, `task complete`, …)
+available two ways:
+
+- **OpenCode plugin** — add the plugin dir to `opencode.json`:
+  `"plugin": [ "<repo>/plugin" ]`
+- **MCP server** (`taskwarrior-mcp`, stdio) — for Claude Code, Cursor,
+  OpenCode, and Codex. The server announces the claim → work → complete
+  workflow in its instructions; `plugin/SKILL.md` carries the same rules
+  for clients that load skills.
+
+The drain workers don't require the plugin — they use direct `task`
+shell commands — but it's useful for interactive sessions.
+
+### MCP client setup
+
+Build once (`cd plugin && npm install && npm run build`, or via
+`./install.sh`), then point your client at
+`<repo>/plugin/dist/mcp-server.js`:
+
+**Claude Code**
+```sh
+claude mcp add taskwarrior -- node /path/to/task-drain/plugin/dist/mcp-server.js
+# with env:
+claude mcp add taskwarrior -e TASK_BIN=/opt/homebrew/bin/task -- node /path/to/task-drain/plugin/dist/mcp-server.js
+```
+
+**Cursor** (`~/.cursor/mcp.json`)
+```json
+{
+  "mcpServers": {
+    "taskwarrior": {
+      "command": "node",
+      "args": ["/path/to/task-drain/plugin/dist/mcp-server.js"],
+      "env": { "TASK_BIN": "/opt/homebrew/bin/task" }
+    }
+  }
+}
+```
+
+**OpenCode** (`opencode.json`)
+```jsonc
+{
+  "mcp": {
+    "taskwarrior": {
+      "type": "local",
+      "command": ["node", "/path/to/task-drain/plugin/dist/mcp-server.js"],
+      "environment": { "TASK_BIN": "/opt/homebrew/bin/task" },
+      "enabled": true
+    }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml` — verify MCP support with `codex mcp list`)
+```toml
+[mcp_servers.taskwarrior]
+command = "node"
+args = ["/path/to/task-drain/plugin/dist/mcp-server.js"]
+```
+
+Configure via environment: `TASK_BIN`, `TASKRC`, `TASK_AUTO_SYNC=0`.
+Full tool reference: `plugin/README.md`.

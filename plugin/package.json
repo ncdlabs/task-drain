@@ -1,0 +1,50 @@
+{
+  "author": "Lou Grossi",
+  "bugs": {
+    "url": "https://github.com/ncdlabs/task-drain/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@opencode/plugin": "^2.0.24"
+  },
+  "description": "TaskChampion/Taskwarrior lifecycle tools (sync, add, claim, review, complete) as an OpenCode plugin and an MCP server for Claude Code, Cursor, and Codex.",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "homepage": "https://github.com/ncdlabs/task-drain#readme",
+  "keywords": [
+    "opencode",
+    "taskwarrior",
+    "taskchampion",
+    "tasks",
+    "plugin",
+    "mcp",
+    "model-context-protocol",
+    "claude-code"
+  ],
+  "license": "MIT",
+  "name": "opencode-tasks",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ncdlabs/task-drain.git",
+    "directory": "plugin"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "test": "node --test tests/task.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "module",
+  "version": "0.1.0",
+  "bin": {
+    "taskwarrior-mcp": "./dist/mcp-server.js"
+  }
+}
