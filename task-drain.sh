@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/lou/.opencode/bin:/Users/lou/bin:/usr/bin:/bin:/usr/sbin:/sbin  # llama Mac tool paths
+export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/bin:/bin:/usr/sbin:/sbin
 #
 # task-drain.sh -- autonomous drain worker for the shared Taskwarrior pool.
 #
@@ -10,8 +10,7 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/lou/.opencode/bin:/Users/lou
 # WORKER LOOP: sync -> release stale claims -> pick highest-urgency eligible
 # task -> claim it -> run `opencode run` on it -> verify -> repeat until empty.
 #
-# (Run with `bash`; the file may not carry the exec bit, and `bash script`
-#  doesn't need it.)
+# (Run directly -- both scripts carry the exec bit -- or with `bash script`.)
 #
 # Run 2-3 copies in separate terminals for a worker pool. The pick->claim
 # window is ~100ms; a rare double-claim just means two agents annotate the
@@ -30,7 +29,7 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/lou/.opencode/bin:/Users/lou
 #   noauto        -- opt out of autonomous pickup (tag any task to skip it)
 #   drain-failed  -- set automatically when a worker attempt ends without the
 #                    task being completed; clear it to re-queue:
-#                      /opt/homebrew/bin/task <uuid> modify -drain-failed
+#                      task <uuid> modify -drain-failed
 #
 # RETRY MODE (DRAIN_RETRY_FAILED=1):
 #   Workers reprocess drain-failed tasks instead of the regular queue.
@@ -40,12 +39,12 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/lou/.opencode/bin:/Users/lou
 #     drain start [N] [project] --failed
 #
 # SAFETY DIALS:
-#   OPENCODE_RUN_FLAGS -- default --dangerously-skip-permissions --model
-#     opencode-go/longcat-2.5-preview-free. Without --dangerously-skip-permissions
-#     an unattended run stalls on the first approval prompt; with it the agent can
-#     edit, run, and push without asking. This is the main risk dial. The model
-#     is pinned to the only zero-cost model on the opencode-go provider (all other
-#     opencode-go models are paid). Verify flags with: opencode run --help
+#   OPENCODE_RUN_FLAGS -- default --standalone --dangerously-skip-permissions
+#     --model $DRAIN_MODEL (default opencode-go/longcat-2.5-preview-free;
+#     override with the DRAIN_MODEL env var). Without
+#     --dangerously-skip-permissions an unattended run stalls on the first
+#     approval prompt; with it the agent can edit, run, and push without
+#     asking. This is the main risk dial. Verify flags with: opencode run --help
 #     WARNING: an invalid flag here fails EVERY task attempt, and each failure
 #     is failed as +drain-failed -- one bad flag can drain-fail the whole queue
 #     (and workers then exit on the empty eligible set). Test a single task
@@ -58,19 +57,27 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/lou/.opencode/bin:/Users/lou
 #     installed. Timed-out tasks are failed, not retried.
 #
 # The worker prompt forbids the agent from deciding design / security / product
-# matters (those belong to Lou + Juno): it must annotate and fail instead.
+# matters (those belong to the project owner -- see DRAIN_OWNER below):
+# it must annotate and fail instead.
 #
 set -euo pipefail
 
-TASK=/opt/homebrew/bin/task
+# Taskwarrior binary. Override with TASK=/path/to/task in the environment.
+# Defaults to `task` on PATH, falling back to the Homebrew location on macOS.
+TASK="${TASK:-$(command -v task 2>/dev/null || echo /opt/homebrew/bin/task)}"
 OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
-OPENCODE_RUN_FLAGS=(--standalone --dangerously-skip-permissions --model opencode-go/longcat-2.5-preview-free)
+# Model for worker runs. Override with DRAIN_MODEL in the environment.
+DRAIN_MODEL="${DRAIN_MODEL:-opencode-go/longcat-2.5-preview-free}"
+OPENCODE_RUN_FLAGS=(--standalone --dangerously-skip-permissions --model "$DRAIN_MODEL")
+# Name shown in the worker prompt as the human authority for design/security/
+# product decisions (workers must not make these). Override with DRAIN_OWNER.
+DRAIN_OWNER="${DRAIN_OWNER:-the project owner}"
 STALE_AFTER_SEC="${STALE_AFTER_SEC:-14400}"   # 4 hours
 TASK_TIMEOUT_SEC="${TASK_TIMEOUT_SEC:-14400}" # 4 hours per task (gtimeout only)
 PROJECT_FILTER="${PROJECT_FILTER:-}"
 DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-0}" # 1 = reprocess drain-failed tasks instead of the regular queue
 RETRY_SNAPSHOT=""                             # temp file holding retry UUIDs for this run
-GIT_ROOT="$HOME/git"
+GIT_ROOT="${GIT_ROOT:-$HOME/git}"
 STOP_FILE="$HOME/.task-drain/STOP"
 WORKER_ID="drain-$(hostname -s)-$$"
 CHILD_PID=""
@@ -121,7 +128,24 @@ on_signal() {
 }
 trap on_signal INT TERM
 
+# EDIT THIS: map your Taskwarrior project names to repo paths.
+# The entries below are examples -- replace them with your own projects.
+# You can also (or instead) add overrides in ~/.task-drain/repos.conf,
+# one per line:   myproject=$HOME/git/myrepo   (or ~/git/myrepo)
+# Entries in repos.conf take precedence over the built-in table.
 repo_for_project() {
+	local conf="$HOME/.task-drain/repos.conf" proj path
+	if [ -f "$conf" ]; then
+		while IFS='=' read -r proj path; do
+			case "$proj" in ''|\#*) continue ;; esac
+			if [ "$proj" = "${1:-}" ]; then
+				path="${path/#\~/$HOME}"
+				path="${path//\$HOME/$HOME}"
+				echo "$path"
+				return 0
+			fi
+		done <"$conf"
+	fi
 	case "${1:-}" in
 	attendeesync) echo "$GIT_ROOT/attendeesync" ;;
 	ncdlabs) echo "$GIT_ROOT/ncdlabs.com" ;;
@@ -182,7 +206,7 @@ reclaim_stale() {
 
 build_prompt() { # $1 uuid $2 project $3 priority $4 description $5 annotations $6 repo
 	cat <<PROMPT_EOF
-You are an autonomous coding-agent worker on Lou's Mac. Work exactly ONE Taskwarrior task to completion, then stop. Do not pick up other tasks.
+You are an autonomous coding-agent worker. Work exactly ONE Taskwarrior task to completion, then stop. Do not pick up other tasks.
 
 TASK
   UUID:        $1   <- always reference tasks by UUID, never short numeric IDs
@@ -193,36 +217,37 @@ TASK
 $5
 
 ENVIRONMENT
-- macOS. Repos live under /Users/lou/git. Your working directory is: $6
-- Taskwarrior binary: /opt/homebrew/bin/task (use this exact full path; it talks to the shared TaskChampion pool)
+- Repos live under $GIT_ROOT. Your working directory is: $6
+- Taskwarrior binary: $TASK (use this exact full path; it talks to the shared TaskChampion pool)
 - 'git pull --rebase' before starting. Never force-push. Never change the task sync client ID.
 
 DISCIPLINE (non-negotiable)
-- Taskwarrior is the only system of record. Run '/opt/homebrew/bin/task sync' at session start, after every change, and at session end.
+- Taskwarrior is the only system of record. Run '$TASK sync' at session start, after every change, and at session end.
 - If sync fails: stop, annotate the failure on the task, report it, do not continue offline.
 - Keep annotations current as you work. Search for duplicates before creating any task.
 - Durable decisions go in the repo's docs/DECISIONS.md, not in tasks.
 
 AUTHORITY (non-negotiable)
-- Design, security, product, and public-facing decisions belong to Lou and Juno. You do not make them.
-- If this task needs human judgment, credentials you do not have, a legal/compliance declaration, publishing or submitting anything public, or any irreversible action beyond the task's stated scope: DO NOT complete it. Annotate exactly what is needed and by whom, run '/opt/homebrew/bin/task $1 stop', sync, and print FAILED: <reason> as your final line.
+- Design, security, product, and public-facing decisions belong to $DRAIN_OWNER. You do not make them.
+- If this task needs human judgment, credentials you do not have, a legal/compliance declaration, publishing or submitting anything public, or any irreversible action beyond the task's stated scope: DO NOT complete it. Annotate exactly what is needed and by whom, run '$TASK $1 stop', sync, and print FAILED: <reason> as your final line.
 
 COMPLETION CONTRACT
 - Do the work. Verify it for real: run the build, the tests, or the task's own acceptance criteria. Never assert success you did not observe.
-- Only when the acceptance criteria are truly met: annotate a short summary of what changed, run '/opt/homebrew/bin/task $1 done', sync, and print DONE: <one-line summary> as your final line.
-- If you cannot meet the criteria: annotate the precise blocker, run '/opt/homebrew/bin/task $1 stop' (leave it pending), sync, and print FAILED: <reason>. Never mark done on partial or unverified work.
+- Only when the acceptance criteria are truly met: annotate a short summary of what changed, run '$TASK $1 done', sync, and print DONE: <one-line summary> as your final line.
+- If you cannot meet the criteria: annotate the precise blocker, run '$TASK $1 stop' (leave it pending), sync, and print FAILED: <reason>. Never mark done on partial or unverified work.
 
 GIT WORKFLOW (when the task involves code changes)
 - Work on a feature branch, never directly on main/master. If not already on a branch, create one: git checkout -b <task-desc-short>
 - Commit your changes with a clear message referencing the task UUID.
 - Push the branch: git push -u origin <branch-name>
-- Create a PR and leave it open for Lou to review. Never merge it yourself.
-  - For Gitea repos (git.ncdlabs.com): use the gitea-mcp-server tools if available, or the API:
-    curl -s -X POST -H "Authorization: token $GITEA_TOKEN" -H "Content-Type: application/json" \
-      -d '{"title":"<task description>","head":"<branch>","base":"main","body":"Task <uuid>. <summary>"}' \
-      https://git.ncdlabs.com/api/v1/repos/<owner>/<repo>/pulls
-    (GITEA_TOKEN is in ~/.zshenv and works in non-interactive shells.)
+- Create a PR and leave it open for review. Never merge it yourself.
   - For GitHub repos: gh pr create --title "<task description>" --body "Task <uuid>. <summary>"
+  - For Gitea / self-hosted forges: use the forge's API, e.g.:
+    curl -s -X POST -H "Authorization: token \$FORGE_TOKEN" -H "Content-Type: application/json" \
+      -d '{"title":"<task description>","head":"<branch>","base":"main","body":"Task <uuid>. <summary>"}' \
+      https://<your-forge-host>/api/v1/repos/<owner>/<repo>/pulls
+    (Export FORGE_TOKEN in your shell environment -- e.g. ~/.zshenv or ~/.bashrc --
+    so non-interactive shells can see it.)
 - If push or PR creation fails (auth not set up, etc.): annotate the blocker on the task, print FAILED: <reason>, do not mark done.
 PROMPT_EOF
 }
@@ -255,9 +280,10 @@ run_one() { # $1 = task export JSON
 	}
 
 	rc=0
-	# NOTE: `opencode run` has no --dir flag (v2.0.24 takes no directory flag;
-	# verify with: opencode run --help). Set the working directory via subshell
-	# cd instead -- a bad flag here fails every task and mass-fails the queue
+	# NOTE: `opencode run` has no --dir flag (verify with: opencode run --help),
+	# so the working directory is set via subshell cd. Runs use --standalone
+	# (avoids hangs when stdin is not a TTY) with stdin redirected from
+	# /dev/null. A bad flag here fails every task and mass-fails the queue
 	# as +drain-failed without doing any work.
 	if command -v gtimeout >/dev/null 2>&1; then
 		(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" < /dev/null) &
@@ -448,13 +474,11 @@ cmd_status() {
 	[[ "$nworkers" =~ ^[0-9]+$ ]] || nworkers=0
 
 	# --- kill switch ---
-	local ks_txt ks_dot
+	local ks_dot
 	if stop_requested; then
 		ks_dot="${R}■ STOPPED${RESET}"
-		ks_txt="STOP file present ($STOP_FILE)"
 	else
 		ks_dot="${G}● LIVE${RESET}"
-		ks_txt="accepting work"
 	fi
 
 	# --- queue counts, pending-scoped to match the tagging system (see `drain docs`) ---
@@ -466,7 +490,7 @@ cmd_status() {
 	# tasks pickup skips. (-WAITING in the pickup filter is then a no-op kept
 	# for clarity.)
 	local n_elig n_active n_blocked n_waiting n_noauto n_failed n_done
-	local n_claimed n_claimed_active n_interactive n_stale n_pending_total
+	local n_claimed_active n_interactive n_stale n_pending_total
 	n_elig=$(tq +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed count 2>/dev/null || echo "?")
 	n_active=$(tq +ACTIVE count 2>/dev/null || echo "?")
 	n_blocked=$(tq +PENDING +BLOCKED count 2>/dev/null || echo "?")

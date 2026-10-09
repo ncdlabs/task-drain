@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/lou/.opencode/bin:/Users/lou/bin:/usr/bin:/bin:/usr/sbin:/sbin  # llama Mac tool paths
+export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/bin:/bin:/usr/sbin:/sbin
 #
 # drain -- CLI for the task-drain autonomous worker pool.
 # Worker logic lives in the adjacent task-drain.sh; this is the human interface.
@@ -32,7 +32,7 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/lou/.opencode/bin:/Users/lou
 #   drain logs [-f]      tail worker logs (follow with -f)
 #   drain help
 #
-# Workers log to ~/.task-drain/logs/worker-N.log.
+# Workers log to ~/.task-drain/logs/worker-<timestamp>-<pid>-N.log.
 #
 set -euo pipefail
 
@@ -148,7 +148,9 @@ cmd_start() { # [N] [project|all] [--failed]
   [ -n "$project" ] && mode_desc=" [project=$project]"
   [ "$retry" = 1 ] && mode_desc="$mode_desc [retrying failed]"
   for i in $(seq 1 "$n"); do
-    logf="$LOG_DIR/worker-$i.log"
+    # Timestamp + CLI pid in the name so a second `drain start` never
+    # overwrites the logs of already-running workers.
+    logf="$LOG_DIR/worker-$(date '+%Y%m%d-%H%M%S')-$$-$i.log"
     { echo ""; echo "===== run started $(date '+%F %T')$mode_desc ====="; } >>"$logf"
     nohup bash "$DRAIN_SCRIPT" >>"$logf" 2>&1 &
     echo "started worker $i (pid $!$mode_desc, log $logf)"
@@ -248,19 +250,19 @@ TAGS
     Tag a task and drain workers will never touch it. Use for tasks that
     need you, interactive-only work, or anything you don't want a free
     model grinding on unattended:
-      /opt/homebrew/bin/task <uuid> modify +noauto
+      task <uuid> modify +noauto
   drain-failed
     Set automatically when a worker attempt ends without the task being
     completed (agent failed it, crashed, timed out, or finished nothing).
     Regular workers never retry these. To give them another shot, either
     re-queue (a normal worker picks it up):
-      /opt/homebrew/bin/task <uuid> modify -drain-failed
+      task <uuid> modify -drain-failed
     or retry directly without untagging:
       drain start 2 --failed                (all projects)
       drain start 2 attendeesync --failed   (one project)
     A --failed retry that fails again keeps drain-failed; each task gets
     at most one retry per --failed run, so nothing loops forever.
-    Everything failed is listed under `drain status` ("needs Lou's eyes").
+    Everything failed is listed under `drain status` ("needs human review").
   drain-claimed
     Set automatically while a worker owns a task. Don't set it by hand.
     If a worker dies mid-task, its claim is auto-released after 4 hours.
@@ -281,10 +283,11 @@ WHAT THE AGENT IS TOLD
       after every change, and at session end. Never work offline. Never
       change the sync client ID. Reference tasks by UUID, never short IDs.
     - Authority: design, security, product, and public-facing decisions
-      belong to Lou + Juno. If the task needs human judgment, credentials
-      it lacks, a legal/compliance declaration, or anything public or
-      irreversible, the agent must annotate what's needed and FAIL the
-      task -- never decide on its own.
+      belong to the project owner (see DRAIN_OWNER in task-drain.sh).
+      If the task needs human judgment, credentials it lacks, a
+      legal/compliance declaration, or anything public or irreversible,
+      the agent must annotate what's needed and FAIL the task -- never
+      decide on its own.
     - Completion contract: verify for real (build, tests, or the task's
       own acceptance criteria). Only then `task <uuid> done`. Partial or
       unverified work is failed, never marked done.
@@ -298,7 +301,7 @@ STOPPING
   drain resume  clear the STOP file (doesn't start workers)
 
 LOGS
-  ~/.task-drain/logs/worker-N.log      drain logs [-f]
+  ~/.task-drain/logs/worker-<timestamp>-<pid>-N.log      drain logs [-f]
 
 VIEWS
   drain status              queue dashboard (one snapshot)
@@ -308,12 +311,14 @@ VIEWS
                             project, other projects are dimmed:
                               drain status attendeesync --workers
 
-SAFETY DIALS (edit at the top of bin/task-drain.sh)
+SAFETY DIALS (env vars, or edit at the top of task-drain.sh)
   --dangerously-skip-permissions : unattended runs need this or they stall
       on the first approval prompt; it lets the agent edit/run/push freely.
       This is the main risk dial.
+  DRAIN_MODEL                : model for worker runs
+                               (default opencode-go/longcat-2.5-preview-free)
   STALE_AFTER_SEC=14400  : release worker claims older than 4 hours
-  TASK_TIMEOUT_SEC=7200  : per-task wall clock (needs `gtimeout`)
+  TASK_TIMEOUT_SEC=14400 : per-task wall clock (needs `gtimeout`)
 DOCS_EOF
 }
 
