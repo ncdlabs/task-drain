@@ -95,7 +95,8 @@ Environment variables (export them before `drain start`, or edit the top of
 |----------|---------|---------|
 | `TASK` | `task` on PATH, else `/opt/homebrew/bin/task` | Taskwarrior binary |
 | `OPENCODE_BIN` | `opencode` | OpenCode binary |
-| `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs |
+| `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs (opencode only) |
+| `DRAIN_AGENT` | `opencode` | Agent harness: `opencode` \| `claude` \| `codex`. Switches the worker invocation (`opencode run --standalone`, `claude -p`, `codex exec`). |
 | `GIT_ROOT` | `$HOME/git` | Where your repos live |
 | `DRAIN_OWNER` | `the project owner` | Human authority named in the worker prompt for design/security/product decisions (workers must annotate and fail instead of deciding) |
 | `PROJECT_FILTER` | (unset) | Limit one worker run to a single project |

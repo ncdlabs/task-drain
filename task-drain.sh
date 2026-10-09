@@ -69,6 +69,9 @@ OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
 # Model for worker runs. Override with DRAIN_MODEL in the environment.
 DRAIN_MODEL="${DRAIN_MODEL:-opencode-go/longcat-2.5-preview-free}"
 OPENCODE_RUN_FLAGS=(--standalone --dangerously-skip-permissions --model "$DRAIN_MODEL")
+# Agent harness to use for worker runs: opencode | claude | codex.
+# Override with DRAIN_AGENT in the environment.
+DRAIN_AGENT="${DRAIN_AGENT:-opencode}"
 # Name shown in the worker prompt as the human authority for design/security/
 # product decisions (workers must not make these). Override with DRAIN_OWNER.
 DRAIN_OWNER="${DRAIN_OWNER:-the project owner}"
@@ -285,11 +288,36 @@ run_one() { # $1 = task export JSON
 	# (avoids hangs when stdin is not a TTY) with stdin redirected from
 	# /dev/null. A bad flag here fails every task and mass-fails the queue
 	# as +drain-failed without doing any work.
-	if command -v gtimeout >/dev/null 2>&1; then
-		(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" < /dev/null) &
-	else
-		(cd "$repo" && exec "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" < /dev/null) &
-	fi
+	# Launch the agent harness. Each harness has its own non-interactive CLI.
+	case "$DRAIN_AGENT" in
+		opencode)
+			if command -v gtimeout >/dev/null 2>&1; then
+				(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" < /dev/null) &
+			else
+				(cd "$repo" && exec "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" < /dev/null) &
+			fi
+			;;
+		claude)
+			# Claude Code headless: claude -p prints the final response and exits.
+			if command -v gtimeout >/dev/null 2>&1; then
+				(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" claude -p "$prompt" < /dev/null) &
+			else
+				(cd "$repo" && exec claude -p "$prompt" < /dev/null) &
+			fi
+			;;
+		codex)
+			# Codex CLI non-interactive: codex exec runs the prompt and exits.
+			if command -v gtimeout >/dev/null 2>&1; then
+				(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" codex exec "$prompt" < /dev/null) &
+			else
+				(cd "$repo" && exec codex exec "$prompt" < /dev/null) &
+			fi
+			;;
+		*)
+			log "ERROR: unknown DRAIN_AGENT='$DRAIN_AGENT' (expected opencode|claude|codex)"
+			return 1
+			;;
+	esac
 	CHILD_PID=$!
 
 	# Run annotator every 30s in background (after CHILD_PID is set)
@@ -321,8 +349,13 @@ run_one() { # $1 = task export JSON
 }
 
 run_worker() {
-	command -v "$OPENCODE_BIN" >/dev/null 2>&1 || {
-		log "ERROR: '$OPENCODE_BIN' not found on PATH"
+	case "$DRAIN_AGENT" in
+		opencode) _agent_bin="$OPENCODE_BIN" ;;
+		claude)   _agent_bin="claude" ;;
+		codex)    _agent_bin="codex" ;;
+	esac
+	command -v "$_agent_bin" >/dev/null 2>&1 || {
+		log "ERROR: '$_agent_bin' (DRAIN_AGENT=$DRAIN_AGENT) not found on PATH"
 		exit 1
 	}
 	command -v jq >/dev/null 2>&1 || {
