@@ -506,10 +506,12 @@ cmd_status() {
 	if [ -z "$worker_ps" ]; then nworkers=0; else nworkers=$(printf '%s\n' "$worker_ps" | wc -l | tr -d ' '); fi
 	[[ "$nworkers" =~ ^[0-9]+$ ]] || nworkers=0
 
-	# --- kill switch ---
+	# --- kill switch / autoscale state ---
 	local ks_dot
 	if stop_requested; then
 		ks_dot="${R}■ STOPPED${RESET}"
+	elif [ -f "$DRAIN_HOME/autoscale.pid" ] && kill -0 "$(cat "$DRAIN_HOME/autoscale.pid" 2>/dev/null)" 2>/dev/null; then
+		ks_dot="${C}◈ AUTOSCALE${RESET}"
 	else
 		ks_dot="${G}● LIVE${RESET}"
 	fi
