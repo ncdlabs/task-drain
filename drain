@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/lou/.opencode/bin:/Users/lou/bin:/usr/bin:/bin:/usr/sbin:/sbin  # llama Mac tool paths
+#
+# drain -- CLI for the task-drain autonomous worker pool.
+# Worker logic lives in the adjacent task-drain.sh; this is the human interface.
+#
+#   drain                show this help
+#   drain status [project] [-w|--watch] [--workers] [--verbose]
+#                        show status (workers, kill switch, queue),
+#                        optionally scoped to one project; -w keeps a
+#                        live display (q quits, DRAIN_WATCH_INTERVAL=5);
+#                        --workers shows a live per-worker view instead:
+#                        each worker's current task + time-budget meter;
+#                        --verbose (or DRAIN_VERBOSE=1) shows full lists
+#                        instead of the capped summary view
+#   drain docs           how pickup, tags, and the kill switch work
+#   drain start [N] [project|all] [--failed]
+#                        start N background workers (default 2, max 8),
+#                        optionally limited to one project, e.g.:
+#                          drain start 3 attendeesync
+#                        'all' (or no project) = take tasks from any project.
+#                        --failed = reprocess drain-failed tasks instead of
+#                        the regular queue, e.g.:
+#                          drain start 2 attendeesync --failed
+#   drain stop [N|all]   graceful stop: workers finish their current task,
+#                        pick up nothing new, then exit.
+#                        No arg (or 'all') = stop ALL workers.
+#                        N = stop N workers (newest first).
+#   drain kill           immediate stop: TERM workers mid-task (in-flight
+#                        tasks are released back to pending, cleanly)
+#   drain resume         clear the STOP file (does not start workers)
+#   drain logs [-f]      tail worker logs (follow with -f)
+#   drain help
+#
+# Workers log to ~/.task-drain/logs/worker-N.log.
+#
+set -euo pipefail
+
+# Resolve symlinks so the script finds its siblings even when invoked
+# through ~/bin/drain -> repo/bin/drain. macOS readlink lacks -f.
+resolve_symlink() {
+  local path="$1" target
+  while [ -L "$path" ]; do
+    target=$(readlink "$path")
+    if [[ "$target" != /* ]]; then
+      target="$(dirname -- "$path")/$target"
+    fi
+    path="$target"
+  done
+  printf '%s\n' "$path"
+}
+
+SCRIPT_PATH="$(resolve_symlink "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+DRAIN_SCRIPT="$SCRIPT_DIR/task-drain.sh"
+DRAIN_HOME="$HOME/.task-drain"
+LOG_DIR="$DRAIN_HOME/logs"
+STOP_FILE="$DRAIN_HOME/STOP"
+
+die() { echo "drain: $*" >&2; exit 1; }
+
+need_script() { [ -f "$DRAIN_SCRIPT" ] || die "worker script not found: $DRAIN_SCRIPT"; }
+
+worker_pids() {
+  # Portable: macOS pgrep lacks -c print-count mode. Newest first (PID desc).
+  # Never match self or ancestors: a caller whose own command line names the
+  # worker script (e.g. `bash bin/task-drain.sh status`) is not a worker.
+  local skip="$$" p=$PPID ppid guard=0
+  while [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -gt 1 ] && [ "$guard" -lt 64 ]; do
+    skip="$skip|$p"
+    ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ' || true)
+    [[ "$ppid" =~ ^[0-9]+$ ]] || break
+    p=$ppid
+    guard=$((guard+1))
+  done
+  ps -eo pid,command 2>/dev/null \
+    | awk -v skip="^($skip)$" '/(^|[^A-Za-z0-9_-])[t]ask-drain\.sh/ && !/ status/ && !/ watch/ && !/ workers/ && $1 !~ skip {print $1}' \
+    | sort -rn || true
+}
+
+worker_count() {
+  local ps_out
+  ps_out=$(worker_pids)
+  if [ -z "$ps_out" ]; then echo 0; else printf '%s\n' "$ps_out" | wc -l | tr -d ' '; fi
+}
+
+prune_stale_stops() {
+  # Drop per-worker STOP.<pid> files whose worker is already gone.
+  local f pid alive
+  alive=$(worker_pids)
+  for f in "$DRAIN_HOME"/STOP.*; do
+    [ -e "$f" ] || continue
+    pid=${f##*.}
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if ! printf '%s\n' "$alive" | grep -qx "$pid"; then rm -f "$f"; fi
+  done
+}
+
+cmd_status() { # [project] [-w|--watch] [--workers] [--verbose]
+  need_script
+  local project="" watch=0 workers=0 verbose=0 a
+  for a in "$@"; do
+    case "$a" in
+      -w|--watch) watch=1 ;;
+      --workers) workers=1 ;;
+      -v|--verbose) verbose=1 ;;
+      -*) die "unknown status option: $a (try: drain help)" ;;
+      *) [ -z "$project" ] || die "unexpected argument: $a (try: drain help)"; project="$a" ;;
+    esac
+  done
+  [ "$project" = "all" ] && project=""
+  if [ "$workers" = 1 ]; then
+    PROJECT_FILTER="$project" bash "$DRAIN_SCRIPT" workers
+  elif [ "$watch" = 1 ]; then
+    if [ "$verbose" = 1 ]; then export DRAIN_VERBOSE=1; fi
+    PROJECT_FILTER="$project" bash "$DRAIN_SCRIPT" watch
+  else
+    if [ "$verbose" = 1 ]; then export DRAIN_VERBOSE=1; fi
+    PROJECT_FILTER="$project" bash "$DRAIN_SCRIPT" status
+  fi
+}
+
+cmd_start() { # [N] [project|all] [--failed]
+  need_script
+  local n="" project="" retry=0 running i logf a
+  for a in "$@"; do
+    case "$a" in
+      "") ;;
+      --failed) retry=1 ;;
+      *)
+        if [[ "$a" =~ ^[0-9]+$ ]] && [ -z "$n" ]; then n="$a"
+        elif [ -z "$project" ]; then project="$a"
+        else die "unexpected argument: $a (try: drain help)"; fi ;;
+    esac
+  done
+  [ -n "$n" ] || n=2
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer"
+  [ "$n" -le 8 ] || die "max 8 workers"
+  [ "$project" = "all" ] && project=""
+  mkdir -p "$LOG_DIR"
+  if [ -e "$STOP_FILE" ]; then rm -f "$STOP_FILE"; echo "cleared STOP file."; fi
+  prune_stale_stops
+  running=$(worker_count)
+  if [ "$running" -gt 0 ]; then echo "note: $running worker(s) already running; starting $n more."; fi
+  [ -n "$project" ] && export PROJECT_FILTER="$project"
+  [ "$retry" = 1 ] && export DRAIN_RETRY_FAILED=1
+  local mode_desc=""
+  [ -n "$project" ] && mode_desc=" [project=$project]"
+  [ "$retry" = 1 ] && mode_desc="$mode_desc [retrying failed]"
+  for i in $(seq 1 "$n"); do
+    logf="$LOG_DIR/worker-$i.log"
+    { echo ""; echo "===== run started $(date '+%F %T')$mode_desc ====="; } >>"$logf"
+    nohup bash "$DRAIN_SCRIPT" >>"$logf" 2>&1 &
+    echo "started worker $i (pid $!$mode_desc, log $logf)"
+  done
+  if [ "$retry" = 1 ]; then
+    echo "They'll reprocess failed tasks (one retry each), then exit. 'drain stop' to halt."
+  else
+    echo "They'll work until the queue is empty, then exit. 'drain stop' to halt."
+  fi
+}
+
+cmd_stop() { # [N|all] -- default all
+  local target="${1:-all}"
+  [ $# -le 1 ] || die "usage: drain stop [N|all]"
+  case "$target" in
+    all|"") target="all" ;;
+    *) [[ "$target" =~ ^[1-9][0-9]*$ ]] || die "usage: drain stop [N|all] (N = positive integer)" ;;
+  esac
+  mkdir -p "$DRAIN_HOME"
+  prune_stale_stops
+  local running pids pid stopped=0
+  running=$(worker_count)
+  [ "$running" -gt 0 ] || { echo "no workers running."; return 0; }
+  if [ "$target" = "all" ]; then
+    touch "$STOP_FILE"
+    echo "graceful stop requested for all $running worker(s). They'll exit after their current task."
+  elif [ "$target" -ge "$running" ]; then
+    touch "$STOP_FILE"
+    echo "graceful stop requested for all $running worker(s) ($target >= running). They'll exit after their current task."
+  else
+    pids=$(worker_pids)
+    while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      [ "$stopped" -lt "$target" ] || break
+      touch "$STOP_FILE.$pid"
+      echo "graceful stop requested for worker pid $pid (finishes current task, then exits)."
+      stopped=$((stopped+1))
+    done <<<"$pids"
+    echo "$stopped of $running worker(s) stopping. Check with: drain status"
+  fi
+  echo "Check with: drain status"
+}
+
+cmd_kill() {
+  if [ "$(worker_count)" -gt 0 ]; then
+    pkill -TERM -f "(^|[^A-Za-z0-9_-])task-drain\.sh$"
+    echo "TERM sent. In-flight tasks are released back to pending."
+  else
+    echo "no workers running."
+  fi
+}
+
+cmd_resume() {
+  rm -f "$STOP_FILE" "$DRAIN_HOME"/STOP.*
+  echo "STOP cleared (global + per-worker). Start workers with: drain start [N] [project]"
+}
+
+cmd_logs() { # [-f]
+  local follow=0 l
+  [ "${1:-}" = "-f" ] && follow=1
+  local logs=( "$LOG_DIR"/worker-*.log )
+  [ -e "${logs[0]}" ] || die "no worker logs yet in $LOG_DIR"
+  if [ "$follow" = 1 ]; then
+    tail -f "${logs[@]}"
+  else
+    for l in "${logs[@]}"; do echo "--- $l"; tail -n 30 "$l"; done
+  fi
+}
+
+cmd_help() {
+  awk 'NR<2{next} /^#/||/^$/{print; next} {exit}' "$0" | sed 's/^# //; s/^#//'
+}
+
+cmd_docs() {
+  cat <<'DOCS_EOF'
+DRAIN -- autonomous Taskwarrior queue workers
+============================================
+
+WHAT IT DOES
+  Each worker loops: sync -> pick the highest-urgency eligible task ->
+  claim it -> run `opencode run` on it -> verify -> repeat until the
+  queue is empty, then exits.
+
+WHAT GETS PICKED UP
+  Nothing special is required. Pickup is OPT-OUT: any task is eligible
+  unless it is:
+    - already active (started by someone or something)
+    - waiting (scheduled for a future date)
+    - blocked (has an unmet dependency)
+    - tagged noauto        (your opt-out)
+    - tagged drain-failed  (a worker already tried and couldn't finish it)
+  Among eligible tasks, highest urgency goes first. Limit to one project:
+    drain start 2 attendeesync
+
+TAGS
+  noauto
+    Tag a task and drain workers will never touch it. Use for tasks that
+    need you, interactive-only work, or anything you don't want a free
+    model grinding on unattended:
+      /opt/homebrew/bin/task <uuid> modify +noauto
+  drain-failed
+    Set automatically when a worker attempt ends without the task being
+    completed (agent failed it, crashed, timed out, or finished nothing).
+    Regular workers never retry these. To give them another shot, either
+    re-queue (a normal worker picks it up):
+      /opt/homebrew/bin/task <uuid> modify -drain-failed
+    or retry directly without untagging:
+      drain start 2 --failed                (all projects)
+      drain start 2 attendeesync --failed   (one project)
+    A --failed retry that fails again keeps drain-failed; each task gets
+    at most one retry per --failed run, so nothing loops forever.
+    Everything failed is listed under `drain status` ("needs Lou's eyes").
+  drain-claimed
+    Set automatically while a worker owns a task. Don't set it by hand.
+    If a worker dies mid-task, its claim is auto-released after 4 hours.
+    Only worker claims are ever released -- your interactive sessions'
+    active tasks are never touched.
+
+RETRYING FAILED TASKS
+  drain start [N] [project] --failed
+    Spins up workers that reprocess drain-failed tasks instead of the
+    regular queue. The failed set is snapshotted when each worker starts;
+    every failed task gets at most one retry per run, so a task that fails
+    again can't loop -- it keeps drain-failed for the next explicit retry.
+    Combine with a project:  drain start 2 attendeesync --failed
+
+WHAT THE AGENT IS TOLD
+  Every worker hands its task to `opencode run` with a prompt enforcing:
+    - Taskwarrior is the only system of record. Sync at session start,
+      after every change, and at session end. Never work offline. Never
+      change the sync client ID. Reference tasks by UUID, never short IDs.
+    - Authority: design, security, product, and public-facing decisions
+      belong to Lou + Juno. If the task needs human judgment, credentials
+      it lacks, a legal/compliance declaration, or anything public or
+      irreversible, the agent must annotate what's needed and FAIL the
+      task -- never decide on its own.
+    - Completion contract: verify for real (build, tests, or the task's
+      own acceptance criteria). Only then `task <uuid> done`. Partial or
+      unverified work is failed, never marked done.
+
+STOPPING
+  drain stop        graceful all: no new pickups; in-flight tasks finish, workers exit
+  drain stop all    same as bare 'drain stop'
+  drain stop N      graceful: stop N workers (newest first); each finishes its
+                    current task, then exits. N >= running stops all.
+  drain kill    immediate: workers die mid-task; claims released to pending
+  drain resume  clear the STOP file (doesn't start workers)
+
+LOGS
+  ~/.task-drain/logs/worker-N.log      drain logs [-f]
+
+VIEWS
+  drain status              queue dashboard (one snapshot)
+  drain status -w           same, live (q quits, DRAIN_WATCH_INTERVAL=5)
+  drain status --workers    live per-worker view: each worker's current
+                            task + time-budget meter (q quits). With a
+                            project, other projects are dimmed:
+                              drain status attendeesync --workers
+
+SAFETY DIALS (edit at the top of bin/task-drain.sh)
+  --dangerously-skip-permissions : unattended runs need this or they stall
+      on the first approval prompt; it lets the agent edit/run/push freely.
+      This is the main risk dial.
+  STALE_AFTER_SEC=14400  : release worker claims older than 4 hours
+  TASK_TIMEOUT_SEC=7200  : per-task wall clock (needs `gtimeout`)
+DOCS_EOF
+}
+
+case "${1:-}" in
+  "") cmd_help ;;
+  status) shift; cmd_status "$@" ;;
+  docs) cmd_docs ;;
+  start)  shift; cmd_start "$@" ;;
+  stop)   shift; cmd_stop "$@" ;;
+  kill)   cmd_kill ;;
+  resume) cmd_resume ;;
+  logs)   shift; cmd_logs "${1:-}" ;;
+  help|--help|-h) cmd_help ;;
+  *)      die "unknown command: $1 (try: drain help)" ;;
+esac
