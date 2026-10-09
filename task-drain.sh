@@ -99,12 +99,22 @@ _DRAIN_DEFAULT_TIMEOUT=14400
 PROJECT_FILTER="${PROJECT_FILTER:-}"
 DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-0}" # 1 = reprocess drain-failed tasks instead of the regular queue
 
+# Single sync attempt. macOS 26 Local Network Privacy blocks third-party
+# (Homebrew, unsigned) binaries from the LAN taskserver (EHOSTUNREACH), while
+# root bypasses it -- so fall back to sudo when the direct sync fails. sudo
+# runs with the user's HOME/TASKRC, keeping the task DB user-owned. Requires
+# NOPASSWD for the task binary in sudoers.
+task_sync() {
+	"$TASK" sync >/dev/null 2>&1 && return 0
+	sudo env HOME="$HOME" TASKRC="${TASKRC:-$HOME/.taskrc}" "$TASK" sync >/dev/null 2>&1
+}
+
 # Wrapper for task sync with retry. The TaskChampion sync endpoint flakes
 # intermittently; a single failed sync must not abort a worker or fail a task.
 sync_with_retry() {
-	local attempt=1 delay=3
+	local attempt=1 delay="${DRAIN_SYNC_RETRY_DELAY:-3}"
 	while [ $attempt -le 3 ]; do
-		if "$TASK" sync >/dev/null 2>&1; then return 0; fi
+		if task_sync; then return 0; fi
 		[ $attempt -lt 3 ] && sleep $delay
 		attempt=$((attempt + 1)); delay=$((delay * 2))
 	done
@@ -404,7 +414,7 @@ run_one() { # $1 = task export JSON
 	kill "$ANNOTATOR_PID" 2>/dev/null || true
 	wait "$ANNOTATOR_PID" 2>/dev/null || true
 
-	$TASK sync >/dev/null || true
+	sync_with_retry || true
 	status=$($TASK "$uuid" export 2>/dev/null | jq -r '.[0].status // "unknown"')
 	CURRENT_UUID=""
 	if [ "$status" = "completed" ]; then

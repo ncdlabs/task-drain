@@ -37,7 +37,12 @@ setup() {
     mkdir -p "$(dirname "$TASK")"
     cat > "$TASK" << 'MOCK'
 #!/usr/bin/env bash
-# Mock task command for testing
+# Mock task command for testing.
+# Simulates macOS Local Network Privacy: the direct sync fails when
+# MOCK_SYNC_FAIL=1, and succeeds once the sudo fallback has run (MOCK_SUDO_OK).
+if [ "${MOCK_SYNC_FAIL:-0}" = "1" ] && [ -z "${MOCK_SUDO_OK:-}" ]; then
+    exit 1
+fi
 echo "mock-task $@"
 MOCK
     chmod +x "$TASK"
@@ -50,6 +55,7 @@ MOCK
 teardown() {
     rm -rf "$BATS_TEST_DIRNAME/fake-home"
     rm -rf "$BATS_TEST_DIRNAME/fixtures"
+    rm -rf "$BATS_TEST_DIRNAME/bin" # fake sudo for LNP fallback tests
     rm -f "$TASK"
 }
 
@@ -214,6 +220,50 @@ load_functions() {
     unset DRAIN_SKIP_PERMISSIONS
 }
 
+# --- task sync with sudo fallback (macOS Local Network Privacy) ---
+
+@test "sync_with_retry succeeds when direct sync works" {
+    load_functions
+    run sync_with_retry
+    [ "$status" -eq 0 ]
+}
+
+@test "sync_with_retry falls back to sudo when direct sync fails (LNP)" {
+    load_functions
+    # Fake sudo: runs the real command with MOCK_SUDO_OK set, so the mock
+    # task succeeds on the fallback path where the direct call failed.
+    mkdir -p "$BATS_TEST_DIRNAME/bin"
+    cat > "$BATS_TEST_DIRNAME/bin/sudo" << 'FAKESUDO'
+#!/usr/bin/env bash
+MOCK_SUDO_OK=1
+export MOCK_SUDO_OK
+exec "$@"
+FAKESUDO
+    chmod +x "$BATS_TEST_DIRNAME/bin/sudo"
+    export PATH="$BATS_TEST_DIRNAME/bin:$PATH"
+    export MOCK_SYNC_FAIL=1
+    export DRAIN_SYNC_RETRY_DELAY=0
+    run sync_with_retry
+    [ "$status" -eq 0 ]
+    rm -rf "$BATS_TEST_DIRNAME/bin"
+}
+
+@test "sync_with_retry fails when direct and sudo sync both fail" {
+    load_functions
+    mkdir -p "$BATS_TEST_DIRNAME/bin"
+    cat > "$BATS_TEST_DIRNAME/bin/sudo" << 'FAKESUDO'
+#!/usr/bin/env bash
+exec "$@"
+FAKESUDO
+    chmod +x "$BATS_TEST_DIRNAME/bin/sudo"
+    export PATH="$BATS_TEST_DIRNAME/bin:$PATH"
+    export MOCK_SYNC_FAIL=1
+    export DRAIN_SYNC_RETRY_DELAY=0
+    run sync_with_retry
+    [ "$status" -eq 1 ]
+    rm -rf "$BATS_TEST_DIRNAME/bin"
+}
+
 # --- drain CLI help system ---
 
 @test "drain help produces output" {
@@ -245,6 +295,10 @@ load_functions() {
 }
 
 @test "drain autoscale --min 2 --max 4 parses correctly" {
+    # Pre-seed the pidfile with a live PID so the "already running" guard
+    # fires and the command exits without spawning a real autoscaler daemon
+    # (setup fakes HOME, so the real pidfile is never seen here).
+    echo $$ > "$HOME/.task-drain/autoscale.pid"
     run "$SCRIPT_DIR/drain" autoscale --min 2 --max 4
     [[ "$output" != *"unexpected argument"* ]]
 }

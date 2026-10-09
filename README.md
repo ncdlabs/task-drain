@@ -34,6 +34,12 @@ reference or manual installs:
   ```
   Each machine needs its own `client_id` and its own `data.location`.
   There is currently no public hosted TaskChampion sync service.
+- **macOS 26+ (Local Network Privacy).** If the taskserver is on your LAN,
+  macOS may block third-party (e.g. Homebrew) binaries from reaching it
+  (`EHOSTUNREACH`). `task-drain.sh` falls back to `sudo task sync` — root
+  bypasses LNP, and the DB stays user-owned — which needs NOPASSWD for the
+  task binary in sudoers. Granting the agent binary Local Network permission
+  in System Settings > Privacy & Security > Local Network also works.
 - **An agent CLI** on PATH (pick one with `DRAIN_AGENT`):
   - `opencode` (v2) — workers invoke `opencode run --standalone
     --dangerously-skip-permissions`
