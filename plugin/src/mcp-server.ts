@@ -68,5 +68,17 @@ async function main() {
 
 main().catch((err) => {
   console.error("taskwarrior-mcp failed:", err);
+  // Report to webhook if configured
+  const webhook = process.env.DRAIN_ERROR_WEBHOOK;
+  if (webhook) {
+    const payload = JSON.stringify({
+      text: `taskwarrior-mcp failed: ${err?.message ?? String(err)}`,
+    });
+    fetch(webhook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+    }).catch(() => {});
+  }
   process.exit(1);
 });

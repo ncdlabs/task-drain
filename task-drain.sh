@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+# Source shared display and worker detection functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/display.sh
+source "$SCRIPT_DIR/lib/display.sh"
+# shellcheck source=lib/worker-detect.sh
+source "$SCRIPT_DIR/lib/worker-detect.sh"
 #
 # task-drain.sh -- autonomous drain worker for the shared Taskwarrior pool.
 #
@@ -39,12 +46,14 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #     drain start [N] [project] --failed
 #
 # SAFETY DIALS:
-#   OPENCODE_RUN_FLAGS -- default --standalone --dangerously-skip-permissions
-#     --model $DRAIN_MODEL (default opencode-go/longcat-2.5-preview-free;
-#     override with the DRAIN_MODEL env var). Without
-#     --dangerously-skip-permissions an unattended run stalls on the first
-#     approval prompt; with it the agent can edit, run, and push without
-#     asking. This is the main risk dial. Verify flags with: opencode run --help
+#   DRAIN_SKIP_PERMISSIONS -- set to 1 to add --dangerously-skip-permissions
+#     to opencode run flags. Without it, unattended runs stall on the first
+#     approval prompt. With it, the agent can edit, run, and push without
+#     asking. This is the main risk dial -- only enable it if you trust the
+#     autonomous worker to operate without human approval.
+#   OPENCODE_RUN_FLAGS -- default --standalone --model $DRAIN_MODEL
+#     (default opencode-go/longcat-2.5-preview-free; override with the
+#     DRAIN_MODEL env var). Verify flags with: opencode run --help
 #     WARNING: an invalid flag here fails EVERY task attempt, and each failure
 #     is failed as +drain-failed -- one bad flag can drain-fail the whole queue
 #     (and workers then exit on the empty eligible set). Test a single task
@@ -68,7 +77,12 @@ TASK="${TASK:-$(command -v task 2>/dev/null || echo /opt/homebrew/bin/task)}"
 OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
 # Model for worker runs. Override with DRAIN_MODEL in the environment.
 DRAIN_MODEL="${DRAIN_MODEL:-opencode-go/longcat-2.5-preview-free}"
-OPENCODE_RUN_FLAGS=(--standalone --dangerously-skip-permissions --model "$DRAIN_MODEL")
+# --dangerously-skip-permissions is OPT-IN (set DRAIN_SKIP_PERMISSIONS=1).
+# Without it, unattended runs stall on the first approval prompt.
+OPENCODE_RUN_FLAGS=(--standalone --model "$DRAIN_MODEL")
+if [ "${DRAIN_SKIP_PERMISSIONS:-0}" = "1" ]; then
+	OPENCODE_RUN_FLAGS+=(--dangerously-skip-permissions)
+fi
 # Agent harness to use for worker runs: opencode | claude | codex.
 # Override with DRAIN_AGENT in the environment.
 DRAIN_AGENT="${DRAIN_AGENT:-opencode}"
@@ -77,6 +91,11 @@ DRAIN_AGENT="${DRAIN_AGENT:-opencode}"
 DRAIN_OWNER="${DRAIN_OWNER:-the project owner}"
 STALE_AFTER_SEC="${STALE_AFTER_SEC:-14400}"   # 4 hours
 TASK_TIMEOUT_SEC="${TASK_TIMEOUT_SEC:-14400}" # 4 hours per task (gtimeout only)
+# Validate numeric environment variables
+[[ "$STALE_AFTER_SEC" =~ ^[0-9]+$ ]] || STALE_AFTER_SEC=14400
+[[ "$TASK_TIMEOUT_SEC" =~ ^[0-9]+$ ]] || TASK_TIMEOUT_SEC=14400
+# Default timeout used in cmd_workers display (kept in sync with above)
+_DRAIN_DEFAULT_TIMEOUT=14400
 PROJECT_FILTER="${PROJECT_FILTER:-}"
 DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-0}" # 1 = reprocess drain-failed tasks instead of the regular queue
 RETRY_SNAPSHOT=""                             # temp file holding retry UUIDs for this run
@@ -87,6 +106,20 @@ CHILD_PID=""
 CURRENT_UUID=""
 
 log() { printf '[%s] [%s] %s\n' "$(date '+%F %T')" "$WORKER_ID" "$*" >&2; }
+
+# Debug logging: set DRAIN_DEBUG=1 for verbose output
+debug() { [ "${DRAIN_DEBUG:-0}" = "1" ] && printf '[%s] [%s] DEBUG: %s\n' "$(date '+%F %T')" "$WORKER_ID" "$*" >&2 || true; }
+
+# Error reporting: send critical failures to a webhook (Slack, Discord, etc.)
+# Set DRAIN_ERROR_WEBHOOK to enable. Errors are also always logged locally.
+report_error() { # $1 = error message
+	local webhook="${DRAIN_ERROR_WEBHOOK:-}"
+	[ -n "$webhook" ] || return 0
+	local payload
+	payload=$(jq -nc --arg worker "$WORKER_ID" --arg msg "$1" --arg host "$(hostname -s)" \
+		'{text: "🚨 task-drain error on \($host) [\($worker)]: \($msg)"}')
+	curl -s -X POST -H 'Content-Type: application/json' -d "$payload" "$webhook" >/dev/null 2>&1 || true
+}
 
 stop_requested() { [ -e "$STOP_FILE" ] || [ -e "${STOP_FILE}.$$" ]; }
 
@@ -99,21 +132,27 @@ stop_scope() { # why this worker is stopping: global|personal|none
 }
 
 claim_task() { # $1 = uuid
-	$TASK "$1" modify +drain-claimed >/dev/null
-	if [ "$DRAIN_RETRY_FAILED" = "1" ]; then
-		$TASK "$1" modify -drain-failed >/dev/null
-		$TASK "$1" annotate "drain worker $WORKER_ID retrying previously failed attempt ($(date -u +%Y-%m-%dT%H:%M:%SZ))" >/dev/null
-	else
-		$TASK "$1" annotate "claimed by $WORKER_ID at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null
+	if ! $TASK "$1" modify +drain-claimed >/dev/null 2>&1; then
+		report_error "claim_task: failed to add drain-claimed tag to $1"
+		return 1
 	fi
-	$TASK "$1" start >/dev/null
-	$TASK sync >/dev/null
+	if [ "$DRAIN_RETRY_FAILED" = "1" ]; then
+		$TASK "$1" modify -drain-failed >/dev/null 2>&1 || true
+		$TASK "$1" annotate "drain worker $WORKER_ID retrying previously failed attempt ($(date -u +%Y-%m-%dT%H:%M:%SZ))" >/dev/null 2>&1 || true
+	else
+		$TASK "$1" annotate "claimed by $WORKER_ID at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1 || true
+	fi
+	if ! $TASK "$1" start >/dev/null 2>&1; then
+		report_error "claim_task: failed to start task $1"
+		return 1
+	fi
+	$TASK sync >/dev/null 2>&1 || report_error "claim_task: sync failed after claiming $1"
 }
 
 release_claim() { # $1 = uuid, $2 = reason annotation
-	$TASK "$1" modify -drain-claimed >/dev/null || true
-	$TASK "$1" annotate "$2" >/dev/null || true
-	$TASK "$1" stop >/dev/null || true
+	$TASK "$1" modify -drain-claimed >/dev/null 2>&1 || report_error "release_claim: failed to remove drain-claimed from $1"
+	$TASK "$1" annotate "$2" >/dev/null 2>&1 || true
+	$TASK "$1" stop >/dev/null 2>&1 || true
 }
 
 cleanup_retry() { [ -n "$RETRY_SNAPSHOT" ] && rm -f "$RETRY_SNAPSHOT" "$RETRY_SNAPSHOT.tmp"; }
@@ -140,7 +179,7 @@ repo_for_project() {
 	local conf="$HOME/.task-drain/repos.conf" proj path
 	if [ -f "$conf" ]; then
 		while IFS='=' read -r proj path; do
-			case "$proj" in ''|\#*) continue ;; esac
+			case "$proj" in '' | \#*) continue ;; esac
 			if [ "$proj" = "${1:-}" ]; then
 				path="${path/#\~/$HOME}"
 				path="${path//\$HOME/$HOME}"
@@ -172,7 +211,14 @@ pick_task() {
 	local filter="+PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed"
 	if [ -n "$PROJECT_FILTER" ]; then filter="project:$PROJECT_FILTER $filter"; fi
 	# shellcheck disable=SC2086
-	$TASK $filter export 2>/dev/null | jq -c 'sort_by(.urgency // 0) | reverse | .[0] // empty'
+	local export_output
+	export_output=$($TASK $filter export 2>/dev/null)
+	if [ -z "$export_output" ]; then
+		report_error "pick_task: task export returned empty (binary missing or sync error?)"
+		echo ""
+		return
+	fi
+	echo "$export_output" | jq -c 'sort_by(.urgency // 0) | reverse | .[0] // empty'
 }
 
 # Retry mode: pop UUIDs off the startup snapshot. Each failed task is retried
@@ -196,15 +242,20 @@ pick_retry_task() {
 
 reclaim_stale() {
 	local cutoff=$(($(date +%s) - STALE_AFTER_SEC))
-	$TASK +drain-claimed +ACTIVE export 2>/dev/null |
+	local stale_uuids
+	stale_uuids=$($TASK +drain-claimed +ACTIVE export 2>/dev/null |
 		jq -r --argjson cutoff "$cutoff" \
-			'.[] | select(.start and ((.start | strptime("%Y%m%dT%H%M%SZ") | mktime) < $cutoff)) | .uuid' |
-		while IFS= read -r uuid; do
-			[ -n "$uuid" ] || continue
-			log "releasing stale claim: $uuid"
-			release_claim "$uuid" "drain worker: released stale claim (active > $((STALE_AFTER_SEC / 3600))h, no completion)"
-		done || true
-	$TASK sync >/dev/null || true
+			'.[] | select(.start and ((.start | strptime("%Y%m%dT%H%M%SZ") | mktime) < $cutoff)) | .uuid' 2>/dev/null)
+	if [ -z "$stale_uuids" ]; then
+		debug "reclaim_stale: no stale claims found"
+		return
+	fi
+	echo "$stale_uuids" | while IFS= read -r uuid; do
+		[ -n "$uuid" ] || continue
+		log "releasing stale claim: $uuid"
+		release_claim "$uuid" "drain worker: released stale claim (active > $((STALE_AFTER_SEC / 3600))h, no completion)"
+	done
+	$TASK sync >/dev/null 2>&1 || report_error "reclaim_stale: sync failed after releasing stale claims"
 }
 
 build_prompt() { # $1 uuid $2 project $3 priority $4 description $5 annotations $6 repo
@@ -290,33 +341,33 @@ run_one() { # $1 = task export JSON
 	# as +drain-failed without doing any work.
 	# Launch the agent harness. Each harness has its own non-interactive CLI.
 	case "$DRAIN_AGENT" in
-		opencode)
-			if command -v gtimeout >/dev/null 2>&1; then
-				(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" < /dev/null) &
-			else
-				(cd "$repo" && exec "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" < /dev/null) &
-			fi
-			;;
-		claude)
-			# Claude Code headless: claude -p prints the final response and exits.
-			if command -v gtimeout >/dev/null 2>&1; then
-				(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" claude -p "$prompt" < /dev/null) &
-			else
-				(cd "$repo" && exec claude -p "$prompt" < /dev/null) &
-			fi
-			;;
-		codex)
-			# Codex CLI non-interactive: codex exec runs the prompt and exits.
-			if command -v gtimeout >/dev/null 2>&1; then
-				(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" codex exec "$prompt" < /dev/null) &
-			else
-				(cd "$repo" && exec codex exec "$prompt" < /dev/null) &
-			fi
-			;;
-		*)
-			log "ERROR: unknown DRAIN_AGENT='$DRAIN_AGENT' (expected opencode|claude|codex)"
-			return 1
-			;;
+	opencode)
+		if command -v gtimeout >/dev/null 2>&1; then
+			(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" </dev/null) &
+		else
+			(cd "$repo" && exec "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" </dev/null) &
+		fi
+		;;
+	claude)
+		# Claude Code headless: claude -p prints the final response and exits.
+		if command -v gtimeout >/dev/null 2>&1; then
+			(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" claude -p "$prompt" </dev/null) &
+		else
+			(cd "$repo" && exec claude -p "$prompt" </dev/null) &
+		fi
+		;;
+	codex)
+		# Codex CLI non-interactive: codex exec runs the prompt and exits.
+		if command -v gtimeout >/dev/null 2>&1; then
+			(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" codex exec "$prompt" </dev/null) &
+		else
+			(cd "$repo" && exec codex exec "$prompt" </dev/null) &
+		fi
+		;;
+	*)
+		log "ERROR: unknown DRAIN_AGENT='$DRAIN_AGENT' (expected opencode|claude|codex)"
+		return 1
+		;;
 	esac
 	CHILD_PID=$!
 
@@ -342,17 +393,19 @@ run_one() { # $1 = task export JSON
 		return 0
 	fi
 	log "not completed (agent rc=$rc, status=$status) -- failed, will not auto-retry"
-	$TASK "$uuid" modify +drain-failed >/dev/null || true
+	if ! $TASK "$uuid" modify +drain-failed >/dev/null 2>&1; then
+		report_error "run_one: failed to tag $uuid as drain-failed (task may be re-picked)"
+	fi
 	release_claim "$uuid" "drain worker $WORKER_ID: agent exited (rc=$rc) without completing; tagged drain-failed, not auto-retried"
-	$TASK sync >/dev/null || true
+	$TASK sync >/dev/null 2>&1 || report_error "run_one: sync failed after marking $uuid as drain-failed"
 	return 1
 }
 
 run_worker() {
 	case "$DRAIN_AGENT" in
-		opencode) _agent_bin="$OPENCODE_BIN" ;;
-		claude)   _agent_bin="claude" ;;
-		codex)    _agent_bin="codex" ;;
+	opencode) _agent_bin="$OPENCODE_BIN" ;;
+	claude) _agent_bin="claude" ;;
+	codex) _agent_bin="codex" ;;
 	esac
 	command -v "$_agent_bin" >/dev/null 2>&1 || {
 		log "ERROR: '$_agent_bin' (DRAIN_AGENT=$DRAIN_AGENT) not found on PATH"
@@ -430,49 +483,14 @@ cmd_status() {
 		exit 1
 	}
 
-	# --- terminal setup: color only on a TTY, respect NO_COLOR ---
-	local use_color=0
-	if [ -n "${DRAIN_FORCE_COLOR:-}" ] && [ -z "${NO_COLOR:-}" ]; then
-		use_color=1
-	elif [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then use_color=1; fi
-	local B="" C="" G="" Y="" R="" M="" DIM="" RESET=""
-	if [ "$use_color" = 1 ]; then
-		B=$'\033[1m'
-		C=$'\033[36m'
-		G=$'\033[32m'
-		Y=$'\033[33m'
-		R=$'\033[31m'
-		M=$'\033[35m'
-		DIM=$'\033[2m'
-		RESET=$'\033[0m'
-	fi
-	local cols
-	cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
-	[[ "$cols" =~ ^[0-9]+$ ]] || cols=80
-	[ "$cols" -ge 40 ] || cols=40
-	[ "$cols" -le 200 ] || cols=200
-
-	divider() {
-		local i
-		for ((i = 0; i < cols; i++)); do printf '─'; done
-		printf '\n'
-	}
-	section() { printf '\n%s%s%s%s%s\n' "$B" "$C" "$1" "$RESET" ""; }
-	trunc_str() { # $1=text $2=maxlen
-		local s="$1" max="$2"
-		if [ "${#s}" -gt "$max" ]; then printf '%s…' "${s:0:$((max - 1))}"; else printf '%s' "$s"; fi
-	}
-	bar() { # $1=n $2=max $3=width
-		local n="$1" max="$2" width="${3:-18}" fill empty i
-		[[ "$n" =~ ^[0-9]+$ ]] || n=0
-		[[ "$max" =~ ^[0-9]+$ ]] || max=1
-		[ "$max" -ge 1 ] || max=1
-		fill=$((n * width / max))
-		[ "$fill" -gt "$width" ] && fill=$width
-		empty=$((width - fill))
-		for ((i = 0; i < fill; i++)); do printf '█'; done
-		for ((i = 0; i < empty; i++)); do printf '░'; done
-	}
+	# --- terminal setup: shared display functions ---
+	drain_terminal_setup
+	local B="$DRAIN_B" C="$DRAIN_C" G="$DRAIN_G" Y="$DRAIN_Y" R="$DRAIN_R" M="$DRAIN_M" DIM="$DRAIN_DIM" RESET="$DRAIN_RESET"
+	local cols="$DRAIN_COLS"
+	alias divider=drain_divider
+	alias section=drain_section
+	alias trunc_str=drain_trunc_str
+	alias bar=drain_bar
 
 	# Optional project scoping (`drain status <project>` sets PROJECT_FILTER).
 	# tq = task query with the scope applied; plain $TASK stays global (sync).
@@ -490,19 +508,9 @@ cmd_status() {
 		sync_state="${DIM}sync: watch (no re-sync)${RESET}"
 	elif ! $TASK sync >/dev/null 2>&1; then sync_state="${Y}sync: FAILED (showing local state)${RESET}"; fi
 
-	# --- workers (portable ps; macOS pgrep lacks -c/-a-print) ---
-	# Never match self or ancestors (a status probe's own command line
-	# names the worker script).
-	local worker_ps nworkers _skip="$$" _p=$PPID _ppid _guard=0
-	while [[ "$_p" =~ ^[0-9]+$ ]] && [ "$_p" -gt 1 ] && [ "$_guard" -lt 64 ]; do
-		_skip="$_skip|$_p"
-		_ppid=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)
-		[[ "$_ppid" =~ ^[0-9]+$ ]] || break
-		_p=$_ppid
-		_guard=$((_guard + 1))
-	done
-	worker_ps=$(ps -eo pid,ppid,etime,command 2>/dev/null |
-		awk -v skip="^($_skip)$" '/(^|[^A-Za-z0-9_-])[t]ask-drain\.sh/ && !/ status/ && !/ watch/ && !/ workers/ && $1 !~ skip { pid=$1; ppid=$2; pids[pid]=1; parent[pid]=ppid; et[pid]=$3; $1=$2=$3=""; sub(/^   */, ""); cmd[pid]=$0; next } END { for (p in pids) if (!(parent[p] in pids)) print p, et[p], cmd[p] }' | sort -n || true)
+	# --- workers (shared detection logic) ---
+	local worker_ps nworkers
+	worker_ps=$(drain_worker_info)
 	if [ -z "$worker_ps" ]; then nworkers=0; else nworkers=$(printf '%s\n' "$worker_ps" | wc -l | tr -d ' '); fi
 	[[ "$nworkers" =~ ^[0-9]+$ ]] || nworkers=0
 
@@ -809,66 +817,18 @@ cmd_workers() {
 		exit 1
 	}
 
-	# --- terminal setup (same convention as cmd_status) ---
-	local use_color=0
-	if [ -n "${DRAIN_FORCE_COLOR:-}" ] && [ -z "${NO_COLOR:-}" ]; then
-		use_color=1
-	elif [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then use_color=1; fi
-	local B="" C="" G="" Y="" R="" M="" DIM="" RESET=""
-	if [ "$use_color" = 1 ]; then
-		B=$'\033[1m'
-		C=$'\033[36m'
-		G=$'\033[32m'
-		Y=$'\033[33m'
-		R=$'\033[31m'
-		M=$'\033[35m'
-		DIM=$'\033[2m'
-		RESET=$'\033[0m'
-	fi
-	local cols
-	cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
-	[[ "$cols" =~ ^[0-9]+$ ]] || cols=80
-	[ "$cols" -ge 40 ] || cols=40
-	[ "$cols" -le 200 ] || cols=200
-
-	divider() {
-		local i
-		for ((i = 0; i < cols; i++)); do printf '─'; done
-		printf '\n'
-	}
-	trunc_str() { # $1=text $2=maxlen
-		local s="$1" max="$2"
-		if [ "${#s}" -gt "$max" ]; then printf '%s…' "${s:0:$((max - 1))}"; else printf '%s' "$s"; fi
-	}
+	# --- terminal setup (shared display functions) ---
+	drain_terminal_setup
+	local B="$DRAIN_B" C="$DRAIN_C" G="$DRAIN_G" Y="$DRAIN_Y" R="$DRAIN_R" M="$DRAIN_M" DIM="$DRAIN_DIM" RESET="$DRAIN_RESET"
+	local cols="$DRAIN_COLS"
+	alias divider=drain_divider
+	alias trunc_str=drain_trunc_str
+	alias meter=drain_meter
+	alias fmt_dur=drain_fmt_dur
 	fit() { # $1=text $2=fixed-overhead -> text truncated to fit $cols (min 10)
 		local s="$1" max=$((cols - $2))
 		[ "$max" -ge 10 ] || max=10
 		trunc_str "$s" "$max"
-	}
-	meter() { # $1=elapsed_sec $2=budget_sec $3=width -> capped bar
-		local el="$1" budget="$2" width="${3:-14}" fill empty i
-		[[ "$el" =~ ^[0-9]+$ ]] || el=0
-		[[ "$budget" =~ ^[0-9]+$ ]] || budget=1
-		[ "$budget" -ge 1 ] || budget=1
-		fill=$((el * width / budget))
-		[ "$fill" -gt "$width" ] && fill=$width
-		empty=$((width - fill))
-		for ((i = 0; i < fill; i++)); do printf '█'; done
-		for ((i = 0; i < empty; i++)); do printf '░'; done
-	}
-	fmt_dur() { # $1=sec -> 45s / 12m / 3h / 2d ; unknown -> ?
-		local s="$1"
-		[[ "$s" =~ ^[0-9]+$ ]] || {
-			printf '?'
-			return
-		}
-		if [ "$s" -lt 60 ]; then
-			printf '%ss' "$s"
-		elif [ "$s" -lt 7200 ]; then
-			printf '%sm' "$((s / 60))"
-		elif [ "$s" -lt 172800 ]; then
-			printf '%sh' "$((s / 3600))"
-		else printf '%sd' "$((s / 86400))"; fi
 	}
 
 	# --- sync (skipped on watch refreshes; first frame syncs) ---
@@ -892,7 +852,7 @@ cmd_workers() {
 
 	# --- claimed tasks, global (project dimming happens at render) ---
 	# Worker->task link: claim_task() annotates "claimed by drain-HOST-PID at …".
-	local budget="${TASK_TIMEOUT_SEC:-7200}" stale_after="${STALE_AFTER_SEC:-14400}"
+	local budget="${TASK_TIMEOUT_SEC:-$_DRAIN_DEFAULT_TIMEOUT}" stale_after="${STALE_AFTER_SEC:-14400}"
 	[[ "$budget" =~ ^[0-9]+$ ]] || budget=7200
 	[[ "$stale_after" =~ ^[0-9]+$ ]] || stale_after=14400
 	local claims rows
@@ -1126,24 +1086,24 @@ autoscale_supervisor() {
 		running=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | wc -l | tr -d ' ')
 		[[ "$running" =~ ^[0-9]+$ ]] || running=0
 		# Exclude ourselves from the count
-		running=$(( running > 0 ? running - 1 : 0 ))
+		running=$((running > 0 ? running - 1 : 0))
 
 		# Desired workers: enough to cover eligible tasks, clamped to [min, max]
-		local desired=$(( (eligible + tasks_per_worker - 1) / tasks_per_worker ))
+		local desired=$(((eligible + tasks_per_worker - 1) / tasks_per_worker))
 		[ "$desired" -lt "$min_w" ] && desired="$min_w"
 		[ "$desired" -gt "$max_w" ] && desired="$max_w"
 		# If nothing eligible and min is 0, scale to zero
 		if [ "$eligible" -eq 0 ] && [ "$min_w" -eq 0 ]; then desired=0; fi
 
 		if [ "$desired" -gt "$running" ]; then
-			local to_start=$(( desired - running ))
+			local to_start=$((desired - running))
 			log "autoscaler: eligible=$eligible running=$running -> starting $to_start worker(s)"
 			for _i in $(seq 1 "$to_start"); do
 				local logf="$LOG_DIR/worker-$(date '+%Y%m%d-%H%M%S')-autoscale-$_.log"
 				nohup bash "$DRAIN_SCRIPT" >>"$logf" 2>&1 &
 			done
 		elif [ "$desired" -lt "$running" ]; then
-			local to_stop=$(( running - desired ))
+			local to_stop=$((running - desired))
 			log "autoscaler: eligible=$eligible running=$running -> stopping $to_stop worker(s) gracefully"
 			# Signal excess workers via per-worker STOP files (they finish current task)
 			local pids

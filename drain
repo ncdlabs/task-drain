@@ -65,25 +65,17 @@ DRAIN_HOME="$HOME/.task-drain"
 LOG_DIR="$DRAIN_HOME/logs"
 STOP_FILE="$DRAIN_HOME/STOP"
 
+# Source shared worker detection functions
+# shellcheck source=lib/worker-detect.sh
+source "$SCRIPT_DIR/lib/worker-detect.sh"
+
 die() { echo "drain: $*" >&2; exit 1; }
 
 need_script() { [ -f "$DRAIN_SCRIPT" ] || die "worker script not found: $DRAIN_SCRIPT"; }
 
 worker_pids() {
-  # Portable: macOS pgrep lacks -c print-count mode. Newest first (PID desc).
-  # Never match self or ancestors: a caller whose own command line names the
-  # worker script (e.g. `bash bin/task-drain.sh status`) is not a worker.
-  local skip="$$" p=$PPID ppid guard=0
-  while [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -gt 1 ] && [ "$guard" -lt 64 ]; do
-    skip="$skip|$p"
-    ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ' || true)
-    [[ "$ppid" =~ ^[0-9]+$ ]] || break
-    p=$ppid
-    guard=$((guard+1))
-  done
-  ps -eo pid,command 2>/dev/null \
-    | awk -v skip="^($skip)$" '/(^|[^A-Za-z0-9_-])[t]ask-drain\.sh/ && !/ status/ && !/ watch/ && !/ workers/ && $1 !~ skip {print $1}' \
-    | sort -rn || true
+  # Use shared worker detection from lib/worker-detect.sh
+  drain_worker_pids
 }
 
 worker_count() {
@@ -386,11 +378,13 @@ VIEWS
                               drain status attendeesync --workers
 
 SAFETY DIALS (env vars, or edit at the top of task-drain.sh)
-  --dangerously-skip-permissions : unattended runs need this or they stall
-      on the first approval prompt; it lets the agent edit/run/push freely.
-      This is the main risk dial.
-  DRAIN_MODEL                : model for worker runs
-                               (default opencode-go/longcat-2.5-preview-free)
+  DRAIN_SKIP_PERMISSIONS=1      : adds --dangerously-skip-permissions to
+      opencode run flags. Without it, unattended runs stall on the first
+      approval prompt. With it, the agent can edit, run, and push without
+      asking. This is the main risk dial -- only enable if you trust the
+      autonomous worker to operate without human approval.
+  DRAIN_MODEL                  : model for worker runs
+                                  (default opencode-go/longcat-2.5-preview-free)
   STALE_AFTER_SEC=14400  : release worker claims older than 4 hours
   TASK_TIMEOUT_SEC=14400 : per-task wall clock (needs `gtimeout`)
 DOCS_EOF

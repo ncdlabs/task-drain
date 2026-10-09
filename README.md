@@ -82,6 +82,7 @@ Installer knobs:
 | `SKIP_PLUGIN=1` | Skip the plugin build |
 | `TASKCHAMPION_URL` | Use this sync server URL instead of starting a local one |
 | `TASKCHAMPION_LOCAL=0` | Don't set up a local sync server |
+| `CONTAINER_RUNTIME` | Auto-detect (nerdctl → docker → podman) | Container runtime for the local sync server. Override if auto-detect fails. |
 | `PLUGIN_DIR` | Plugin location (default: `<repo>/plugin`) |
 
 Both scripts are executable; invoke `drain` directly (no `bash` prefix needed).
@@ -148,6 +149,8 @@ Environment variables (export them before `drain start`, or edit the top of
 | `OPENCODE_BIN` | `opencode` | OpenCode binary (only used when `DRAIN_AGENT=opencode`) |
 | `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs (opencode only) |
 | `DRAIN_AGENT` | `opencode` | Agent harness: `opencode` \| `claude` \| `codex`. Switches the worker invocation (`opencode run --standalone`, `claude -p`, `codex exec`). |
+| `DRAIN_SKIP_PERMISSIONS` | `0` | Set to `1` to add `--dangerously-skip-permissions` to `opencode run` flags. **Security risk:** allows the agent to edit, run, and push without approval. |
+| `DRAIN_ERROR_WEBHOOK` | (unset) | Slack/Discord webhook URL for error reporting. When set, critical worker failures are POSTed to this URL. |
 | `GIT_ROOT` | `$HOME/git` | Where your repos live |
 | `DRAIN_OWNER` | `the project owner` | Human authority named in the worker prompt for design/security/product decisions (workers must annotate and fail instead of deciding) |
 | `PROJECT_FILTER` | (unset) | Limit one worker run to a single project |

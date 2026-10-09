@@ -634,7 +634,10 @@ export function createTools(config: TaskConfig): ToolDef[] {
               await runTask(config, [input.uuid, "done"], {
                 signal: context.signal,
               });
-              return { uuid: input.uuid, status: "completed" };
+              const completedTask = await getTask(config, input.uuid, {
+                signal: context.signal,
+              });
+              return { uuid: input.uuid, status: completedTask.status };
             }, context),
           ),
       });
@@ -838,9 +841,14 @@ export function createTools(config: TaskConfig): ToolDef[] {
           if (input.write) {
             const fs = await import("node:fs/promises");
             const path = await import("node:path");
+            const cwd = process.cwd();
             const outPath = input.outputPath
               ? path.resolve(input.outputPath)
               : path.resolve("install-taskwarrior.sh");
+            // Restrict writes to the current working directory
+            if (!outPath.startsWith(cwd + path.sep) && outPath !== cwd) {
+              throw new Error(`outputPath must be within the current directory (${cwd}): ${outPath}`);
+            }
             await fs.writeFile(outPath, script, { mode: 0o755 });
             return text({ ok: true, path: outPath, message: `Script written to ${outPath} (executable)` });
           }
