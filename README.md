@@ -1,9 +1,13 @@
 # task-drain
 
 Autonomous [Taskwarrior](https://taskwarrior.org/) queue workers powered by
-[OpenCode](https://opencode.ai/). Each worker loops: sync → pick the
-highest-urgency eligible task → claim it → run `opencode run` on it non-
-interactively → verify → repeat until the queue is empty, then exit.
+your AI coding agent. Each worker loops: sync → pick the highest-urgency
+eligible task → claim it → hand it to the agent non-interactively →
+verify → repeat until the queue is empty, then exit.
+
+Supported harnesses (set with `DRAIN_AGENT`): [OpenCode](https://opencode.ai/)
+(default), [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
+[Codex](https://github.com/openai/codex).
 
 Pickup is **opt-out**: any pending task is eligible unless it is active,
 waiting, blocked, or tagged `noauto` / `drain-failed`.
@@ -24,14 +28,19 @@ waiting, blocked, or tagged `noauto` / `drain-failed`.
   ```
   Each machine needs its own `client_id` and its own `data.location`.
   There is currently no public hosted TaskChampion sync service.
-- **OpenCode CLI v2** (`opencode`) on PATH — workers invoke `opencode run`
-  with `--standalone --dangerously-skip-permissions`
+- **An agent CLI** on PATH (pick one with `DRAIN_AGENT`):
+  - `opencode` (v2) — workers invoke `opencode run --standalone
+    --dangerously-skip-permissions`
+  - `claude` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) —
+    workers invoke `claude -p` (headless)
+  - `codex` ([OpenAI Codex CLI](https://github.com/openai/codex)) —
+    workers invoke `codex exec`
 - **jq** (queue queries are parsed with `jq`)
 - **gtimeout** (optional, from coreutils — enables the per-task wall clock;
   without it tasks run unbounded)
 - **bash 4+**
 - Primarily tested on **macOS** (Homebrew). Linux works if `task`,
-  `opencode`, and `jq` are on PATH — see [Configuration](#configuration)
+  your agent CLI, and `jq` are on PATH — see [Configuration](#configuration)
   for the paths you'll need to override.
 
 ## Installation
@@ -46,13 +55,14 @@ This symlinks (not copies) `task-drain.sh` and `drain` into `~/bin/`,
 so `git pull` in the repo updates your install. Set `PREFIX=/usr/local`
 to install into `/usr/local/bin` instead.
 
-The installer also clones and builds the
-[opencode-tasks](https://github.com/ncdlabs/opencode-tasks) plugin
+The installer also clones and builds
+[opencode-tasks](https://github.com/ncdlabs/opencode-tasks)
 into `~/git/opencode-tasks` (override with `PLUGIN_DIR=`, skip with
-`SKIP_PLUGIN=1`). Add its path to your `opencode.json` under `"plugin"`
-to give agents native Taskwarrior tools. The drain workers don't require
-it -- they use direct `task` shell commands -- but it's useful for
-interactive sessions.
+`SKIP_PLUGIN=1`). It provides native Taskwarrior tools for agents —
+as an OpenCode plugin *and* as an MCP server (`taskwarrior-mcp`) for
+Claude Code, Cursor, and Codex. The drain workers don't require it —
+they use direct `task` shell commands — but it's useful for interactive
+sessions. See that repo's README for per-client setup.
 
 Both scripts are executable; invoke `drain` directly (no `bash` prefix needed).
 
@@ -94,7 +104,7 @@ Environment variables (export them before `drain start`, or edit the top of
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `TASK` | `task` on PATH, else `/opt/homebrew/bin/task` | Taskwarrior binary |
-| `OPENCODE_BIN` | `opencode` | OpenCode binary |
+| `OPENCODE_BIN` | `opencode` | OpenCode binary (only used when `DRAIN_AGENT=opencode`) |
 | `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs (opencode only) |
 | `DRAIN_AGENT` | `opencode` | Agent harness: `opencode` \| `claude` \| `codex`. Switches the worker invocation (`opencode run --standalone`, `claude -p`, `codex exec`). |
 | `GIT_ROOT` | `$HOME/git` | Where your repos live |
@@ -126,7 +136,7 @@ human review. GitHub uses `gh pr create`; other forges use their API with a
 
 ## How the worker prompt works
 
-Every worker hands its task to `opencode run --standalone` with a prompt
+Every worker hands its task to the configured agent harness with a prompt
 enforcing:
 
 - **Discipline:** Taskwarrior is the only system of record — sync at session
@@ -142,14 +152,15 @@ enforcing:
 
 Two implementation details worth knowing:
 
-- `opencode run` hangs waiting on stdin when not attached to a TTY, so
-  workers run it with `--standalone` and stdin redirected from `/dev/null`.
-- The working directory is set via subshell `cd` because `opencode run`
-  accepts no `--dir` flag.
+- Agent CLIs hang waiting on stdin when not attached to a TTY, so workers
+  redirect stdin from `/dev/null` on every invocation. (OpenCode also needs
+  `--standalone` — its default service mode hangs the same way.)
+- The working directory is set via subshell `cd` before invoking the agent.
 
 ## Related
 
-- [opencode-tasks](https://github.com/ncdlabs/opencode-tasks) — OpenCode
-  plugin exposing Taskwarrior lifecycle tools as native agent tools.
+- [opencode-tasks](https://github.com/ncdlabs/opencode-tasks) —
+  Taskwarrior lifecycle tools as native agent tools: an OpenCode plugin
+  *and* an MCP server (`taskwarrior-mcp`) for Claude Code, Cursor, and Codex.
   Optional companion; the drain workers use direct `task` shell commands and
   don't require it.
