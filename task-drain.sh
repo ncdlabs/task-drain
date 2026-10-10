@@ -125,6 +125,8 @@ sync_with_retry() {
 RETRY_SNAPSHOT="" # temp file holding retry UUIDs for this run
 GIT_ROOT="${GIT_ROOT:-$HOME/git}"
 STOP_FILE="$HOME/.task-drain/STOP"
+HISTORY_FILE="$HOME/.task-drain/history.log"
+HISTORY_LIMIT="${DRAIN_HISTORY_LIMIT:-20}"
 WORKER_ID="drain-$(hostname -s)-$$"
 CHILD_PID=""
 CURRENT_UUID=""
@@ -338,7 +340,7 @@ PROMPT_EOF
 }
 
 run_one() { # $1 = task export JSON
-	local uuid project priority description annotations repo prompt rc status
+	local uuid project priority description annotations repo prompt rc status start_ts
 	uuid=$(jq -r '.uuid' <<<"$1")
 	project=$(jq -r '.project // "(none)"' <<<"$1")
 	priority=$(jq -r '.priority // "(none)"' <<<"$1")
@@ -349,6 +351,7 @@ run_one() { # $1 = task export JSON
 	if [ -z "$repo" ] || [ ! -d "$repo" ]; then repo="$HOME"; fi
 
 	log "starting: [$project] $description ($uuid)"
+	start_ts=$(date +%s)
 	claim_task "$uuid"
 	CURRENT_UUID="$uuid"
 	prompt=$(build_prompt "$uuid" "$project" "$priority" "$description" "$annotations" "$repo")
@@ -421,15 +424,26 @@ run_one() { # $1 = task export JSON
 	CURRENT_UUID=""
 	if [ "$status" = "completed" ]; then
 		log "DONE: [$project] $description"
+		history_record "$uuid" "$project" "$description" "done" "$(( $(date +%s) - start_ts ))" "$WORKER_ID"
 		return 0
 	fi
 	log "not completed (agent rc=$rc, status=$status) -- failed, will not auto-retry"
+	history_record "$uuid" "$project" "$description" "failed" "$(( $(date +%s) - start_ts ))" "$WORKER_ID"
 	if ! $TASK "$uuid" modify +drain-failed >/dev/null 2>&1; then
 		report_error "run_one: failed to tag $uuid as drain-failed (task may be re-picked)"
 	fi
 	release_claim "$uuid" "drain worker $WORKER_ID: agent exited (rc=$rc) without completing; tagged drain-failed, not auto-retried"
 	sync_with_retry || report_error "run_one: sync failed after marking $uuid as drain-failed"
 	return 1
+}
+
+history_record() { # $1=uuid $2=project $3=description $4=result $5=duration_sec $6=worker_id
+	local desc
+	desc=$(printf '%s' "$3" | tr '\t\n\r' ' ')
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$(date -u '+%FT%TZ')" "$1" "$2" "$desc" "$4" "$5" "${6:-$WORKER_ID}" >>"$HISTORY_FILE"
+	# Prune to rolling window
+	tail -n "$HISTORY_LIMIT" "$HISTORY_FILE" >"$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
 }
 
 run_worker() {
@@ -862,6 +876,109 @@ cmd_status() {
 	printf '%scommands:%s drain status [project] [--workers] [--verbose] · drain start [N] [project] · drain stop · drain kill · drain resume · drain logs [-f]\n' "$DIM" "$RESET"
 }
 
+cmd_history() { # [--limit N] -- show recently processed drain tasks
+	command -v jq >/dev/null 2>&1 || {
+		echo "ERROR: jq not found (brew install jq)" >&2
+		exit 1
+	}
+
+	local limit="${DRAIN_HISTORY_LIMIT:-20}"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--limit|-n) [ $# -ge 2 ] || { echo "ERROR: --limit requires a value" >&2; exit 1; }; limit="$2"; shift 2 ;;
+		--limit=*) limit="${1#--limit=}"; shift ;;
+		-*) echo "ERROR: unknown history option: $1" >&2; exit 1 ;;
+		*) echo "ERROR: unexpected argument: $1" >&2; exit 1 ;;
+		esac
+	done
+	[[ "$limit" =~ ^[0-9]+$ ]] || limit=20
+
+	# --- terminal setup (shared display functions) ---
+	drain_terminal_setup
+	local B="$DRAIN_B" C="$DRAIN_C" G="$DRAIN_G" Y="$DRAIN_Y" R="$DRAIN_R" M="$DRAIN_M" DIM="$DRAIN_DIM" RESET="$DRAIN_RESET"
+	local cols="$DRAIN_COLS"
+	divider() { drain_divider "$@"; }
+	section() { drain_section "$@"; }
+	trunc_str() { drain_trunc_str "$@"; }
+	dur() {
+		local s="$1"
+		[[ "$s" =~ ^[0-9]+$ ]] || { printf '?'; return; }
+		if [ "$s" -lt 90 ]; then printf '%ss' "$s"
+		elif [ "$s" -lt 5400 ]; then printf '%sm' "$((s / 60))"
+		elif [ "$s" -lt 172800 ]; then printf '%sh' "$((s / 3600))"
+		else printf '%sd' "$((s / 86400))"
+		fi
+	}
+
+	if [ ! -f "$HISTORY_FILE" ]; then
+		printf '%sDRAIN HISTORY%s\n' "$B" "$RESET"
+		divider
+		printf '  %sno history yet%s — start workers with: drain start 2\n' "$DIM" "$RESET"
+		divider
+		return 0
+	fi
+
+	# --- parse TSV -> JSON array ---
+	local history_json
+	history_json=$(jq -R 'split("\t") | {ts: .[0], uuid: .[1], project: .[2], desc: .[3], result: .[4], dur: .[5], worker: .[6]}' "$HISTORY_FILE" 2>/dev/null | jq -s '.' 2>/dev/null || echo '[]')
+
+	local total n_done n_failed pct last_ts avg_dur
+	total=$(printf '%s' "$history_json" | jq 'length' 2>/dev/null || echo 0)
+	[[ "$total" =~ ^[0-9]+$ ]] || total=0
+	if [ "$total" -eq 0 ]; then
+		printf '%sDRAIN HISTORY%s\n' "$B" "$RESET"
+		divider
+		printf '  %sno history yet%s\n' "$DIM" "$RESET"
+		divider
+		return 0
+	fi
+
+	n_done=$(printf '%s' "$history_json" | jq '[.[] | select(.result == "done")] | length' 2>/dev/null || echo 0)
+	n_failed=$(printf '%s' "$history_json" | jq '[.[] | select(.result == "failed")] | length' 2>/dev/null || echo 0)
+	[[ "$n_done" =~ ^[0-9]+$ ]] || n_done=0
+	[[ "$n_failed" =~ ^[0-9]+$ ]] || n_failed=0
+	pct=$(printf '%s' "$history_json" | jq --argjson t "$total" '([.[] | select(.result == "done")] | length) / $t * 100 | floor' 2>/dev/null || echo 0)
+	[[ "$pct" =~ ^[0-9]+$ ]] || pct=0
+	last_ts=$(printf '%s' "$history_json" | jq -r '.[-1].ts // ""' 2>/dev/null || echo "")
+	avg_dur=$(printf '%s' "$history_json" | jq '[.[] | .dur | tonumber? // 0] | if length > 0 then (add / length | floor) else 0 end' 2>/dev/null || echo 0)
+	[[ "$avg_dur" =~ ^[0-9]+$ ]] || avg_dur=0
+
+	# --- header ---
+	printf '%sDRAIN HISTORY%s  %s  ·  %d processed · %s%d done%s · %s%d failed%s · %s%d%%%s success · avg %s\n' \
+		"$B" "$RESET" "$(date '+%a %F %T %Z')" "$total" \
+		"$G" "$n_done" "$RESET" "$R" "$n_failed" "$RESET" "$DIM" "$pct" "$RESET" "$(dur "$avg_dur")"
+	if [ -n "$last_ts" ]; then
+		printf '  %slast: %s%s\n' "$DIM" "$last_ts" "$RESET"
+	fi
+	divider
+
+	# --- table (most recent first) ---
+	local desc_max=$((cols - 40))
+	[ "$desc_max" -ge 30 ] || desc_max=30
+	[ "$desc_max" -le 90 ] || desc_max=90
+
+	local tsv
+	tsv=$(printf '%s' "$history_json" | jq -r --argjson limit "$limit" '
+		reverse | .[0:$limit] | .[] |
+		"\(.ts)\t\(.result)\t\(.project)\t\(.desc)\t\(.dur)\t\(.uuid)"' 2>/dev/null || true)
+	if [ -n "$tsv" ]; then
+		local _ts _res _proj _desc _dur _uuid _time_short
+		while IFS=$'\t' read -r _ts _res _proj _desc _dur _uuid; do
+			[ -n "$_ts" ] || continue
+			local icon res_col
+			if [ "$_res" = "done" ]; then icon="✓"; res_col="$G"; else icon="✗"; res_col="$R"; fi
+			_time_short="$_ts"
+			if [[ "$_ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T([0-9]{2}:[0-9]{2}) ]]; then _time_short="${BASH_REMATCH[1]}"; fi
+			printf '  %s %s%s%s [%s] %s  %s(%s · %s)%s\n' \
+				"$_time_short" "$res_col" "$icon" "$RESET" "$_proj" "$(trunc_str "$_desc" "$desc_max")" \
+				"$DIM" "${_uuid:0:8}" "$(dur "$_dur")" "$RESET"
+		done <<<"$tsv"
+	fi
+
+	divider
+	printf '%scommands:%s drain history [--limit N] · drain status · drain logs [-f]\n' "$DIM" "$RESET"
+}
+
 cmd_workers() {
 	# One snapshot frame: live workers, the task each one owns right now,
 	# and a time-budget meter per worker (elapsed vs TASK_TIMEOUT_SEC).
@@ -1192,10 +1309,11 @@ case "${1:-run}" in
 run) run_worker ;;
 autoscale) autoscale_supervisor ;;
 status) cmd_status ;;
+history) shift; cmd_history "$@" ;;
 watch) cmd_watch ;;
 workers) cmd_watch cmd_workers ;;
 *)
-	echo "usage: bash $0 [run|status|watch|workers|autoscale]" >&2
+	echo "usage: bash $0 [run|status|history|watch|workers|autoscale]" >&2
 	exit 2
 	;;
 esac

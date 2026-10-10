@@ -111,6 +111,7 @@ drain autoscale [project]      # supervisor daemon: auto-scale workers to queue 
 drain autoscale-stop           # stop the autoscaler (workers keep running)
 drain resume                   # clear the STOP file (doesn't start workers)
 drain docs                     # pickup rules, tags, kill switch, safety dials
+drain history [--limit N]      # show last N processed tasks (default 20)
 ```
 
 The kill switch also works by hand: `touch ~/.task-drain/STOP` stops workers
@@ -169,6 +170,7 @@ Environment variables (export them before `drain start`, or edit the top of
 | `DRAIN_AUTOSCALE_INTERVAL` | `30` | Autoscaler: seconds between queue checks |
 | `DRAIN_TASKS_PER_WORKER` | `2` | Autoscaler: eligible tasks per worker before scaling up |
 | `DRAIN_RETRY_FAILED` | `0` | `1` = reprocess `drain-failed` instead of the regular queue (normally set via `drain start --failed`) |
+| `DRAIN_HISTORY_LIMIT` | `20` | Rolling-window size for `drain history` (entries kept in `~/.task-drain/history.log`) |
 
 **Project → repo mapping.** `repo_for_project()` in `task-drain.sh` maps
 Taskwarrior project names to checkout paths (used as the worker's working

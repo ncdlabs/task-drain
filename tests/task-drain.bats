@@ -392,3 +392,116 @@ FAKESUDO
     [[ "$output" != *"+1 more"* ]]
     unset MOCK_REVIEW_DATA
 }
+
+# --- drain history ---
+
+@test "history_record writes a TSV line to the history file" {
+    load_functions
+    rm -f "$HISTORY_FILE"
+    export HISTORY_LIMIT=20
+    history_record "aaaa1111-1111-1111-1111-111111111111" "testproj" "test task" "done" "120" "drain-host-1234"
+    [ -f "$HISTORY_FILE" ]
+    local line
+    line=$(cat "$HISTORY_FILE")
+    [[ "$line" == *"aaaa1111-1111-1111-1111-111111111111"* ]]
+    [[ "$line" == *"testproj"* ]]
+    [[ "$line" == *"test task"* ]]
+    [[ "$line" == *"done"* ]]
+    [[ "$line" == *"120"* ]]
+    [[ "$line" == *"drain-host-1234"* ]]
+    rm -f "$HISTORY_FILE"
+}
+
+@test "history_record sanitizes tabs and newlines in description" {
+    load_functions
+    rm -f "$HISTORY_FILE"
+    export HISTORY_LIMIT=20
+    history_record "bbbb2222-2222-2222-2222-222222222222" "proj" $'task\twith\ttabs\nand\nnewlines' "failed" "60" "drain-host-9999"
+    local line
+    line=$(cat "$HISTORY_FILE")
+    [[ "$line" != *$'\t\t'* ]]
+    [[ "$line" != *$'\n'* ]]
+    [[ "$line" == *"task with tabs and newlines"* ]]
+    rm -f "$HISTORY_FILE"
+}
+
+@test "history_record prunes to rolling window" {
+    load_functions
+    rm -f "$HISTORY_FILE"
+    export HISTORY_LIMIT=3
+    for i in 1 2 3 4 5; do
+        history_record "uuid-$i" "proj" "task $i" "done" "10" "w1"
+    done
+    local count
+    count=$(wc -l < "$HISTORY_FILE" | tr -d ' ')
+    [ "$count" = "3" ]
+    # Should keep the last 3 (tasks 3, 4, 5)
+    local content
+    content=$(cat "$HISTORY_FILE")
+    [[ "$content" != *"task 1"* ]]
+    [[ "$content" != *"task 2"* ]]
+    [[ "$content" == *"task 3"* ]]
+    [[ "$content" == *"task 4"* ]]
+    [[ "$content" == *"task 5"* ]]
+    rm -f "$HISTORY_FILE"
+}
+
+@test "cmd_history shows no-history message when file does not exist" {
+    load_functions
+    rm -f "$HISTORY_FILE"
+    run cmd_history
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"no history yet"* ]]
+}
+
+@test "cmd_history shows summary stats and table" {
+    load_functions
+    rm -f "$HISTORY_FILE"
+    export HISTORY_LIMIT=20
+    history_record "aaaa1111-1111-1111-1111-111111111111" "projA" "first task" "done" "120" "w1"
+    history_record "bbbb2222-2222-2222-2222-222222222222" "projB" "second task" "failed" "45" "w1"
+    run cmd_history
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"2 processed"* ]]
+    [[ "$output" == *"1 done"* ]]
+    [[ "$output" == *"1 failed"* ]]
+    [[ "$output" == *"50%"* ]]
+    [[ "$output" == *"first task"* ]]
+    [[ "$output" == *"second task"* ]]
+    [[ "$output" == *"✓"* ]]
+    [[ "$output" == *"✗"* ]]
+    rm -f "$HISTORY_FILE"
+}
+
+@test "cmd_history --limit flag limits output rows" {
+    load_functions
+    rm -f "$HISTORY_FILE"
+    export HISTORY_LIMIT=20
+    for i in 1 2 3 4 5; do
+        history_record "uuid-$i" "proj" "task $i" "done" "10" "w1"
+    done
+    run cmd_history --limit 2
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"task 5"* ]]
+    [[ "$output" == *"task 4"* ]]
+    [[ "$output" != *"task 3"* ]]
+    rm -f "$HISTORY_FILE"
+}
+
+@test "drain help shows history command" {
+    run "$SCRIPT_DIR/drain" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"history"* ]]
+}
+
+@test "drain help history shows detailed help" {
+    run "$SCRIPT_DIR/drain" help history
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--limit"* ]]
+    [[ "$output" == *"drain history"* ]]
+}
+
+@test "drain history --limit 10 runs successfully" {
+    run "$SCRIPT_DIR/drain" history --limit 10
+    [ "$status" -eq 0 ]
+}

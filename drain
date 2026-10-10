@@ -43,6 +43,8 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #                        returning them to the regular queue
 #   drain resume         clear the STOP file (does not start workers)
 #   drain logs [-f]      tail worker logs (follow with -f)
+#   drain history [--limit N]
+#                        show last N processed tasks (default 20)
 #   drain projects       list configured project → repo mappings
 #   drain projects merge <destination> <source...>
 #                        merge source projects into destination (moves all tasks)
@@ -326,6 +328,22 @@ cmd_logs() { # [-f]
   else
     for l in "${logs[@]}"; do echo "--- $l"; tail -n 30 "$l"; done
   fi
+}
+
+cmd_history() { # [--limit N] -- show recently processed drain tasks
+  need_script
+  local limit="${DRAIN_HISTORY_LIMIT:-20}"
+  local args=("$@")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit) [ $# -ge 2 ] || die "--limit requires a value"; limit="$2"; shift 2 ;;
+      --limit=*) limit="${1#--limit=}"; shift ;;
+      -v|--verbose) shift ;; # accepted for consistency, no effect
+      -*) die "unknown history option: $1 (try: drain help)" ;;
+      *) die "unexpected argument: $1 (try: drain help)" ;;
+    esac
+  done
+  PROJECT_FILTER="" DRAIN_HISTORY_LIMIT="$limit" bash "$DRAIN_SCRIPT" history "${args[@]}"
 }
 
 cmd_projects() { # list configured project → repo mappings
@@ -639,6 +657,28 @@ OPTIONS
 Logs are at ~/.task-drain/logs/worker-<timestamp>-<pid>-N.log
 HELP
       ;;
+    history)
+      cat <<'HELP'
+drain history — show recently processed drain tasks
+
+USAGE
+  drain history [--limit N]
+
+OPTIONS
+  --limit N          Maximum number of entries to show (default 20)
+
+Displays summary statistics (total processed, success rate, average
+duration) followed by a table of the most recent drain completions
+and failures. Workers record one entry per processed task in
+~/.task-drain/history.log, which keeps a rolling window of the last
+20 entries.
+
+EXAMPLES
+  drain history
+  drain history --limit 10
+  drain history --limit 50
+HELP
+      ;;
     projects)
       cat <<'HELP'
 drain projects — list configured project → repo mappings
@@ -834,6 +874,7 @@ case "${1:-}" in
     ;;
   resume) cmd_resume ;;
   logs)   shift; cmd_logs "${1:-}" ;;
+  history) shift; cmd_history "$@" ;;
   projects)
     shift
     if [ $# -gt 0 ] && [ "$1" = "merge" ]; then
