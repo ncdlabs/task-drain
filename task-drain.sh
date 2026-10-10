@@ -98,6 +98,7 @@ TASK_TIMEOUT_SEC="${TASK_TIMEOUT_SEC:-14400}" # 4 hours per task (gtimeout only)
 _DRAIN_DEFAULT_TIMEOUT=14400
 PROJECT_FILTER="${PROJECT_FILTER:-}"
 DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-0}" # 1 = reprocess drain-failed tasks instead of the regular queue
+DRAIN_PERSIST="${DRAIN_PERSIST:-0}"           # 1 = wait for new jobs after queue empties instead of exiting
 
 # Wrapper for task sync with retry. The TaskChampion sync endpoint flakes
 # intermittently; a single failed sync must not abort a worker or fail a task.
@@ -106,11 +107,12 @@ sync_with_retry() {
 	while [ $attempt -le 3 ]; do
 		if "$TASK" sync >/dev/null 2>&1; then return 0; fi
 		[ $attempt -lt 3 ] && sleep $delay
-		attempt=$((attempt + 1)); delay=$((delay * 2))
+		attempt=$((attempt + 1))
+		delay=$((delay * 2))
 	done
 	return 1
 }
-RETRY_SNAPSHOT=""                             # temp file holding retry UUIDs for this run
+RETRY_SNAPSHOT="" # temp file holding retry UUIDs for this run
 GIT_ROOT="${GIT_ROOT:-$HOME/git}"
 STOP_FILE="$HOME/.task-drain/STOP"
 WORKER_ID="drain-$(hostname -s)-$$"
@@ -483,6 +485,11 @@ run_worker() {
 		task_json=$(pick_task) || task_json=""
 		if [ -z "$task_json" ]; then
 			$TASK sync >/dev/null || true
+			if [ "$DRAIN_PERSIST" = "1" ]; then
+				log "queue empty -- waiting for new jobs (persist mode)"
+				sleep "${DRAIN_PERSIST_POLL_SEC:-10}"
+				continue
+			fi
 			log "$done_msg -- completed=$completed failed=$failed. exiting."
 			rm -f "${STOP_FILE}.$$"
 			cleanup_retry

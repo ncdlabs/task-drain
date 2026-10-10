@@ -14,7 +14,7 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #                        --verbose (or DRAIN_VERBOSE=1) shows full lists
 #                        instead of the capped summary view
 #   drain docs           how pickup, tags, and the kill switch work
-#   drain start [N] [project|all] [--failed]
+#   drain start [N] [project|all] [--failed] [--persist]
 #                        start N background workers (default 2, max 8),
 #                        optionally limited to one project, e.g.:
 #                          drain start 3 attendeesync
@@ -22,6 +22,9 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #                        --failed = reprocess drain-failed tasks instead of
 #                        the regular queue, e.g.:
 #                          drain start 2 attendeesync --failed
+#                        --persist = workers wait for new jobs after the queue
+#                        empties instead of exiting, e.g.:
+#                          drain start 2 attendeesync --persist
 #   drain stop [N|all]   graceful stop: workers finish their current task,
 #                        pick up nothing new, then exit.
 #                        No arg (or 'all') = stop ALL workers.
@@ -36,6 +39,8 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #                        DRAIN_AUTOSCALE_INTERVAL (sec, default 30),
 #                        DRAIN_TASKS_PER_WORKER (default 2).
 #   drain autoscale-stop stop the autoscaler (workers keep running)
+#   drain unfail [project] remove drain-failed tag from failed tasks,
+#                        returning them to the regular queue
 #   drain resume         clear the STOP file (does not start workers)
 #   drain logs [-f]      tail worker logs (follow with -f)
 #   drain projects       list configured project → repo mappings
@@ -123,13 +128,14 @@ cmd_status() { # [project] [-w|--watch] [--workers] [--verbose]
   fi
 }
 
-cmd_start() { # [N] [project|all] [--failed]
+cmd_start() { # [N] [project|all] [--failed] [--persist]
   need_script
-  local n="" project="" retry=0 running i logf a
+  local n="" project="" retry=0 persist=0 running i logf a
   for a in "$@"; do
     case "$a" in
       "") ;;
       --failed) retry=1 ;;
+      --persist) persist=1 ;;
       *)
         if [[ "$a" =~ ^[0-9]+$ ]] && [ -z "$n" ]; then n="$a"
         elif [ -z "$project" ]; then project="$a"
@@ -147,9 +153,11 @@ cmd_start() { # [N] [project|all] [--failed]
   if [ "$running" -gt 0 ]; then echo "note: $running worker(s) already running; starting $n more."; fi
   [ -n "$project" ] && export PROJECT_FILTER="$project"
   [ "$retry" = 1 ] && export DRAIN_RETRY_FAILED=1
+  [ "$persist" = 1 ] && export DRAIN_PERSIST=1
   local mode_desc=""
   [ -n "$project" ] && mode_desc=" [project=$project]"
   [ "$retry" = 1 ] && mode_desc="$mode_desc [retrying failed]"
+  [ "$persist" = 1 ] && mode_desc="$mode_desc [persist]"
   for i in $(seq 1 "$n"); do
     # Timestamp + CLI pid in the name so a second `drain start` never
     # overwrites the logs of already-running workers.
@@ -160,9 +168,42 @@ cmd_start() { # [N] [project|all] [--failed]
   done
   if [ "$retry" = 1 ]; then
     echo "They'll reprocess failed tasks (one retry each), then exit. 'drain stop' to halt."
+  elif [ "$persist" = 1 ]; then
+    echo "They'll work through the queue, then wait for new jobs. 'drain stop' to halt."
   else
     echo "They'll work until the queue is empty, then exit. 'drain stop' to halt."
   fi
+}
+
+cmd_unfail() { # [project]
+  local TASK="${TASK:-$(command -v task 2>/dev/null || echo /opt/homebrew/bin/task)}"
+  local project="" a
+  for a in "$@"; do
+    case "$a" in
+      "") ;;
+      -*) die "unknown unfail option: $a (try: drain help)" ;;
+      *) [ -z "$project" ] || die "unexpected argument: $a (try: drain help)"; project="$a" ;;
+    esac
+  done
+  [ "$project" = "all" ] && project=""
+  local filter="+drain-failed -ACTIVE -WAITING -BLOCKED -noauto"
+  if [ -n "$project" ]; then filter="project:$project $filter"; fi
+  # shellcheck disable=SC2086
+  local tasks
+  tasks=$("$TASK" $filter export 2>/dev/null || echo "[]")
+  local count
+  count=$(echo "$tasks" | jq 'length' 2>/dev/null || echo "0")
+  if [ "$count" -eq 0 ]; then
+    echo "No failed tasks found${project:+ in project '$project'}."
+    return 0
+  fi
+  echo "Re-queueing $count failed task(s)${project:+ in project '$project'}:"
+  echo "$tasks" | jq -r '.[] | "  \(.uuid) [\(.project // "?")] \(.description)"'
+  echo
+  echo "$tasks" | jq -r '.[].uuid' | while IFS= read -r uuid; do
+    "$TASK" "$uuid" modify -drain-failed >/dev/null 2>&1 || echo "  WARN: failed to un-fail $uuid"
+  done
+  echo "Done. These tasks are now in the regular queue."
 }
 
 cmd_autoscale() { # [project] [--min N] [--max N]
@@ -448,7 +489,7 @@ HELP
 drain start — start background workers
 
 USAGE
-  drain start [N] [project|all] [--failed]
+  drain start [N] [project|all] [--failed] [--persist]
 
 ARGUMENTS
   N                Number of workers to start (default 2, max 8)
@@ -457,6 +498,8 @@ ARGUMENTS
 
 OPTIONS
   --failed         Reprocess drain-failed tasks instead of the regular queue
+  --persist        Workers wait for new jobs after the queue empties
+                   instead of exiting
 
 EXAMPLES
   drain start
@@ -464,9 +507,32 @@ EXAMPLES
   drain start 3 attendeesync
   drain start 2 --failed
   drain start 2 attendeesync --failed
+  drain start 2 --persist
+  drain start 2 attendeesync --persist
 
 Workers loop: sync -> pick highest-urgency eligible task -> claim it ->
-run `opencode run` -> verify -> repeat until queue is empty, then exit.
+run `opencode run` -> verify -> repeat until queue is empty, then exit
+(or wait for new jobs if --persist).
+HELP
+      ;;
+    unfail)
+      cat <<'HELP'
+drain unfail — remove drain-failed tag from failed tasks
+
+USAGE
+  drain unfail [project]
+
+ARGUMENTS
+  project          Limit to one project (e.g. drain unfail attendeesync)
+                   No argument = all projects
+
+EXAMPLES
+  drain unfail
+  drain unfail attendeesync
+
+Removes the drain-failed tag from matching tasks, returning them to the
+regular queue. Workers (persistent or autoscaled) will pick them up
+on their next poll.
 HELP
       ;;
     stop)
@@ -758,6 +824,14 @@ case "${1:-}" in
   kill)   cmd_kill ;;
   autoscale) shift; cmd_autoscale "$@" ;;
   autoscale-stop) cmd_autoscale_stop ;;
+  unfail)
+    shift
+    if [ $# -gt 0 ] && [ "$1" = "help" ]; then
+      help_for unfail
+    else
+      cmd_unfail "$@"
+    fi
+    ;;
   resume) cmd_resume ;;
   logs)   shift; cmd_logs "${1:-}" ;;
   projects)

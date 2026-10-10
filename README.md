@@ -93,10 +93,12 @@ Both scripts are executable; invoke `drain` directly (no `bash` prefix needed).
 drain start 2                  # start 2 background workers (default)
 drain start 4 myproject        # 4 workers, one project only
 drain start 2 --failed         # retry drain-failed tasks (one retry each)
+drain start 2 --persist        # workers wait for new jobs after queue empties
 drain status                   # queue dashboard: workers, counts, failed list
 drain status -w                # live dashboard (q quits)
 drain status --workers         # live per-worker view
 drain logs [-f]                # tail worker logs
+drain unfail [project]         # remove drain-failed tag, return to regular queue
 drain stop                     # graceful stop (finish current task, then exit)
 drain kill                     # immediate stop (claims released to pending)
 drain autoscale [project]      # supervisor daemon: auto-scale workers to queue depth

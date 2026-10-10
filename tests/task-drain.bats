@@ -248,3 +248,34 @@ load_functions() {
     run "$SCRIPT_DIR/drain" autoscale --min 2 --max 4
     [[ "$output" != *"unexpected argument"* ]]
 }
+
+@test "drain help start shows --persist option" {
+    run "$SCRIPT_DIR/drain" help start
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--persist"* ]]
+}
+
+@test "drain start --persist flag is accepted" {
+    run "$SCRIPT_DIR/drain" start 1 --persist
+    [[ "$output" != *"unexpected argument"* ]]
+    [[ "$output" != *"unknown option"* ]]
+}
+
+@test "drain start --persist shows persist mode in output" {
+    run "$SCRIPT_DIR/drain" start 1 --persist
+    [[ "$output" == *"persist"* ]]
+}
+
+@test "drain help unfail shows unfail help" {
+    run "$SCRIPT_DIR/drain" help unfail
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"drain-failed"* ]]
+    [[ "$output" == *"unfail"* ]]
+}
+
+@test "drain unfail help dispatches correctly" {
+    run "$SCRIPT_DIR/drain" unfail help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"unfail"* ]]
+    [[ "$output" == *"drain-failed"* ]]
+}
