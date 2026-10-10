@@ -100,12 +100,22 @@ PROJECT_FILTER="${PROJECT_FILTER:-}"
 DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-0}" # 1 = reprocess drain-failed tasks instead of the regular queue
 DRAIN_PERSIST="${DRAIN_PERSIST:-0}"           # 1 = wait for new jobs after queue empties instead of exiting
 
+# Single sync attempt. macOS 26 Local Network Privacy blocks third-party
+# (Homebrew, unsigned) binaries from the LAN taskserver (EHOSTUNREACH), while
+# root bypasses it -- so fall back to sudo when the direct sync fails. sudo
+# runs with the user's HOME/TASKRC, keeping the task DB user-owned. Requires
+# NOPASSWD for the task binary in sudoers.
+task_sync() {
+	"$TASK" sync >/dev/null 2>&1 && return 0
+	sudo env HOME="$HOME" TASKRC="${TASKRC:-$HOME/.taskrc}" "$TASK" sync >/dev/null 2>&1
+}
+
 # Wrapper for task sync with retry. The TaskChampion sync endpoint flakes
 # intermittently; a single failed sync must not abort a worker or fail a task.
 sync_with_retry() {
-	local attempt=1 delay=3
+	local attempt=1 delay="${DRAIN_SYNC_RETRY_DELAY:-3}"
 	while [ $attempt -le 3 ]; do
-		if "$TASK" sync >/dev/null 2>&1; then return 0; fi
+		if task_sync; then return 0; fi
 		[ $attempt -lt 3 ] && sleep $delay
 		attempt=$((attempt + 1))
 		delay=$((delay * 2))
@@ -406,7 +416,7 @@ run_one() { # $1 = task export JSON
 	kill "$ANNOTATOR_PID" 2>/dev/null || true
 	wait "$ANNOTATOR_PID" 2>/dev/null || true
 
-	$TASK sync >/dev/null || true
+	sync_with_retry || true
 	status=$($TASK "$uuid" export 2>/dev/null | jq -r '.[0].status // "unknown"')
 	CURRENT_UUID=""
 	if [ "$status" = "completed" ]; then
@@ -586,10 +596,12 @@ cmd_status() {
 	}
 
 	# --- data exports (single shot each; tag exports scoped to +PENDING) ---
-	local eligible_json active_json failed_json
+	local eligible_json active_json failed_json review_json
 	eligible_json=$(tq +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed export 2>/dev/null || echo '[]')
 	active_json=$(tq +ACTIVE export 2>/dev/null || echo '[]')
 	failed_json=$(tq +PENDING +drain-failed export 2>/dev/null || echo '[]')
+	review_json=$(tq +COMPLETED end.after:today export 2>/dev/null |
+		jq '[.[] | select((.annotations // []) | map(.description) | any(test("claimed by drain-")))]' 2>/dev/null || echo '[]')
 
 	local desc_max=$((cols - 34))
 	[ "$desc_max" -ge 30 ] || desc_max=30
@@ -799,6 +811,27 @@ cmd_status() {
 			printf '  • [%s] %s  %s(%s)%s\n' "$pproj" "$(trunc_str "$pdesc" "$desc_max")" "$DIM" "$short" "$RESET"
 		done <<<"$failed_lines"
 		printf '  %sre-queue: task <uuid> modify -drain-failed%s\n' "$DIM" "$RESET"
+	fi
+
+	# ================= pending review =================
+	local n_review
+	n_review=$(printf '%s' "$review_json" | jq 'length' 2>/dev/null || echo 0)
+	[[ "$n_review" =~ ^[0-9]+$ ]] || n_review=0
+	if [ "$n_review" -gt 0 ]; then
+		section "PENDING REVIEW  (${n_review} completed today)"
+		local review_lines
+		review_lines=$(printf '%s' "$review_json" | jq -r 'sort_by(.end // "") | reverse | .[] | "\(.uuid // "?")\t\(.project // "-")\t\((.description // "?") | gsub("[\t\n]"; " "))"' 2>/dev/null || true)
+		local _rshown=0 _ruuid _rproj _rdesc _rshort
+		while IFS=$'\t' read -r _ruuid _rproj _rdesc; do
+			[ -n "$_rdesc" ] || continue
+			_rshown=$((_rshown + 1))
+			if [ "$_rshown" -gt "$fail_max" ]; then
+				printf '  %s… +%d more (use --verbose)%s\n' "$DIM" "$((n_review - fail_max))" "$RESET"
+				break
+			fi
+			_rshort=${_ruuid:0:8}
+			printf '  • [%s] %s  %s(%s)%s\n' "$_rproj" "$(trunc_str "$_rdesc" "$desc_max")" "$DIM" "$_rshort" "$RESET"
+		done <<<"$review_lines"
 	fi
 
 	# ================= by project (verbose only) =================
@@ -1120,7 +1153,7 @@ autoscale_supervisor() {
 
 		# Count running workers
 		local running
-		running=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | wc -l | tr -d ' ')
+		running=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | wc -l | tr -d ' ' || true)
 		[[ "$running" =~ ^[0-9]+$ ]] || running=0
 		# Exclude ourselves from the count
 		running=$((running > 0 ? running - 1 : 0))

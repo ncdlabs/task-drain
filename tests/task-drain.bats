@@ -37,8 +37,29 @@ setup() {
     mkdir -p "$(dirname "$TASK")"
     cat > "$TASK" << 'MOCK'
 #!/usr/bin/env bash
-# Mock task command for testing
-echo "mock-task $@"
+# Mock task command for testing.
+# Simulates macOS Local Network Privacy: the direct sync fails when
+# MOCK_SYNC_FAIL=1, and succeeds once the sudo fallback has run (MOCK_SUDO_OK).
+if [ "${MOCK_SYNC_FAIL:-0}" = "1" ] && [ -z "${MOCK_SUDO_OK:-}" ]; then
+    exit 1
+fi
+# Return valid JSON for export commands so cmd_status sections render.
+case "$*" in
+    *"export"*)
+        if [[ "$*" == *"+COMPLETED end.after:today export"* ]]; then
+            # For the PENDING REVIEW query: return tasks with and without drain claims.
+            if [ "${MOCK_REVIEW_DATA:-0}" = "1" ]; then
+                echo '[{"uuid":"aaaa1111-1111-1111-1111-111111111111","project":"testproj","description":"drain completed task A","status":"completed","end":"20261009T120000Z","annotations":[{"description":"claimed by drain-9999 at 20261009T100000Z"}]},{"uuid":"bbbb2222-2222-2222-2222-222222222222","project":"otherproj","description":"manually completed task","status":"completed","end":"20261009T120000Z","annotations":[{"description":"some other note"}]}]'
+            else
+                echo '[]'
+            fi
+        else
+            echo '[]'
+        fi
+        ;;
+    *"count"*) echo "0" ;;
+    *) echo "mock-task $@" ;;
+esac
 MOCK
     chmod +x "$TASK"
 
@@ -50,6 +71,7 @@ MOCK
 teardown() {
     rm -rf "$BATS_TEST_DIRNAME/fake-home"
     rm -rf "$BATS_TEST_DIRNAME/fixtures"
+    rm -rf "$BATS_TEST_DIRNAME/bin" # fake sudo for LNP fallback tests
     rm -f "$TASK"
 }
 
@@ -214,6 +236,50 @@ load_functions() {
     unset DRAIN_SKIP_PERMISSIONS
 }
 
+# --- task sync with sudo fallback (macOS Local Network Privacy) ---
+
+@test "sync_with_retry succeeds when direct sync works" {
+    load_functions
+    run sync_with_retry
+    [ "$status" -eq 0 ]
+}
+
+@test "sync_with_retry falls back to sudo when direct sync fails (LNP)" {
+    load_functions
+    # Fake sudo: runs the real command with MOCK_SUDO_OK set, so the mock
+    # task succeeds on the fallback path where the direct call failed.
+    mkdir -p "$BATS_TEST_DIRNAME/bin"
+    cat > "$BATS_TEST_DIRNAME/bin/sudo" << 'FAKESUDO'
+#!/usr/bin/env bash
+MOCK_SUDO_OK=1
+export MOCK_SUDO_OK
+exec "$@"
+FAKESUDO
+    chmod +x "$BATS_TEST_DIRNAME/bin/sudo"
+    export PATH="$BATS_TEST_DIRNAME/bin:$PATH"
+    export MOCK_SYNC_FAIL=1
+    export DRAIN_SYNC_RETRY_DELAY=0
+    run sync_with_retry
+    [ "$status" -eq 0 ]
+    rm -rf "$BATS_TEST_DIRNAME/bin"
+}
+
+@test "sync_with_retry fails when direct and sudo sync both fail" {
+    load_functions
+    mkdir -p "$BATS_TEST_DIRNAME/bin"
+    cat > "$BATS_TEST_DIRNAME/bin/sudo" << 'FAKESUDO'
+#!/usr/bin/env bash
+exec "$@"
+FAKESUDO
+    chmod +x "$BATS_TEST_DIRNAME/bin/sudo"
+    export PATH="$BATS_TEST_DIRNAME/bin:$PATH"
+    export MOCK_SYNC_FAIL=1
+    export DRAIN_SYNC_RETRY_DELAY=0
+    run sync_with_retry
+    [ "$status" -eq 1 ]
+    rm -rf "$BATS_TEST_DIRNAME/bin"
+}
+
 # --- drain CLI help system ---
 
 @test "drain help produces output" {
@@ -245,6 +311,10 @@ load_functions() {
 }
 
 @test "drain autoscale --min 2 --max 4 parses correctly" {
+    # Pre-seed the pidfile with a live PID so the "already running" guard
+    # fires and the command exits without spawning a real autoscaler daemon
+    # (setup fakes HOME, so the real pidfile is never seen here).
+    echo $$ > "$HOME/.task-drain/autoscale.pid"
     run "$SCRIPT_DIR/drain" autoscale --min 2 --max 4
     [[ "$output" != *"unexpected argument"* ]]
 }
@@ -278,4 +348,47 @@ load_functions() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"unfail"* ]]
     [[ "$output" == *"drain-failed"* ]]
+}
+
+# --- PENDING REVIEW section in drain status ---
+
+@test "cmd_status shows PENDING REVIEW section when drain completed tasks exist" {
+    load_functions
+    export MOCK_REVIEW_DATA=1
+    run cmd_status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PENDING REVIEW"* ]]
+    [[ "$output" == *"drain completed task A"* ]]
+    # Task without drain annotation should NOT appear
+    [[ "$output" != *"manually completed task"* ]]
+    unset MOCK_REVIEW_DATA
+}
+
+@test "cmd_status omits PENDING REVIEW section when no drain completed tasks" {
+    load_functions
+    export MOCK_REVIEW_DATA=0
+    run cmd_status
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"PENDING REVIEW"* ]]
+    unset MOCK_REVIEW_DATA
+}
+
+@test "cmd_status PENDING REVIEW section shows count in header" {
+    load_functions
+    export MOCK_REVIEW_DATA=1
+    run cmd_status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"(1 completed today)"* ]]
+    unset MOCK_REVIEW_DATA
+}
+
+@test "cmd_status PENDING REVIEW section respects fail_max limit" {
+    load_functions
+    export MOCK_REVIEW_DATA=1
+    export DRAIN_VERBOSE=0
+    run cmd_status
+    [ "$status" -eq 0 ]
+    # Only 1 drain task in mock data, should not show overflow message
+    [[ "$output" != *"+1 more"* ]]
+    unset MOCK_REVIEW_DATA
 }
