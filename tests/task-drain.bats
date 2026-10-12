@@ -494,6 +494,58 @@ FAKESUDO
     [[ "$output" == *"history"* ]]
 }
 
+# --- drain pr list ---
+
+@test "drain help shows pr command" {
+    run "$SCRIPT_DIR/drain" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"pr list"* ]]
+}
+
+@test "drain help pr shows detailed help" {
+    run "$SCRIPT_DIR/drain" help pr
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--json"* ]]
+    [[ "$output" == *"drain pr list"* ]]
+}
+
+@test "drain pr list runs successfully" {
+    run "$SCRIPT_DIR/drain" pr list
+    [ "$status" -eq 0 ]
+}
+
+@test "drain pr list --json runs successfully" {
+    run "$SCRIPT_DIR/drain" pr list --json
+    [ "$status" -eq 0 ]
+}
+
+# --- drain_list_prs / PENDING APPROVAL section ---
+
+@test "drain_list_prs returns empty array when no repos exist" {
+    load_functions
+    export GIT_ROOT="$BATS_TEST_DIRNAME/nonexistent-git-root"
+    result=$(drain_list_prs)
+    [ "$result" = "[]" ]
+}
+
+@test "drain_repo_paths returns empty when no repos.conf and no GIT_ROOT" {
+    load_functions
+    export GIT_ROOT="$BATS_TEST_DIRNAME/nonexistent-git-root"
+    result=$(drain_repo_paths)
+    [ -z "$result" ]
+}
+
+@test "drain_repo_paths includes repos.conf entries" {
+    load_functions
+    mkdir -p "$BATS_TEST_DIRNAME/fake-repo"
+    echo "myproject=$BATS_TEST_DIRNAME/fake-repo" > "$HOME/.task-drain/repos.conf"
+    export GIT_ROOT="$BATS_TEST_DIRNAME/nonexistent-git-root"
+    result=$(drain_repo_paths)
+    [[ "$result" == *"$BATS_TEST_DIRNAME/fake-repo"* ]]
+    rm -f "$HOME/.task-drain/repos.conf"
+    rm -rf "$BATS_TEST_DIRNAME/fake-repo"
+}
+
 @test "drain help history shows detailed help" {
     run "$SCRIPT_DIR/drain" help history
     [ "$status" -eq 0 ]

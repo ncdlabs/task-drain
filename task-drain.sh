@@ -203,6 +203,70 @@ on_signal() {
 }
 trap on_signal INT TERM
 
+# Collect unique repo paths from repos.conf, built-in table, and auto-detect.
+# Outputs one path per line (deduplicated, existing dirs only).
+drain_repo_paths() {
+	local proj path
+	# 1. repos.conf
+	if [ -f "$HOME/.task-drain/repos.conf" ]; then
+		while IFS='=' read -r proj path; do
+			case "$proj" in '' | \#*) continue ;; esac
+			path="${path/#\~/$HOME}"
+			path="${path//\$HOME/$HOME}"
+			[ -d "$path" ] && printf '%s\n' "$path"
+		done <"$HOME/.task-drain/repos.conf"
+	fi
+	# 2. Built-in table
+	local _repo
+	for _proj in attendeesync ncdlabs ncdlabs-assure ncdlabs-changepress ncdlabs-site-access-policies agentx innercircles gitseer meridian solfoundation; do
+		case "$_proj" in
+		ncdlabs) _repo="$GIT_ROOT/ncdlabs.com" ;;
+		solfoundation) _repo="$GIT_ROOT/wp-solfoundation-plugin" ;;
+		*) _repo="$GIT_ROOT/$_proj" ;;
+		esac
+		[ -d "$_repo" ] && printf '%s\n' "$_repo"
+	done
+	# 3. Auto-detect
+	if [ -d "$GIT_ROOT" ]; then
+		for _dir in "$GIT_ROOT"/*/; do
+			[ -d "$_dir" ] && printf '%s\n' "${_dir%/}"
+		done
+	fi
+}
+
+# List open PRs created by drain agents (body contains "Task <uuid>").
+# Workers create PRs with body "Task <uuid>. <summary>" per the git workflow.
+# Outputs JSON array: [{repo, number, title, url, branch, created, uuid}]
+drain_list_prs() {
+	local unique_repos repo_path remote pr_json filtered prs="[]"
+
+	unique_repos=$(drain_repo_paths | sort -u | grep -v '^$' || true)
+	[ -n "$unique_repos" ] || {
+		echo "[]"
+		return 0
+	}
+	command -v gh >/dev/null 2>&1 || {
+		echo "[]"
+		return 0
+	}
+
+	while IFS= read -r repo_path; do
+		[ -n "$repo_path" ] || continue
+		[ -d "$repo_path/.git" ] || continue
+		# Only scan GitHub repos (gh CLI)
+		remote=$(git -C "$repo_path" remote get-url origin 2>/dev/null || true)
+		[[ "$remote" == *github.com* ]] || continue
+		pr_json=$(cd "$repo_path" && gh pr list --state open --json number,title,body,url,headRefName,createdAt 2>/dev/null || echo '[]')
+		filtered=$(printf '%s' "$pr_json" | jq --arg repo "$repo_path" '
+			[.[] | select(.body // "" | test("Task [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"; "i")) |
+			{repo: $repo, number, title, url, branch: .headRefName, created: .createdAt,
+			 uuid: (.body | capture("Task (?<u>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"; "i") | .u)}]' 2>/dev/null || echo '[]')
+		prs=$(printf '%s\n%s\n' "$prs" "$filtered" | jq -s 'add' 2>/dev/null || echo "$prs")
+	done <<<"$unique_repos"
+
+	echo "$prs"
+}
+
 # Project → repo mapping:
 # 1. repos.conf (~/.task-drain/repos.conf) is PRIMARY — one per line:
 #      myproject=$HOME/git/myrepo   (or ~/git/myrepo)
@@ -438,11 +502,11 @@ run_one() { # $1 = task export JSON
 	CURRENT_UUID=""
 	if [ "$status" = "completed" ]; then
 		log "DONE: [$project] $description"
-		history_record "$uuid" "$project" "$description" "done" "$(( $(date +%s) - start_ts ))" "$WORKER_ID"
+		history_record "$uuid" "$project" "$description" "done" "$(($(date +%s) - start_ts))" "$WORKER_ID"
 		return 0
 	fi
 	log "not completed (agent rc=$rc, status=$status) -- failed, will not auto-retry"
-	history_record "$uuid" "$project" "$description" "failed" "$(( $(date +%s) - start_ts ))" "$WORKER_ID"
+	history_record "$uuid" "$project" "$description" "failed" "$(($(date +%s) - start_ts))" "$WORKER_ID"
 	if ! $TASK "$uuid" modify +drain-failed >/dev/null 2>&1; then
 		report_error "run_one: failed to tag $uuid as drain-failed (task may be re-picked)"
 	fi
@@ -862,6 +926,27 @@ cmd_status() {
 		done <<<"$review_lines"
 	fi
 
+	# ================= pending approval (agent PRs) =================
+	local pr_json n_prs
+	pr_json=$(drain_list_prs)
+	n_prs=$(printf '%s' "$pr_json" | jq 'length' 2>/dev/null || echo 0)
+	[[ "$n_prs" =~ ^[0-9]+$ ]] || n_prs=0
+	if [ "$n_prs" -gt 0 ]; then
+		section "PENDING APPROVAL  (${n_prs} open PR$([ "$n_prs" -eq 1 ] || echo s))"
+		local pr_lines
+		pr_lines=$(printf '%s' "$pr_json" | jq -r 'sort_by(.created) | reverse | .[] | "\(.repo)\t\(.number)\t\(.title)\t\(.url)\t\(.uuid)"' 2>/dev/null || true)
+		local _shown=0 _prepo _pnum _ptitle _purl _puuid
+		while IFS=$'\t' read -r _prepo _pnum _ptitle _purl _puuid; do
+			[ -n "$_ptitle" ] || continue
+			_shown=$((_shown + 1))
+			if [ "$_shown" -gt "$fail_max" ]; then
+				printf '  %s… +%d more (use --verbose)%s\n' "$DIM" "$((n_prs - fail_max))" "$RESET"
+				break
+			fi
+			printf '  • [%s#%s] %s  %s(%s)%s\n' "$(basename "$_prepo")" "$_pnum" "$(trunc_str "$_ptitle" "$desc_max")" "$DIM" "${_puuid:0:8}" "$RESET"
+		done <<<"$pr_lines"
+	fi
+
 	# ================= by project (verbose only) =================
 	if [ "$verbose" = 1 ]; then
 		local proj_lines proj_max
@@ -899,10 +984,26 @@ cmd_history() { # [--limit N] -- show recently processed drain tasks
 	local limit="${DRAIN_HISTORY_LIMIT:-20}"
 	while [ $# -gt 0 ]; do
 		case "$1" in
-		--limit|-n) [ $# -ge 2 ] || { echo "ERROR: --limit requires a value" >&2; exit 1; }; limit="$2"; shift 2 ;;
-		--limit=*) limit="${1#--limit=}"; shift ;;
-		-*) echo "ERROR: unknown history option: $1" >&2; exit 1 ;;
-		*) echo "ERROR: unexpected argument: $1" >&2; exit 1 ;;
+		--limit | -n)
+			[ $# -ge 2 ] || {
+				echo "ERROR: --limit requires a value" >&2
+				exit 1
+			}
+			limit="$2"
+			shift 2
+			;;
+		--limit=*)
+			limit="${1#--limit=}"
+			shift
+			;;
+		-*)
+			echo "ERROR: unknown history option: $1" >&2
+			exit 1
+			;;
+		*)
+			echo "ERROR: unexpected argument: $1" >&2
+			exit 1
+			;;
 		esac
 	done
 	[[ "$limit" =~ ^[0-9]+$ ]] || limit=20
@@ -916,11 +1017,18 @@ cmd_history() { # [--limit N] -- show recently processed drain tasks
 	trunc_str() { drain_trunc_str "$@"; }
 	dur() {
 		local s="$1"
-		[[ "$s" =~ ^[0-9]+$ ]] || { printf '?'; return; }
-		if [ "$s" -lt 90 ]; then printf '%ss' "$s"
-		elif [ "$s" -lt 5400 ]; then printf '%sm' "$((s / 60))"
-		elif [ "$s" -lt 172800 ]; then printf '%sh' "$((s / 3600))"
-		else printf '%sd' "$((s / 86400))"
+		[[ "$s" =~ ^[0-9]+$ ]] || {
+			printf '?'
+			return
+		}
+		if [ "$s" -lt 90 ]; then
+			printf '%ss' "$s"
+		elif [ "$s" -lt 5400 ]; then
+			printf '%sm' "$((s / 60))"
+		elif [ "$s" -lt 172800 ]; then
+			printf '%sh' "$((s / 3600))"
+		else
+			printf '%sd' "$((s / 86400))"
 		fi
 	}
 
@@ -980,7 +1088,13 @@ cmd_history() { # [--limit N] -- show recently processed drain tasks
 		while IFS=$'\t' read -r _ts _res _proj _desc _dur _uuid; do
 			[ -n "$_ts" ] || continue
 			local icon res_col
-			if [ "$_res" = "done" ]; then icon="✓"; res_col="$G"; else icon="✗"; res_col="$R"; fi
+			if [ "$_res" = "done" ]; then
+				icon="✓"
+				res_col="$G"
+			else
+				icon="✗"
+				res_col="$R"
+			fi
 			_time_short="$_ts"
 			if [[ "$_ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T([0-9]{2}:[0-9]{2}) ]]; then _time_short="${BASH_REMATCH[1]}"; fi
 			printf '  %s %s%s%s [%s] %s  %s(%s · %s)%s\n' \
@@ -991,6 +1105,55 @@ cmd_history() { # [--limit N] -- show recently processed drain tasks
 
 	divider
 	printf '%scommands:%s drain history [--limit N] · drain status · drain logs [-f]\n' "$DIM" "$RESET"
+}
+
+cmd_pr_list() { # [--json] -- list open PRs created by drain agents
+	local gh_missing=0
+	command -v gh >/dev/null 2>&1 || gh_missing=1
+	local json_out=0 a
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--json)
+			json_out=1
+			shift
+			;;
+		-*)
+			echo "ERROR: unknown pr option: $1 (try: drain help pr)" >&2
+			exit 1
+			;;
+		*)
+			echo "ERROR: unexpected argument: $1 (try: drain help pr)" >&2
+			exit 1
+			;;
+		esac
+	done
+
+	drain_terminal_setup
+	local B="$DRAIN_B" DIM="$DRAIN_DIM" RESET="$DRAIN_RESET"
+	local prs n
+	prs=$(drain_list_prs)
+	n=$(printf '%s' "$prs" | jq 'length' 2>/dev/null || echo 0)
+	[[ "$n" =~ ^[0-9]+$ ]] || n=0
+
+	if [ "$json_out" = "1" ]; then
+		printf '%s\n' "$prs"
+		return 0
+	fi
+
+	if [ "$gh_missing" = "1" ]; then
+		printf '%sDRAIN PRS%s\n' "$B" "$RESET"
+		printf '  %sgh CLI not found%s — install with: brew install gh\n' "$DIM" "$RESET"
+		return 0
+	fi
+
+	if [ "$n" -eq 0 ]; then
+		printf '%sDRAIN PRS%s\n' "$B" "$RESET"
+		printf '  %sno open PRs from drain agents%s\n' "$DIM" "$RESET"
+		return 0
+	fi
+
+	printf '%sDRAIN PRS%s  %d open PR%s awaiting review\n' "$B" "$RESET" "$n" "$([ "$n" -eq 1 ] || echo s)"
+	printf '%s\n' "$prs" | jq -r 'sort_by(.created) | reverse | .[] | "  • [\(.repo | split("/") | last)#\(.number)] \(.title)  \(.url)"'
 }
 
 cmd_workers() {
@@ -1326,11 +1489,18 @@ case "${1:-run}" in
 run) run_worker ;;
 autoscale) autoscale_supervisor ;;
 status) cmd_status ;;
-history) shift; cmd_history "$@" ;;
+history)
+	shift
+	cmd_history "$@"
+	;;
+pr-list)
+	shift
+	cmd_pr_list "$@"
+	;;
 watch) cmd_watch ;;
 workers) cmd_watch cmd_workers ;;
 *)
-	echo "usage: bash $0 [run|status|history|watch|workers|autoscale]" >&2
+	echo "usage: bash $0 [run|status|history|pr-list|watch|workers|autoscale]" >&2
 	exit 2
 	;;
 esac

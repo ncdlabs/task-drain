@@ -60,6 +60,7 @@ drain kill                     # immediate stop (claims released; autoscaler sto
 drain autoscale [project]      # supervisor daemon: auto-scale workers to queue depth
 drain autoscale-stop           # stop the autoscaler (workers keep running)
 drain resume                   # clear the STOP file (doesn't start workers)
+drain pr list [--json]         # list open PRs from drain agents (PENDING APPROVAL)
 drain history [--limit N]      # show last N processed tasks (default 20)
 ```
 

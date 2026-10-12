@@ -123,6 +123,13 @@ destination and one source; refuses to merge a project into itself. Run
 `task sync` afterwards. If any source had a `repos.conf` mapping, you're
 reminded to update it.
 
+### `drain pr list [--json]`
+
+List open pull requests across all configured repos whose body references
+a task UUID (created by drain workers via the git workflow). Shows repo,
+PR number, title, URL, and linked task UUID. Use `--json` for raw JSON
+output. Also surfaced in `drain status` under **PENDING APPROVAL**.
+
 ### `drain docs`
 
 The extended operator manual: pickup rules, tags, retrying failed tasks,

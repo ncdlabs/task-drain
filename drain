@@ -45,6 +45,8 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/
 #   drain logs [-f]      tail worker logs (follow with -f)
 #   drain history [--limit N]
 #                        show last N processed tasks (default 20)
+#   drain pr list [--json]
+#                        list open PRs created by drain agents
 #   drain projects       list configured project → repo mappings
 #   drain projects merge <destination> <source...>
 #                        merge source projects into destination (moves all tasks)
@@ -354,6 +356,11 @@ cmd_history() { # [--limit N] -- show recently processed drain tasks
     esac
   done
   PROJECT_FILTER="" DRAIN_HISTORY_LIMIT="$limit" bash "$DRAIN_SCRIPT" history "${args[@]}"
+}
+
+cmd_pr_list() { # [--json] -- list open PRs created by drain agents
+	need_script
+	PROJECT_FILTER="${PROJECT_FILTER:-}" bash "$DRAIN_SCRIPT" pr-list "$@"
 }
 
 cmd_projects() { # list configured project → repo mappings
@@ -689,6 +696,25 @@ EXAMPLES
   drain history --limit 50
 HELP
       ;;
+    pr)
+      cat <<'HELP'
+drain pr list — list open PRs created by drain agents
+
+USAGE
+   drain pr list [--json]
+
+OPTIONS
+   --json           Output raw JSON instead of formatted text
+
+Lists open pull requests across all configured repos whose body references
+a task UUID (created by drain workers via the git workflow). Shows repo,
+PR number, title, URL, and linked task UUID.
+
+EXAMPLES
+   drain pr list
+   drain pr list --json
+HELP
+      ;;
     projects)
       cat <<'HELP'
 drain projects — list configured project → repo mappings
@@ -886,6 +912,16 @@ case "${1:-}" in
   resume) cmd_resume ;;
   logs)   shift; cmd_logs "${1:-}" ;;
   history) shift; cmd_history "$@" ;;
+  pr)
+    shift
+    if [ $# -gt 0 ] && [ "$1" = "help" ]; then
+      help_for pr
+    else
+      # Strip the "list" subcommand if present
+      if [ $# -gt 0 ] && [ "$1" = "list" ]; then shift; fi
+      cmd_pr_list "$@"
+    fi
+    ;;
   projects)
     shift
     if [ $# -gt 0 ] && [ "$1" = "merge" ]; then
