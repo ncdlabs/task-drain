@@ -51,7 +51,8 @@ The installer is idempotent — safe to re-run. It does, in order:
    available, then configures `task` with `sync.server.url` and generates a
    `sync.server.client_id` if you don't have one. Honors `TASKCHAMPION_URL`
    to use a remote server instead, or `TASKCHAMPION_LOCAL=0` to skip.
-   Warns (does not silently sync) if `sync.encryption_secret` is unset.
+   Warns if `sync.encryption_secret` is unset (data syncs unencrypted),
+   then attempts a test sync regardless.
 3. **Scripts** — symlinks `task-drain.sh` and `drain` into `~/bin/`, so
    `git pull` in the repo updates your install. Set `PREFIX=/usr/local` to
    install into `/usr/local/bin` instead.

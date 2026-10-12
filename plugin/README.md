@@ -189,4 +189,4 @@ point those at a scratch/test profile first: it creates real tasks.
 
 ## Related
 
-- [task-drain](https://github.com/ncdlabs/task-drain) -- autonomous Taskwarrior queue drain workers using OpenCode. The workers use direct `task` shell commands and do not require this plugin, but it provides the same operations as native agent tools.
+- <a href="https://github.com/ncdlabs/task-drain" target="_blank" rel="noopener noreferrer">task-drain</a> -- autonomous Taskwarrior queue drain workers using OpenCode. The workers use direct `task` shell commands and do not require this plugin, but it provides the same operations as native agent tools.

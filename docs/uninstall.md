@@ -45,8 +45,15 @@ rm -rf ~/.task-drain
 ```
 
 This deletes the kill-switch files, the autoscaler PID file,
-`repos.conf`, `history.log`, and all worker logs. Your `repos.conf`
-mappings are worth copying elsewhere first if you plan to reinstall.
+`repos.conf`, `history.log`, and all worker logs. **It also deletes the
+local sync server's data directory (`~/.task-drain/taskchampion-data`),
+which holds the only copy of your tasks if no other replica has synced.**
+Your `repos.conf` mappings are worth copying elsewhere first if you plan to
+reinstall.
+
+**Do not run step 3 if the sync server holds the only copy of your
+tasks** — make sure every replica has synced (`task sync` on each machine)
+before removing server data.
 
 ## 4. Remove the plugin (if installed)
 
@@ -64,10 +71,7 @@ docker stop taskchampion && docker rm taskchampion
 # (use nerdctl/podman instead of docker if that's what you run)
 ```
 
-Its data lived under `~/.task-drain/taskchampion-data`, already removed in
-step 3. **Do not do this if the sync server holds the only copy of your
-tasks** — make sure every replica has synced (`task sync` on each machine)
-before removing server data.
+The server's data was already removed in step 3 along with `~/.task-drain`.
 
 ## 6. Optional: clean drain tags from tasks
 

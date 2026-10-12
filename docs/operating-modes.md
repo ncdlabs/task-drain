@@ -43,7 +43,7 @@ tasks tagged `+auto` are picked up, and the autoscaler is launched to pick
 up new tickets as they are tagged. Details in `drain docs` and
 [Configuration](configuration.md#tags).
 
-The agent runs under a prompt that enforces three non-negotiables:
+The agent runs under a prompt that **instructs** three non-negotiables:
 
 - **Discipline** — Taskwarrior is the only system of record; sync at session
   start, after every change, and at session end; never work offline.
@@ -52,6 +52,9 @@ The agent runs under a prompt that enforces three non-negotiables:
   annotated and failed, never decided.
 - **Completion contract** — verify for real (build, tests, acceptance
   criteria) or mark failed. Partial work is never marked done.
+
+These are prompt instructions given to the agent; the worker cannot enforce
+them. The agent may still choose to ignore them.
 
 Code changes go on feature branches; the agent pushes the branch and opens
 a PR, leaving it unmerged for human review. Use this mode when you have a

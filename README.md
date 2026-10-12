@@ -1,13 +1,13 @@
 # task-drain
 
-Autonomous [Taskwarrior](https://taskwarrior.org/) queue workers powered by
+Autonomous <a href="https://taskwarrior.org/" target="_blank" rel="noopener noreferrer">Taskwarrior</a> queue workers powered by
 your AI coding agent. Each worker loops: sync → pick the highest-urgency
 eligible task → claim it → hand it to the agent non-interactively →
 verify → repeat until the queue is empty, then exit.
 
-Supported harnesses (set with `DRAIN_AGENT`): [OpenCode](https://opencode.ai/)
-(default), [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
-[Codex](https://github.com/openai/codex).
+Supported harnesses (set with `DRAIN_AGENT`): <a href="https://opencode.ai/" target="_blank" rel="noopener noreferrer">OpenCode</a>
+(default), <a href="https://docs.anthropic.com/en/docs/claude-code" target="_blank" rel="noopener noreferrer">Claude Code</a>,
+<a href="https://github.com/openai/codex" target="_blank" rel="noopener noreferrer">Codex</a>.
 
 Pickup is **opt-out** by default: any pending task is eligible unless it is
 active, waiting, blocked, or tagged `noauto` / `drain-failed`.
@@ -41,7 +41,7 @@ cd task-drain
 ./install.sh          # deps, sync server, symlinks into ~/bin, plugin build
 drain docs            # pickup rules, tags, kill switch — read this first
 drain projects        # check your project → repo mappings
-drain start 2         # start 2 background workers
+drain autoscale        # start the autoscaler (scales workers to queue depth)
 ```
 
 Full instructions: [docs/installation.md](docs/installation.md).

@@ -27,7 +27,7 @@ workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
 | `DRAIN_HISTORY_LIMIT` | `20` | Rolling-window size for `drain history` |
 | `DRAIN_ERROR_WEBHOOK` | (unset) | Slack/Discord webhook URL. Critical worker failures are POSTed here (and always logged locally). |
 | `DRAIN_DEBUG` | `0` | Set to `1` for verbose worker logging |
-| `TASKRC` | (unset) | Passed through to the sudo sync fallback so the task DB stays user-owned |
+| `TASKRC` | (unset) | Passed through to the **sudo sync fallback only** (`sudo task sync`) so the task DB stays user-owned. Regular task operations use the default `~/.taskrc` pool and do not read this variable. |
 
 ## Autoscaler
 
