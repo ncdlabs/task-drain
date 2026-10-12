@@ -14,9 +14,11 @@ adapted to the live shared pool (bare `/opt/homebrew/bin/task`, default
 
 ## Install
 
+The plugin lives in the `plugin/` directory of the task-drain repo:
+
 ```sh
-git clone https://github.com/ncdlabs/opencode-tasks <path-to-opencode-tasks>
-cd <path-to-opencode-tasks>
+git clone https://github.com/ncdlabs/task-drain.git <path-to-task-drain>
+cd <path-to-task-drain>/plugin
 npm install
 npm run build   # compiles src/ -> dist/; the plugin host loads dist/index.js
 ```
@@ -26,7 +28,7 @@ Local path (no publish needed) — in your `opencode.json(c)`:
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["<path-to-opencode-tasks>"],
+  "plugins": ["<path-to-task-drain>/plugin"],
 }
 ```
 
@@ -41,10 +43,10 @@ can use them — Claude Code, Cursor, OpenCode, Codex. The server announces
 the claim → work → complete workflow in its instructions, and `SKILL.md`
 carries the same rules for clients that load skills.
 
-Run directly with npx (builds from source on first run):
+Run directly with node (build from source first — see Install above):
 
 ```sh
-npx -y github:ncdlabs/opencode-tasks
+node <path-to-task-drain>/plugin/dist/mcp-server.js
 ```
 
 Configure via environment: `TASK_BIN`, `TASKRC`, `TASK_AUTO_SYNC=0`.
@@ -52,9 +54,9 @@ Configure via environment: `TASK_BIN`, `TASKRC`, `TASK_AUTO_SYNC=0`.
 ### Claude Code
 
 ```sh
-claude mcp add taskwarrior -- npx -y github:ncdlabs/opencode-tasks
+claude mcp add taskwarrior -- node <path-to-task-drain>/plugin/dist/mcp-server.js
 # with env:
-claude mcp add taskwarrior -e TASK_BIN=/opt/homebrew/bin/task -- npx -y github:ncdlabs/opencode-tasks
+claude mcp add taskwarrior -e TASK_BIN=/opt/homebrew/bin/task -- node <path-to-task-drain>/plugin/dist/mcp-server.js
 ```
 
 ### Cursor
@@ -65,8 +67,8 @@ claude mcp add taskwarrior -e TASK_BIN=/opt/homebrew/bin/task -- npx -y github:n
 {
   "mcpServers": {
     "taskwarrior": {
-      "command": "npx",
-      "args": ["-y", "github:ncdlabs/opencode-tasks"],
+      "command": "node",
+      "args": ["<path-to-task-drain>/plugin/dist/mcp-server.js"],
       "env": {
         "TASK_BIN": "/opt/homebrew/bin/task"
       }
@@ -84,7 +86,7 @@ claude mcp add taskwarrior -e TASK_BIN=/opt/homebrew/bin/task -- npx -y github:n
   "mcp": {
     "taskwarrior": {
       "type": "local",
-      "command": ["npx", "-y", "github:ncdlabs/opencode-tasks"],
+      "command": ["node", "<path-to-task-drain>/plugin/dist/mcp-server.js"],
       "environment": {
         "TASK_BIN": "/opt/homebrew/bin/task"
       },
@@ -103,13 +105,13 @@ verify with `codex mcp list`):
 
 ```toml
 [mcp_servers.taskwarrior]
-command = "npx"
-args = ["-y", "github:ncdlabs/opencode-tasks"]
+command = "node"
+args = ["<path-to-task-drain>/plugin/dist/mcp-server.js"]
 ```
 
 ## Configuration
 
-Plugin options (`{ "package": "<path-to-opencode-tasks>", "options": {...} }`)
+Plugin options (`{ "package": "<path-to-task-drain>/plugin", "options": {...} }`)
 or environment:
 
 | Option | Env | Default | Meaning |
