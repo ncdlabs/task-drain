@@ -12,86 +12,36 @@ Supported harnesses (set with `DRAIN_AGENT`): [OpenCode](https://opencode.ai/)
 Pickup is **opt-out**: any pending task is eligible unless it is active,
 waiting, blocked, or tagged `noauto` / `drain-failed`.
 
-## Prerequisites
+## Two operating modes
 
-`./install.sh` handles all of these for you (macOS and Linux; see
-[Installation](#installation)). The list below is what it sets up, for
-reference or manual installs:
+**1. Task layer only — no workers.** The bundled [`plugin/`](plugin/README.md)
+gives any agent session 22 Taskwarrior tools (`task_sync`, `task_claim`,
+`task_add`, …) as an OpenCode plugin or an MCP server for Claude Code,
+Cursor, and Codex. Your agent does claim → work → review → complete with
+you in the loop. Nothing runs unless you ask it to.
 
-- **Taskwarrior 3.x** with [TaskChampion sync](https://github.com/GothenburgBitFactory/taskchampion)
-  configured against a sync server. This is a hard requirement — workers abort
-  if the initial sync fails ("never work offline"). The shared sync pool is
-  what makes multi-machine workers possible.
-- **A TaskChampion sync server.** The installer spins up a local one via
-  Docker (`ghcr.io/gothenburgbitfactory/taskchampion-sync-server`) when
-  available, or you can self-host
-  [taskchampion-sync-server](https://github.com/GothenburgBitFactory/taskchampion-sync-server)
-  yourself (binary release, Docker image, or `cargo build --release`) and
-  point Taskwarrior at it:
-  ```
-  task config sync.server.url https://your-sync-server.example
-  task config sync.server.client_id $(uuidgen)
-  ```
-  Each machine needs its own `client_id` and its own `data.location`.
-  There is currently no public hosted TaskChampion sync service.
-- **macOS 26+ (Local Network Privacy).** If the taskserver is on your LAN,
-  macOS may block third-party (e.g. Homebrew) binaries from reaching it
-  (`EHOSTUNREACH`). `task-drain.sh` falls back to `sudo task sync` — root
-  bypasses LNP, and the DB stays user-owned — which needs NOPASSWD for the
-  task binary in sudoers. Granting the agent binary Local Network permission
-  in System Settings > Privacy & Security > Local Network also works.
-- **An agent CLI** on PATH (pick one with `DRAIN_AGENT`):
-  - `opencode` (v2) — workers invoke `opencode run --standalone
-    --dangerously-skip-permissions`
-  - `claude` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) —
-    workers invoke `claude -p` (headless)
-  - `codex` ([OpenAI Codex CLI](https://github.com/openai/codex)) —
-    workers invoke `codex exec`
-- **jq** (queue queries are parsed with `jq`)
-- **gtimeout** (optional, from coreutils — enables the per-task wall clock;
-  without it tasks run unbounded)
-- **bash 4+**
-- Primarily tested on **macOS** (Homebrew). Linux works if `task`,
-  your agent CLI, and `jq` are on PATH — see [Configuration](#configuration)
-  for the paths you'll need to override.
+**2. Autonomous workers.** `drain start` spins up background workers that
+grind through the queue on their own, with a live dashboard (`drain status`
+/ `-w` / `--workers`), an autoscaler, per-task wall clocks, and a real
+kill switch.
 
-## Installation
+See [docs/operating-modes.md](docs/operating-modes.md) for the full
+comparison, and the safety rails that make Mode 2 sane
+(opt-in `--dangerously-skip-permissions`, `noauto` opt-out, `drain-failed`
+parking, stale-claim release, no telemetry).
+
+## Quick start
 
 ```bash
 git clone https://github.com/ncdlabs/task-drain.git
 cd task-drain
-./install.sh
+./install.sh          # deps, sync server, symlinks into ~/bin, plugin build
+drain docs            # pickup rules, tags, kill switch — read this first
+drain projects        # check your project → repo mappings
+drain start 2         # start 2 background workers
 ```
 
-The installer handles the full setup (idempotent — safe to re-run):
-
-1. **Dependencies** — installs Taskwarrior 3.x (Homebrew on macOS;
-   apt/dnf/pacman on Linux) and `jq` if missing; verifies `task --version`
-   is 3.x. Warns if no agent CLI (`opencode`/`claude`/`codex`) is on PATH.
-2. **Sync server** — starts a local TaskChampion sync server via Docker if
-   available, then configures `task` with `sync.server.url` and generates a
-   `sync.server.client_id` if you don't have one. Honors `TASKCHAMPION_URL`
-   to use a remote server instead, or `TASKCHAMPION_LOCAL=0` to skip.
-3. **Scripts** — symlinks (not copies) `task-drain.sh` and `drain` into
-   `~/bin/`, so `git pull` in the repo updates your install. Set
-   `PREFIX=/usr/local` to install into `/usr/local/bin` instead.
-4. **Task plugin** — builds the bundled `plugin/` (`npm install` +
-   `npm run build`). Skip with `SKIP_PLUGIN=1`, override the path with
-   `PLUGIN_DIR=`.
-
-Installer knobs:
-
-| Variable | Effect |
-|----------|--------|
-| `PREFIX` | Install scripts to `$PREFIX/bin` instead of `~/bin` |
-| `SKIP_DEPS=1` | Skip dependency installation |
-| `SKIP_PLUGIN=1` | Skip the plugin build |
-| `TASKCHAMPION_URL` | Use this sync server URL instead of starting a local one |
-| `TASKCHAMPION_LOCAL=0` | Don't set up a local sync server |
-| `CONTAINER_RUNTIME` | Auto-detect (nerdctl → docker → podman) | Container runtime for the local sync server. Override if auto-detect fails. |
-| `PLUGIN_DIR` | Plugin location (default: `<repo>/plugin`) |
-
-Both scripts are executable; invoke `drain` directly (no `bash` prefix needed).
+Full instructions: [docs/installation.md](docs/installation.md).
 
 ## Usage
 
@@ -106,91 +56,52 @@ drain status --workers         # live per-worker view
 drain logs [-f]                # tail worker logs
 drain unfail [project]         # remove drain-failed tag, return to regular queue
 drain stop                     # graceful stop (finish current task, then exit)
-drain kill                     # immediate stop (claims released to pending)
+drain kill                     # immediate stop (claims released; autoscaler stopped too)
 drain autoscale [project]      # supervisor daemon: auto-scale workers to queue depth
 drain autoscale-stop           # stop the autoscaler (workers keep running)
 drain resume                   # clear the STOP file (doesn't start workers)
-drain docs                     # pickup rules, tags, kill switch, safety dials
 drain history [--limit N]      # show last N processed tasks (default 20)
 ```
 
 The kill switch also works by hand: `touch ~/.task-drain/STOP` stops workers
-gracefully; `pkill -TERM -f task-drain.sh` stops them immediately.
+gracefully; `drain kill` stops them immediately.
 
-## Autoscaling
-
-`drain autoscale` starts a supervisor daemon that watches queue depth and
-scales workers automatically:
-
-- **Scale up:** when eligible tasks exceed `workers × DRAIN_TASKS_PER_WORKER`
-- **Scale down:** when workers exceed what's needed (graceful — workers finish
-  their current task via per-worker STOP files)
-- Clamped to [`DRAIN_MIN_WORKERS`, `DRAIN_MAX_WORKERS`]
-- Checks every `DRAIN_AUTOSCALE_INTERVAL` seconds
-
-```bash
-drain autoscale                  # min 1, max 8, all projects
-drain autoscale myproject --min 2 --max 4
-drain autoscale-stop             # stop supervisor, leave workers running
-```
-
-The supervisor respects the global STOP file and exits cleanly on SIGTERM.
+Complete command reference: [docs/cli-reference.md](docs/cli-reference.md).
 
 ## Tags
 
 | Tag | Meaning |
 |-----|---------|
 | `noauto` | Opt out of worker pickup. Workers never touch these. |
-| `drain-failed` | A worker tried this task and couldn't complete it. Regular workers skip it; clear with `task <uuid> modify -drain-failed` to re-queue, or retry the whole set with `drain start N --failed`. |
-| `drain-claimed` | In-flight marker set while a worker owns a task. Auto-released after 4h if the worker dies (only worker claims are ever released — your interactive sessions' active tasks are never touched). |
-
-Workers never retry `drain-failed` on their own, and `--failed` runs retry
-each failed task at most once, so nothing loops forever.
+| `drain-failed` | A worker tried this task and couldn't complete it. Re-queue with `task <uuid> modify -drain-failed`, or retry the set with `drain start N --failed`. |
+| `drain-claimed` | In-flight marker while a worker owns a task. Auto-released after 4h if the worker dies. |
 
 ## Configuration
 
-Environment variables (export them before `drain start`, or edit the top of
-`task-drain.sh`):
+Environment variables (export before `drain start`, or edit the top of
+`task-drain.sh`). The important ones:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `TASK` | `task` on PATH, else `/opt/homebrew/bin/task` | Taskwarrior binary |
-| `OPENCODE_BIN` | `opencode` | OpenCode binary (only used when `DRAIN_AGENT=opencode`) |
-| `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs (opencode only) |
-| `DRAIN_AGENT` | `opencode` | Agent harness: `opencode` \| `claude` \| `codex`. Switches the worker invocation (`opencode run --standalone`, `claude -p`, `codex exec`). |
-| `DRAIN_SKIP_PERMISSIONS` | `0` | Set to `1` to add `--dangerously-skip-permissions` to `opencode run` flags. **Security risk:** allows the agent to edit, run, and push without approval. |
-| `DRAIN_ERROR_WEBHOOK` | (unset) | Slack/Discord webhook URL for error reporting. When set, critical worker failures are POSTed to this URL. |
-| `GIT_ROOT` | `$HOME/git` | Where your repos live |
-| `DRAIN_OWNER` | `the project owner` | Human authority named in the worker prompt for design/security/product decisions (workers must annotate and fail instead of deciding) |
-| `PROJECT_FILTER` | (unset) | Limit one worker run to a single project |
-| `STALE_AFTER_SEC` | `14400` (4h) | Release worker claims older than this |
-| `TASK_TIMEOUT_SEC` | `14400` (4h) | Per-task wall clock (needs `gtimeout`) |
-| `DRAIN_MIN_WORKERS` | `1` | Autoscaler: minimum workers |
-| `DRAIN_MAX_WORKERS` | `8` | Autoscaler: maximum workers |
-| `DRAIN_AUTOSCALE_INTERVAL` | `30` | Autoscaler: seconds between queue checks |
-| `DRAIN_TASKS_PER_WORKER` | `2` | Autoscaler: eligible tasks per worker before scaling up |
-| `DRAIN_RETRY_FAILED` | `0` | `1` = reprocess `drain-failed` instead of the regular queue (normally set via `drain start --failed`) |
-| `DRAIN_HISTORY_LIMIT` | `20` | Rolling-window size for `drain history` (entries kept in `~/.task-drain/history.log`) |
+| `DRAIN_AGENT` | `opencode` | `opencode` \| `claude` \| `codex` |
+| `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs |
+| `DRAIN_SKIP_PERMISSIONS` | `0` | `1` adds `--dangerously-skip-permissions` — the main risk dial, opt-in only |
+| `DRAIN_OWNER` | `the project owner` | Human authority for design/security/product decisions in the worker prompt |
+| `TASK_TIMEOUT_SEC` | `14400` | Per-task wall clock (needs `gtimeout`) |
+| `STALE_AFTER_SEC` | `14400` | Release worker claims older than this |
 
-**Project → repo mapping.** `repo_for_project()` in `task-drain.sh` maps
-Taskwarrior project names to checkout paths (used as the worker's working
-directory). The built-in table is a set of examples — **edit it for your
-projects**, or add overrides in `~/.task-drain/repos.conf` (one per line,
-takes precedence):
+Everything: [docs/configuration.md](docs/configuration.md) (all variables,
+tags, `repos.conf`, state files).
 
-```
-myproject=$HOME/git/myrepo
-other=~/git/other
-```
+## Documentation
 
-Tasks whose project has no mapping (or whose repo dir doesn't exist) run
-with `$HOME` as the working directory.
-
-**Git workflow.** When a task involves code changes, the worker prompt
-instructs the agent to: work on a feature branch (never main), commit with
-the task UUID referenced, push, and open a PR — leaving it unmerged for
-human review. GitHub uses `gh pr create`; other forges use their API with a
-`FORGE_TOKEN` env var. If push/PR fails, the task is marked failed, not done.
+- [docs/installation.md](docs/installation.md) — prerequisites, installer knobs, manual install, sync server setup, plugin install, verification
+- [docs/operating-modes.md](docs/operating-modes.md) — the two modes, when to use which, safety rails
+- [docs/cli-reference.md](docs/cli-reference.md) — every `drain` command and `task-drain.sh` mode
+- [docs/plugin-tools.md](docs/plugin-tools.md) — all 22 plugin tools, guards, configuration
+- [docs/configuration.md](docs/configuration.md) — environment variables, tags, project → repo mapping
+- [docs/uninstall.md](docs/uninstall.md) — removal: stop, unlink, clean state, unconfigure plugin, server teardown
+- [plugin/README.md](plugin/README.md) — plugin install and MCP client setup
 
 ## How the worker prompt works
 
@@ -208,75 +119,9 @@ enforcing:
   acceptance criteria). Only then `task <uuid> done`. Partial or unverified
   work is failed, never marked done.
 
-Two implementation details worth knowing:
+Code changes go on feature branches; the agent pushes the branch and opens a
+PR, leaving it unmerged for human review.
 
-- Agent CLIs hang waiting on stdin when not attached to a TTY, so workers
-  redirect stdin from `/dev/null` on every invocation. (OpenCode also needs
-  `--standalone` — its default service mode hangs the same way.)
-- The working directory is set via subshell `cd` before invoking the agent.
+## License
 
-## Task plugin (`plugin/`)
-
-The repo bundles Taskwarrior lifecycle tools as native agent tools —
-22 tools (`task sync`, `task claim`, `task start`, `task complete`, …)
-available two ways:
-
-- **OpenCode plugin** — add the plugin dir to `opencode.json`:
-  `"plugin": [ "<repo>/plugin" ]`
-- **MCP server** (`taskwarrior-mcp`, stdio) — for Claude Code, Cursor,
-  OpenCode, and Codex. The server announces the claim → work → complete
-  workflow in its instructions; `plugin/SKILL.md` carries the same rules
-  for clients that load skills.
-
-The drain workers don't require the plugin — they use direct `task`
-shell commands — but it's useful for interactive sessions.
-
-### MCP client setup
-
-Build once (`cd plugin && npm install && npm run build`, or via
-`./install.sh`), then point your client at
-`<repo>/plugin/dist/mcp-server.js`:
-
-**Claude Code**
-```sh
-claude mcp add taskwarrior -- node /path/to/task-drain/plugin/dist/mcp-server.js
-# with env:
-claude mcp add taskwarrior -e TASK_BIN=/opt/homebrew/bin/task -- node /path/to/task-drain/plugin/dist/mcp-server.js
-```
-
-**Cursor** (`~/.cursor/mcp.json`)
-```json
-{
-  "mcpServers": {
-    "taskwarrior": {
-      "command": "node",
-      "args": ["/path/to/task-drain/plugin/dist/mcp-server.js"],
-      "env": { "TASK_BIN": "/opt/homebrew/bin/task" }
-    }
-  }
-}
-```
-
-**OpenCode** (`opencode.json`)
-```jsonc
-{
-  "mcp": {
-    "taskwarrior": {
-      "type": "local",
-      "command": ["node", "/path/to/task-drain/plugin/dist/mcp-server.js"],
-      "environment": { "TASK_BIN": "/opt/homebrew/bin/task" },
-      "enabled": true
-    }
-  }
-}
-```
-
-**Codex** (`~/.codex/config.toml` — verify MCP support with `codex mcp list`)
-```toml
-[mcp_servers.taskwarrior]
-command = "node"
-args = ["/path/to/task-drain/plugin/dist/mcp-server.js"]
-```
-
-Configure via environment: `TASK_BIN`, `TASKRC`, `TASK_AUTO_SYNC=0`.
-Full tool reference: `plugin/README.md`.
+MIT — see [LICENSE](LICENSE).
