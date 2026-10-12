@@ -1,94 +1,70 @@
 # Operating modes
 
-task-drain is two systems that share one Taskwarrior pool. Run either one
-alone, or both together.
+The plugin and shell workers share Taskwarrior data but have independent
+execution and ownership protocols. See [architecture](architecture.md).
 
-## Mode 1 — Task layer only (no workers)
+## Mode 1: task layer only (no workers)
 
-Install the [plugin](../plugin/README.md) (OpenCode plugin or MCP server)
-and any agent session gets 22 native Taskwarrior tools: `task_sync`,
-`task_add`, `task_list`, `task_claim`, `task_start`, `task_submit_for_review`,
-`task_approve`, `task_complete`, and more
-([full tool reference](plugin-tools.md)).
+Install the [plugin or MCP server](installation.md#plugin-install-task-layer-only)
+to expose 22 Taskwarrior tools to an agent client. The plugin does not launch
+coding agents or a background queue consumer. The client decides when to
+call tools; an autonomous client can still use them without human interaction.
 
-In this mode **you stay in the loop**. Your agent performs the Taskwarrior
-session duties — sync before/after operations, UUID-first references,
-claim → work → review → approve → complete, decision recording — without
-hand-rolled `task` shell invocations. Nothing runs unless you ask it to.
+The intended workflow is sync → claim → start → work → submit for review →
+approve → complete. Actual guards are narrower: starting does not require
+ownership, and completing accepts `ready-for-review` without approval.
+Read [the tool reference](plugin-tools.md) before treating this as an approval gate.
 
-Use this mode when:
+`drain status`, `drain history`, and `drain projects` provide dashboards
+without starting agents. `status` can synchronize data and query GitHub;
+these are not strictly local, read-only operations.
 
-- you work interactively with a coding agent and want it to manage tasks properly,
-- you want the discipline (sync hygiene, claim guards, review gates) without autonomy,
-- you're evaluating the system before trusting workers.
+## Mode 2: autonomous workers
 
-The `drain` CLI's read-only commands (`drain status`, `drain history`,
-`drain projects`) are also useful here as a human dashboard over the queue —
-they never start agents.
+Workers select tasks, claim them, invoke an agent, and inspect task completion
+status. The prompt asks the agent to test work and open PRs; the shell does
+not verify those artifacts. See [execution boundaries](architecture.md).
 
-## Mode 2 — Autonomous workers
+| Mode | Normal queue filter |
+|---|---|
+| Default | `+PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed` |
+| Autonomous | `+PENDING -ACTIVE -WAITING -BLOCKED +auto -drain-failed` |
 
-`drain start` (or `drain autoscale`) launches background workers. Each worker
-loops:
+Autonomous mode does **not** exclude `noauto`. To withhold a task from both
+modes, remove `auto` and add `noauto`. A future `scheduled` date alone is not
+an exclusion in these filters; use Taskwarrior waiting state to defer pickup.
+Project filters use Taskwarrior `project:` matching, including its subproject
+semantics; repository mapping still matches the task's exact project string.
 
+For a bounded first run, configure the repository mapping and agent, tag one
+reviewed task `auto`, and run:
+
+```bash
+DRAIN_AUTONOMOUS=1 drain status myproject
+DRAIN_AUTONOMOUS=1 drain start 1 myproject
 ```
-sync → release stale claims → pick highest-urgency eligible task
-     → claim it → run the agent on it → verify → repeat until empty
-```
 
-**Eligibility** is opt-out by default: any task is picked up unless it is
-already active, waiting, blocked, or tagged `noauto` / `drain-failed`.
-With `--autonomous` (or `DRAIN_AUTONOMOUS=1`), eligibility is opt-in: only
-tasks tagged `+auto` are picked up, and the autoscaler is launched to pick
-up new tickets as they are tagged. Details in `drain docs` and
-[Configuration](configuration.md#tags).
+This starts one worker without the autoscaler. `drain start --autonomous`
+also launches a supervisor, potentially growing beyond the initial worker
+count. An existing supervisor keeps its previous configuration.
 
-The agent runs under a prompt that **instructs** three non-negotiables:
+## Operational controls
 
-- **Discipline** — Taskwarrior is the only system of record; sync at session
-  start, after every change, and at session end; never work offline.
-- **Authority** — design, security, product, and public-facing decisions
-  belong to the human (`DRAIN_OWNER`). Anything needing judgment gets
-  annotated and failed, never decided.
-- **Completion contract** — verify for real (build, tests, acceptance
-  criteria) or mark failed. Partial work is never marked done.
+- `drain stop` requests graceful completion of current tasks; `drain kill`
+  sends TERM and stops the local supervisor. Cleanup is best-effort. If no
+  workers exist, `drain stop` returns without setting STOP or stopping a
+  supervisor; use `drain autoscale-stop` explicitly.
+- `drain-failed` parks incomplete attempts. `--failed` snapshots retries per
+  worker; it is not a global one-retry guarantee. Prefer one worker for retries.
+- `DRAIN_SKIP_PERMISSIONS=1` appends a bypass flag to OpenCode only. Claude
+  and Codex retain their configured permissions. Harness behavior can include
+  denying an action or failing a run, not necessarily waiting for a prompt.
+- Stale claim release is based on age and runs only when workers loop. It
+  does not establish that the previous worker died.
+- Workers share mapped working directories. Multiple workers in one checkout
+  can conflict even when they select different tasks.
 
-These are prompt instructions given to the agent; the worker cannot enforce
-them. The agent may still choose to ignore them.
-
-Code changes go on feature branches; the agent pushes the branch and opens
-a PR, leaving it unmerged for human review. Use this mode when you have a
-queue of well-specified tasks and want the machine to grind through them
-while you do something else.
-
-### Safety rails (both modes, critical for Mode 2)
-
-- **Kill switch** — `drain stop` is graceful (finish the current task, then
-  exit); `drain kill` / `drain stop --force` is immediate, with in-flight
-  tasks released back to pending, and also stops the autoscaler so nothing
-  respawns. By hand: `touch ~/.task-drain/STOP`.
-- **No silent retries** — a failed attempt tags the task `drain-failed`;
-  workers never pick those up on their own. Re-queue explicitly
-  (`task <uuid> modify -drain-failed`) or retry the set once each with
-  `drain start N --failed`.
-- **`--dangerously-skip-permissions` is opt-in** (`DRAIN_SKIP_PERMISSIONS=1`).
-  Without it, unattended runs stall on the first approval prompt; with it,
-  the agent can edit, run, and push without asking. Only enable it if you
-  trust the worker to operate without human approval.
-- **Stale claims auto-release** — a worker that dies mid-task has its claim
-  released after `STALE_AFTER_SEC` (default 4h). Only worker claims are ever
-  released; your interactive sessions' active tasks are never touched.
-- **No telemetry.** Error webhooks (`DRAIN_ERROR_WEBHOOK`) are opt-in.
-
-## Choosing
-
-| | Mode 1: task layer | Mode 2: workers |
-|---|---|---|
-| Agent acts without you | No | Yes |
-| Needs an agent CLI installed | No | Yes |
-| Needs `DRAIN_SKIP_PERMISSIONS=1` to be useful | N/A | Recommended for unattended runs |
-| Risk profile | Same as your normal agent session | Autonomous shell access — use the kill switch, `noauto` / `auto`, and review PRs |
-| Start with | `plugin/` install | `drain start 2` |
-
-Most people start with Mode 1, then turn on workers for a well-specified
-project once they trust the loop.
+Use the plugin when an agent client should manage task lifecycle explicitly.
+Use workers for well-specified tasks with suitable repository isolation and
+an understood permission configuration. See [troubleshooting](troubleshooting.md)
+for recovery and [uninstall](uninstall.md) for preserving server data.

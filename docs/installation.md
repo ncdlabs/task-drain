@@ -1,152 +1,171 @@
 # Installation
 
-task-drain has two installable pieces that work independently:
-
-1. **The worker pool** (`task-drain.sh` + the `drain` CLI) — autonomous agents
-   that burn down your Taskwarrior queue. See [Operating modes](operating-modes.md).
-2. **The task plugin** (`plugin/`) — 22 Taskwarrior tools for interactive agent
-   sessions (OpenCode plugin or MCP server). Install it even if you never run
-   a worker.
-
-`./install.sh` sets up both. Everything below is also doable by hand.
+Install shell workers, the task plugin, or both. `install.sh` installs script
+symlinks and builds the plugin by default; it does not enable the plugin in
+an agent client or start workers.
 
 ## Prerequisites
 
-| Requirement | Notes |
+| Requirement | Purpose |
 |---|---|
-| **Taskwarrior 3.x** | Hard requirement — TaskChampion sync is built into 3.x. 2.x cannot sync and workers refuse to run. |
-| **A TaskChampion sync server** | The shared pool is what makes multi-machine workers possible. Self-host via Docker (`ghcr.io/gothenburgbitfactory/taskchampion-sync-server`), the binary release, or `cargo build --release`. There is currently no public hosted service. |
-| **An agent CLI** on PATH | Pick one with `DRAIN_AGENT`: `opencode` (v2, default), `claude` (Claude Code), `codex` (OpenCode). Workers need one; the plugin-only mode does not. |
-| **jq** | Queue queries are parsed with `jq`. |
-| **gtimeout** (optional) | From coreutils. Enables the per-task wall clock (`TASK_TIMEOUT_SEC`); without it tasks run unbounded. |
-| **bash 4+** | |
-| **Node.js** (plugin only) | For building `plugin/` (`npm install && npm run build`). |
+| Taskwarrior 3.x and configured TaskChampion sync | Shared task pool. The installer checks major version ≥3; workers do not independently enforce a version check. |
+| Bash and jq | Worker scripts and JSON processing. Use Bash 4+ for development; the installer does not install Bash. |
+| Authenticated agent CLI | OpenCode v2 (default), Claude Code, or OpenAI Codex for workers; unnecessary for the standalone MCP server itself. |
+| Node.js 20+ and npm | Plugin build/runtime, per `plugin/package.json`. Current development tests require Node.js 22+ with type stripping. |
+| `gtimeout` (optional) | Per-task timeout. Only this executable name is detected; Linux `timeout` alone does not enable the limit. |
+| Git and forge credentials | Needed for code tasks; authenticated `gh` also enables GitHub PR discovery. |
+| Container runtime (optional) | Installer checks nerdctl, Docker, then Podman for a local sync server. |
 
-Primarily tested on **macOS** (Homebrew). Linux works if `task`, your agent
-CLI, and `jq` are on PATH.
+The scripts target macOS and Linux/WSL. Native Windows workers are rejected
+by the installer. Both shell entry points replace PATH; see
+[configuration](configuration.md#environment-and-process-scope) if a binary
+is installed elsewhere. The installer only installs Taskwarrior and jq;
+install the remaining prerequisites separately.
 
-### macOS 26+ note: Local Network Privacy
+## Configure the task pool first
 
-macOS 26 may block third-party (e.g. Homebrew) binaries from reaching a LAN
-taskserver (`EHOSTUNREACH`). `task-drain.sh` falls back to `sudo task sync`
-— root bypasses LNP, and the DB stays user-owned because sudo runs with your
-`HOME`/`TASKRC`. This needs NOPASSWD for the task binary in sudoers.
-Alternatively, grant the agent binary Local Network permission in
-System Settings → Privacy & Security → Local Network.
+For an existing pool, obtain its URL, client ID, and encryption secret through
+your team's credential channel. Replicas sharing tasks use the **same client
+ID and encryption secret**, with separate local data directories. A new
+client ID creates an independent server-side user/pool. Do not regenerate
+an existing profile's identity as a troubleshooting step. See the official
+[Taskwarrior sync manual](https://taskwarrior.org/docs/man/task-sync.5/).
+
+For a new profile, set these values (replace placeholders before running):
+
+```bash
+task config sync.server.url https://your-sync-server.example
+task config sync.server.client_id '<pool-client-id>'
+task config sync.encryption_secret '<pool-encryption-secret>'
+task sync
+```
+
+Create a new UUID only when creating a new pool. Keep credentials out of
+repositories and shared command transcripts. For another replica, start with
+an empty local data directory and the existing pool configuration. Export
+`TASKRC` when using a nondefault profile; Taskwarrior inherits it for ordinary
+commands as well as the worker's sudo fallback.
 
 ## Automated install
 
 ```bash
 git clone https://github.com/ncdlabs/task-drain.git
 cd task-drain
-./install.sh
+TASKCHAMPION_LOCAL=0 ./install.sh  # preserve an already configured sync setup
 ```
 
-The installer is idempotent — safe to re-run. It does, in order:
+For a new local sync server, use `./install.sh` without that override. Review
+these side effects before running it:
 
-1. **Dependencies** — installs Taskwarrior 3.x (Homebrew on macOS;
-   apt/dnf/pacman on Linux) and `jq` if missing; verifies `task --version`
-   is 3.x. Warns if no agent CLI is on PATH.
-2. **Sync server** — starts a local TaskChampion sync server via Docker if
-   available, then configures `task` with `sync.server.url` and generates a
-   `sync.server.client_id` if you don't have one. Honors `TASKCHAMPION_URL`
-   to use a remote server instead, or `TASKCHAMPION_LOCAL=0` to skip.
-   Warns if `sync.encryption_secret` is unset (data syncs unencrypted),
-   then attempts a test sync regardless.
-3. **Scripts** — symlinks `task-drain.sh` and `drain` into `~/bin/`, so
-   `git pull` in the repo updates your install. Set `PREFIX=/usr/local` to
-   install into `/usr/local/bin` instead.
-4. **Task plugin** — builds `plugin/` (`npm install` + `npm run build`).
-   Skip with `SKIP_PLUGIN=1`, override the path with `PLUGIN_DIR=`.
+1. Installs Taskwarrior and jq if missing, unless `SKIP_DEPS=1`.
+2. With local setup enabled, starts/reuses `taskchampion`, binds a new
+   container to `127.0.0.1:8080`, and mounts
+   `~/.task-drain/taskchampion-data`. The image uses `:latest`; this is not a
+   pinned production deployment. A running container is not a health check.
+3. If it selects a sync URL, attempts profile configuration and a real
+   `task sync`. It may generate a missing client ID. Its `task show | awk`
+   probes are fragile; verify the resulting settings yourself. A differing
+   existing URL is preserved even with `TASKCHAMPION_URL` supplied, despite
+   the installer's override message. Set the profile deliberately beforehand.
+4. Warns about a missing encryption secret but still attempts sync. The
+   warning about unencrypted sync is misleading: TaskChampion server sync
+   uses encrypted task data; configure the secret and verify sync explicitly.
+5. Symlinks `drain` and `task-drain.sh` into `$PREFIX/bin` (default `~/bin`),
+   backing up existing non-symlink files as `.bak`. Repeated installation can
+   replace a previous `.bak` file.
+6. Builds `plugin/` using npm unless skipped. Client configuration remains manual.
 
-Installer knobs (environment variables):
-
-| Variable | Effect |
+| Installer variable | Effect |
 |---|---|
-| `PREFIX` | Install scripts to `$PREFIX/bin` instead of `~/bin` |
-| `SKIP_DEPS=1` | Skip dependency installation (`task`, `jq`) |
-| `SKIP_PLUGIN=1` | Skip the plugin build |
-| `TASKCHAMPION_URL=https://…` | Use this sync server instead of starting a local one |
-| `TASKCHAMPION_LOCAL=0` | Don't set up a local sync server at all |
-| `CONTAINER_RUNTIME` | Override container runtime auto-detection (tries nerdctl → docker → podman) |
-| `PLUGIN_DIR=/path` | Plugin location (default: `<repo>/plugin`) |
+| `PREFIX=/usr/local` | Install links into `/usr/local/bin`; caller needs write access |
+| `SKIP_DEPS=1` | Skip dependency installation and automatic local server setup |
+| `SKIP_PLUGIN=1` | Skip plugin build |
+| `TASKCHAMPION_URL=https://…` | Select remote setup instead of creating a local container; does not reliably override an existing URL |
+| `TASKCHAMPION_LOCAL=0` | Disable automatic local server setup; an explicit URL still enables remote setup |
+| `CONTAINER_RUNTIME` | Override nerdctl → Docker → Podman detection |
+| `PLUGIN_DIR` | Override `<repo>/plugin` |
 
-After installing, make sure `$PREFIX/bin` (default `~/bin`) is on your PATH,
-then run `drain docs` and read the pickup rules before starting workers.
+Do not treat a successful installer exit as proof that sync or agent access
+works; some failures produce warnings and installation continues.
 
-## Manual install (without install.sh)
+## Manual script install
 
-1. Install Taskwarrior 3.x, `jq`, and your agent CLI of choice.
-2. Point Taskwarrior at your sync server:
-   ```bash
-   task config sync.server.url https://your-sync-server.example
-   task config sync.server.client_id "$(uuidgen | tr '[:upper:]' '[:lower:]')"
-   ```
-   Each machine needs its **own** `client_id` and its **own** `data.location`.
-   Never change the client ID afterwards, and never share one local data dir
-   between two identities — both corrupt sync state.
-3. `task sync` — workers abort on startup if the initial sync fails
-   ("never work offline").
-4. Symlink (or copy) `task-drain.sh` and `drain` somewhere on your PATH:
-   ```bash
-   ln -s "$PWD/task-drain.sh" ~/bin/task-drain.sh
-   ln -s "$PWD/drain" ~/bin/drain
-   ```
-   Both scripts resolve symlinks to find their siblings and `lib/`.
+From the repository root, after installing prerequisites and configuring sync:
+
+```bash
+mkdir -p "$HOME/bin"
+ln -s "$PWD/drain" "$HOME/bin/drain"
+export PATH="$HOME/bin:$PATH"
+drain help
+```
+
+Keep `task-drain.sh` and `lib/` in the clone. `drain` resolves its own symlink
+and locates them. The worker script itself does not resolve symlinks; use
+`bash /absolute/path/to/task-drain/task-drain.sh` for direct modes. Copying
+only the two scripts into a bin directory omits required libraries.
 
 ## Plugin install (task layer only)
 
-You don't need workers to use the 22 task tools — see
-[Operating modes](operating-modes.md#mode-1-task-layer-only-no-workers).
-
-Build once:
+From the repository root:
 
 ```bash
-cd plugin && npm install && npm run build
+(cd plugin && npm ci && npm run build)
 ```
 
-Then either:
+OpenCode **v2** uses this configuration:
 
-- **OpenCode plugin** — in `opencode.json(c)`:
-  ```jsonc
-  { "plugins": ["<path-to-task-drain>/plugin"] }
-  ```
-- **MCP server** (`taskwarrior-mcp`, stdio) — point your client at
-  `<path-to-task-drain>/plugin/dist/mcp-server.js`:
-  ```sh
-  # Claude Code
-  claude mcp add taskwarrior -- node /path/to/task-drain/plugin/dist/mcp-server.js
-  ```
-  Cursor (`~/.cursor/mcp.json`), OpenCode (`opencode.json` `mcp` section),
-  and Codex (`~/.codex/config.toml`) equivalents are in
-  [plugin/README.md](../plugin/README.md#mcp-server-taskwarrior-mcp).
+```json
+{ "plugins": ["/absolute/path/to/task-drain/plugin"] }
+```
 
-  Configure via environment: `TASK_BIN`, `TASKRC`, `TASK_AUTO_SYNC=0`.
+The plural `plugins` key and `@opencode/plugin` API target v2; v1 plugin
+examples are not interchangeable. See the official
+[OpenCode v2 plugin guide](https://opencode.ai/v2/docs/build/plugins/).
+The installer's printed singular `plugin` example is stale for this adapter.
 
-## Verifying the install
+For an MCP client, launch `node` with the absolute path to
+`plugin/dist/mcp-server.js` over stdio. No port or HTTP service is opened.
+Configure `TASK_BIN` and `TASKRC` in the client environment if necessary;
+leave automatic sync enabled for normal shared-pool use.
+[Plugin README](../plugin/README.md#mcp-server-taskwarrior-mcp) contains client
+configuration examples; [tool reference](plugin-tools.md) defines behavior.
+
+## Verification and first worker
 
 ```bash
-drain docs        # pickup rules, tags, kill switch — read this first
-drain status      # syncs, then shows workers / queue / failed tasks
-drain projects    # check your project → repo mappings
+task --version
+task sync
+drain help
+drain projects
+DRAIN_AUTONOMOUS=1 drain status myproject
 ```
 
-If `drain status` reports `sync: FAILED`, fix sync before starting workers —
-they will refuse to start while offline, by design.
+Configure `~/.task-drain/repos.conf` before starting workers:
 
-## Project → repo mapping
+```text
+myproject=$HOME/git/myrepo
+other=~/git/other
+```
 
-Workers run each task's agent with the project's repo as its working
-directory. Configure the mapping before your first run:
+Resolution order is exact config match, exact directory name under
+`GIT_ROOT`, then the built-in table. Missing/nonexistent mappings fall back
+to HOME. Confirm the actual task project, including subproject suffixes.
 
-1. `~/.task-drain/repos.conf` (highest precedence, one per line):
-   ```
-   myproject=$HOME/git/myrepo
-   other=~/git/other
-   ```
-2. Auto-detect: a directory named exactly like the project under `$GIT_ROOT`
-   (default `~/git`).
-3. Built-in table in `task-drain.sh` (examples — edit for your projects).
+Check the selected agent's noninteractive help and authenticate it before a
+run (`opencode run --help`, `claude --help`, or `codex exec --help`). Configure
+its permissions deliberately. Tag one reviewed task `auto`, sync, then run
+`DRAIN_AUTONOMOUS=1 drain start 1 myproject`. Inspect `drain logs`; launch
+success only means a process was spawned, not that it passed startup checks.
 
-Tasks whose project has no mapping (or whose directory doesn't exist) run
-with `$HOME` as the working directory. Review with `drain projects`.
+## Sync failures and macOS Local Network Privacy
+
+The worker tries normal sync, then `sudo env HOME=… TASKRC=… <task> sync` on
+**any** failure, on all platforms. It retries that pair up to three times.
+This was introduced for a reported macOS LAN-access issue; it is not proof
+that every connection error is a privacy denial. The plugin has no sudo fallback.
+
+Preserving HOME/TASKRC does not preserve effective user identity or guarantee
+file ownership. Sudo policy must permit the exact invocation; a rule for the
+task binary alone may not authorize `sudo env …`. Repair connectivity and
+normal-user permissions first. Do not grant unrestricted passwordless `env`
+as a workaround. See [troubleshooting](troubleshooting.md).

@@ -1,104 +1,90 @@
 # Uninstall
 
-Removal is the reverse of installation, in this order. Nothing here touches
-your Taskwarrior tasks — they live in Taskwarrior, not in task-drain.
+Worker files and Taskwarrior data are separate, but the installer may place
+**sync-server data inside `~/.task-drain/`**. Do not recursively remove that
+directory until you have decided whether to retain the server and backed it up.
 
-## 1. Stop everything
+## 1. Stop local execution
 
 ```bash
-drain autoscale-stop   # stop the supervisor (workers keep running)
-drain kill             # TERM all workers mid-task; claims released to pending
+drain autoscale-stop
+drain stop
 ```
 
-Prefer `drain stop` (graceful — workers finish their current task) if nothing
-is on fire. Verify nothing is left:
+Wait for active work to finish. Use `drain kill` if immediate TERM is needed;
+claim cleanup is best-effort, not guaranteed. Inspect `drain status` and agent
+processes before continuing. These commands do not stop remote workers.
+
+If a claim remains after its worker has stopped, inspect the specific task,
+then release only that UUID:
 
 ```bash
-drain status           # should show "none running"
-```
-
-If a worker was killed hard (`kill -9`) and its claim survived, release it
-by hand:
-
-```bash
-task +drain-claimed +ACTIVE export | jq -r '.[].uuid' | while read -r u; do
-  task "$u" modify -drain-claimed
-  task "$u" stop
-done
+task '<uuid>' export
+task '<uuid>' modify -drain-claimed
+task '<uuid>' stop
 task sync
 ```
 
-## 2. Remove the scripts
+Do not bulk-release `drain-claimed` tasks while other hosts may still own them.
+
+## 2. Preserve data before deleting anything
+
+Back up Taskwarrior configuration, its configured data directory, and the
+pool encryption secret. Preserve `repos.conf`, logs, and history if needed.
+If the installer created a sync server, identify its actual runtime and
+mount with `docker inspect taskchampion` (substitute nerdctl or Podman).
+
+To remove that server, sync participating replicas while it is still running,
+stop the container, and back up the mounted server data before removing it:
 
 ```bash
-rm ~/bin/task-drain.sh ~/bin/drain
+docker stop taskchampion
+# Back up the inspected data mount to a separate location now.
+docker rm taskchampion
 ```
 
-If you installed with `PREFIX=/usr/local` (or another prefix), remove them
-from `$PREFIX/bin` instead. If the installer backed up pre-existing files
-(`drain.bak`), restore or delete those as you prefer.
+If keeping the server, keep its data directory and container. Removing the
+server will make clients using its URL unable to sync until reconfigured.
+A stopped database backup plus retained client replicas provides recovery
+options; do not assume an unverified copy is sufficient.
 
-## 3. Remove worker state
+## 3. Remove client integration and scripts
+
+Remove the OpenCode v2 `plugins` entry or the MCP server entry from the
+configured client, then reload it. For Claude Code, the registered server
+can be removed with `claude mcp remove taskwarrior`. For Cursor and Codex,
+remove the `taskwarrior` server from their MCP configuration.
+
+Remove installed script links (adjust the prefix if necessary):
 
 ```bash
-rm -rf ~/.task-drain
+rm "$HOME/bin/drain" "$HOME/bin/task-drain.sh"
 ```
 
-This deletes the kill-switch files, the autoscaler PID file,
-`repos.conf`, `history.log`, and all worker logs. **It also deletes the
-local sync server's data directory (`~/.task-drain/taskchampion-data`),
-which holds the only copy of your tasks if no other replica has synced.**
-Your `repos.conf` mappings are worth copying elsewhere first if you plan to
-reinstall.
+If you installed only `drain` manually, remove only that link. Restore any
+installer `.bak` files deliberately after checking their contents.
 
-**Do not run step 3 if the sync server holds the only copy of your
-tasks** — make sure every replica has synced (`task sync` on each machine)
-before removing server data.
+## 4. Remove worker state
 
-## 4. Remove the plugin (if installed)
+Delete logs, history, STOP files, `autoscale.pid`, and `repos.conf` only after
+local workers have exited and required backups are complete. If retaining
+the sync server, keep `~/.task-drain/taskchampion-data` intact.
 
-- **OpenCode plugin** — remove the `<path>/plugin` entry from the
-  `plugins` array in your `opencode.json(c)` and reload.
-- **Claude Code** — `claude mcp remove taskwarrior`
-- **Cursor** — delete the `taskwarrior` entry from `~/.cursor/mcp.json`
-- **Codex** — delete the `[mcp_servers.taskwarrior]` section from
-  `~/.codex/config.toml`
-
-## 5. Remove the local sync server (if install.sh created one)
+Only when **all** contents are backed up or intentionally disposable:
 
 ```bash
-docker stop taskchampion && docker rm taskchampion
-# (use nerdctl/podman instead of docker if that's what you run)
+rm -rf "$HOME/.task-drain"
 ```
 
-The server's data was already removed in step 3 along with `~/.task-drain`.
+This deletes any local sync-server data under that directory too.
 
-## 6. Optional: clean drain tags from tasks
+## 5. Optional task-tag cleanup
 
-`drain-failed` and `drain-claimed` are ordinary Taskwarrior tags. They are
-harmless if left in place, but to remove them entirely:
+Inspect exported tasks and remove `drain-failed` or `drain-claimed` by full
+UUID only where appropriate, then sync. These tags are harmless to retain.
+`noauto` and `auto` may still be useful for future worker runs.
 
-```bash
-task +drain-failed modify -drain-failed
-task +drain-claimed modify -drain-claimed
-task sync
-```
-
-`noauto` and `auto` tags are yours — keep them if you still want those tasks
-excluded from (`noauto`) or eligible for (`auto`) any future worker runs.
-
-## What stays behind
-
-- **Your tasks, projects, tags, and annotations** — Taskwarrior data is
-  never deleted by uninstalling task-drain.
-- **Taskwarrior, jq, coreutils, your agent CLI, Node.js** — dependencies
-  installed by `install.sh` or by hand are left alone; remove them with
-  your package manager if you want them gone.
-- **The sync server configuration** in your `taskrc`
-  (`sync.server.url`, `sync.server.client_id`) — still valid for plain
-  `task` use.
-
-## Reinstalling later
-
-Re-clone, re-run `./install.sh` (idempotent), recreate
-`~/.task-drain/repos.conf` from your backup, and `drain start` again.
+Taskwarrior, jq, coreutils, Node.js, agent CLIs, the source clone, and Taskwarrior
+profiles remain installed. Keep pool identity and encryption settings if the
+pool remains in use. Reinstalling requires rebuilding the plugin, restoring
+mappings, and verifying sync and agent access before starting workers.

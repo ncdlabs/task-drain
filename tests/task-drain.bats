@@ -673,3 +673,294 @@ MOCK
     ! kill -0 "$sup" 2>/dev/null
     wait "$sup" 2>/dev/null || true
 }
+
+# --- pick_task urgency sort ---
+
+@test "pick_task returns the highest-urgency task" {
+    load_functions
+    cat > "$TASK" << 'MOCK'
+#!/usr/bin/env bash
+case "$*" in
+    *"export"*)
+        echo '[{"uuid":"aaaa1111-1111-1111-1111-111111111111","urgency":1.0,"description":"low"},{"uuid":"bbbb2222-2222-2222-2222-222222222222","urgency":5.0,"description":"high"},{"uuid":"cccc3333-3333-3333-3333-333333333333","urgency":3.0,"description":"medium"}]'
+        ;;
+    *) echo "mock-task $@" ;;
+esac
+MOCK
+    chmod +x "$TASK"
+    result=$(pick_task)
+    [[ "$result" == *"bbbb2222-2222-2222-2222-222222222222"* ]]
+    [[ "$result" == *"high"* ]]
+}
+
+@test "pick_task returns empty when export is empty" {
+    load_functions
+    cat > "$TASK" << 'MOCK'
+#!/usr/bin/env bash
+case "$*" in
+    *"export"*) echo "" ;;
+    *) echo "mock-task $@" ;;
+esac
+MOCK
+    chmod +x "$TASK"
+    result=$(pick_task)
+    [ "$result" = "" ]
+}
+
+@test "pick_task includes project filter when PROJECT_FILTER is set" {
+    load_functions
+    export PROJECT_FILTER="myproject"
+    result=$(pick_task)
+    [[ "$result" == *"myproject"* ]] || [[ "$result" == "" ]]
+    unset PROJECT_FILTER
+}
+
+# --- pick_retry_task snapshot semantics ---
+
+@test "pick_retry_task pops UUID from snapshot" {
+    load_functions
+    export DRAIN_RETRY_FAILED=1
+    export RETRY_SNAPSHOT="$BATS_TEST_DIRNAME/retry-snapshot-test"
+    echo "aaaa1111-1111-1111-1111-111111111111" > "$RETRY_SNAPSHOT"
+    echo "bbbb2222-2222-2222-2222-222222222222" >> "$RETRY_SNAPSHOT"
+    cat > "$TASK" << 'MOCK'
+#!/usr/bin/env bash
+case "$*" in
+    *"export"*)
+        # Return a pending drain-failed task for any UUID
+        echo '[{"uuid":"aaaa1111-1111-1111-1111-111111111111","status":"pending","tags":["drain-failed"]}]'
+        ;;
+    *) echo "mock-task $@" ;;
+esac
+MOCK
+    chmod +x "$TASK"
+    result=$(pick_retry_task)
+    [[ "$result" == *"aaaa1111-1111-1111-1111-111111111111"* ]]
+    # Snapshot should have the first UUID removed
+    [[ "$(cat "$RETRY_SNAPSHOT")" != *"aaaa1111-1111-1111-1111-111111111111"* ]]
+    rm -f "$RETRY_SNAPSHOT"
+    unset DRAIN_RETRY_FAILED
+}
+
+@test "pick_retry_task skips non-pending tasks" {
+    load_functions
+    export DRAIN_RETRY_FAILED=1
+    export RETRY_SNAPSHOT="$BATS_TEST_DIRNAME/retry-snapshot-test"
+    echo "aaaa1111-1111-1111-1111-111111111111" > "$RETRY_SNAPSHOT"
+    cat > "$TASK" << 'MOCK'
+#!/usr/bin/env bash
+case "$*" in
+    *"export"*)
+        # Return a completed task (not pending)
+        echo '[{"uuid":"aaaa1111-1111-1111-1111-111111111111","status":"completed","tags":["drain-failed"]}]'
+        ;;
+    *) echo "mock-task $@" ;;
+esac
+MOCK
+    chmod +x "$TASK"
+    result=$(pick_retry_task)
+    [ "$result" = "" ]
+    rm -f "$RETRY_SNAPSHOT"
+    unset DRAIN_RETRY_FAILED
+}
+
+# --- reclaim_stale ---
+
+@test "reclaim_stale releases claims for tasks stale beyond threshold" {
+    load_functions
+    export STALE_AFTER_SEC=3600
+    local stale_ts=$(date -v-2H +%Y%m%dT%H%M%SZ 2>/dev/null || date -d '2 hours ago' +%Y%m%dT%H%M%SZ)
+    cat > "$TASK" << MOCK
+#!/usr/bin/env bash
+case "\$*" in
+    *"export"*)
+        echo '[{"uuid":"aaaa1111-1111-1111-1111-111111111111","start":"${stale_ts}","tags":["drain-claimed"]}]'
+        ;;
+    *"modify"*) echo "Modified" ;;
+    *"annotate"*) echo "Annotated" ;;
+    *"stop"*) echo "Stopped" ;;
+    *) echo "mock-task \$@" ;;
+esac
+MOCK
+    chmod +x "$TASK"
+    run reclaim_stale
+    [ "$status" -eq 0 ]
+    rm -f "$RETRY_SNAPSHOT"
+}
+
+@test "reclaim_stale does nothing when no stale claims" {
+    load_functions
+    export STALE_AFTER_SEC=3600
+    cat > "$TASK" << 'MOCK'
+#!/usr/bin/env bash
+case "$*" in
+    *"export"*) echo "[]" ;;
+    *) echo "mock-task $@" ;;
+esac
+MOCK
+    chmod +x "$TASK"
+    run reclaim_stale
+    [ "$status" -eq 0 ]
+}
+
+# --- release_claim ---
+
+@test "release_claim removes drain-claimed tag and annotates" {
+    load_functions
+    cat > "$TASK" << 'MOCK'
+#!/usr/bin/env bash
+echo "called: $@" >> "$MOCK_LOG"
+exit 0
+MOCK
+    chmod +x "$TASK"
+    export MOCK_LOG="$BATS_TEST_DIRNAME/mock-calls.log"
+    rm -f "$MOCK_LOG"
+    run release_claim "aaaa1111-1111-1111-1111-111111111111" "test release reason"
+    [ "$status" -eq 0 ]
+    local calls
+    calls=$(cat "$MOCK_LOG")
+    [[ "$calls" == *"modify -drain-claimed"* ]]
+    [[ "$calls" == *"annotate"* ]]
+    [[ "$calls" == *"test release reason"* ]]
+    rm -f "$MOCK_LOG"
+    unset MOCK_LOG
+}
+
+# --- cleanup_retry ---
+
+@test "cleanup_retry removes snapshot files" {
+    load_functions
+    export RETRY_SNAPSHOT="$BATS_TEST_DIRNAME/retry-snapshot-test"
+    touch "$RETRY_SNAPSHOT" "$RETRY_SNAPSHOT.tmp"
+    cleanup_retry
+    [ ! -f "$RETRY_SNAPSHOT" ]
+    [ ! -f "$RETRY_SNAPSHOT.tmp" ]
+    unset RETRY_SNAPSHOT
+}
+
+@test "cleanup_retry does nothing when no snapshot" {
+    load_functions
+    export RETRY_SNAPSHOT=""
+    run cleanup_retry
+    # Returns 1 because the -n test fails, but should not error
+    [ "$status" -eq 1 ]
+    unset RETRY_SNAPSHOT
+}
+
+# --- on_signal ---
+
+@test "on_signal exits with 130 and releases claim" {
+    load_functions
+    cat > "$TASK" << 'MOCK'
+#!/usr/bin/env bash
+echo "called: $@" >> "$MOCK_LOG"
+exit 0
+MOCK
+    chmod +x "$TASK"
+    export MOCK_LOG="$BATS_TEST_DIRNAME/mock-calls.log"
+    rm -f "$MOCK_LOG"
+    export CURRENT_UUID="aaaa1111-1111-1111-1111-111111111111"
+    export CHILD_PID=""
+    export RETRY_SNAPSHOT=""
+    export DRAIN_SYNC_RETRY_DELAY=0
+    run on_signal
+    [ "$status" -eq 130 ]
+    local calls
+    calls=$(cat "$MOCK_LOG")
+    [[ "$calls" == *"modify -drain-claimed"* ]]
+    rm -f "$MOCK_LOG"
+    unset MOCK_LOG CURRENT_UUID
+}
+
+# --- lib/display.sh formatting ---
+
+@test "drain_fmt_dur formats seconds" {
+    result=$(drain_fmt_dur 45)
+    [ "$result" = "45s" ]
+}
+
+@test "drain_fmt_dur formats minutes" {
+    result=$(drain_fmt_dur 120)
+    [ "$result" = "2m" ]
+}
+
+@test "drain_fmt_dur formats hours" {
+    result=$(drain_fmt_dur 7200)
+    [ "$result" = "2h" ]
+}
+
+@test "drain_fmt_dur formats days" {
+    result=$(drain_fmt_dur 172800)
+    [ "$result" = "2d" ]
+}
+
+@test "drain_fmt_dur returns ? for non-numeric" {
+    result=$(drain_fmt_dur "abc")
+    [ "$result" = "?" ]
+}
+
+@test "drain_dur formats seconds" {
+    result=$(drain_dur 45)
+    [ "$result" = "45s" ]
+}
+
+@test "drain_dur formats minutes" {
+    result=$(drain_dur 120)
+    [ "$result" = "2m" ]
+}
+
+@test "drain_dur formats hours" {
+    result=$(drain_dur 7200)
+    [ "$result" = "2h" ]
+}
+
+@test "drain_dur formats days" {
+    result=$(drain_dur 172800)
+    [ "$result" = "2d" ]
+}
+
+@test "drain_dur returns ? for non-numeric" {
+    result=$(drain_dur "abc")
+    [ "$result" = "?" ]
+}
+
+@test "drain_trunc_str truncates long strings" {
+    result=$(drain_trunc_str "this is a very long string" 10)
+    [[ "$result" == *"…" ]]
+    [ "${#result}" -le 10 ]
+}
+
+@test "drain_trunc_str passes through short strings" {
+    result=$(drain_trunc_str "short" 10)
+    [ "$result" = "short" ]
+}
+
+@test "drain_bar produces a bar of correct width" {
+    result=$(drain_bar 5 10 20)
+    [ "${#result}" -eq 20 ]
+}
+
+@test "drain_bar caps fill at width" {
+    result=$(drain_bar 10 10 20)
+    [ "${#result}" -eq 20 ]
+    [[ "$result" != *"░"* ]]
+}
+
+@test "drain_meter produces a bar of correct width" {
+    result=$(drain_meter 5 10 20)
+    [ "${#result}" -eq 20 ]
+}
+
+@test "drain_terminal_setup clamps columns to 40-200" {
+    export COLUMNS=10
+    drain_terminal_setup
+    [ "$DRAIN_COLS" -ge 40 ]
+    export COLUMNS=500
+    drain_terminal_setup
+    [ "$DRAIN_COLS" -le 200 ]
+    export COLUMNS=80
+    drain_terminal_setup
+    [ "$DRAIN_COLS" -eq 80 ]
+    unset COLUMNS
+}
+

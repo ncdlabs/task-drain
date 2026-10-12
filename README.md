@@ -3,7 +3,7 @@
 Autonomous <a href="https://taskwarrior.org/" target="_blank" rel="noopener noreferrer">Taskwarrior</a> queue workers powered by
 your AI coding agent. Each worker loops: sync → pick the highest-urgency
 eligible task → claim it → hand it to the agent non-interactively →
-verify → repeat until the queue is empty, then exit.
+check task completion status → repeat until the queue is empty, then exit.
 
 Supported harnesses (set with `DRAIN_AGENT`): <a href="https://opencode.ai/" target="_blank" rel="noopener noreferrer">OpenCode</a>
 (default), <a href="https://docs.anthropic.com/en/docs/claude-code" target="_blank" rel="noopener noreferrer">Claude Code</a>,
@@ -12,8 +12,9 @@ Supported harnesses (set with `DRAIN_AGENT`): <a href="https://opencode.ai/" tar
 Pickup is **opt-out** by default: any pending task is eligible unless it is
 active, waiting, blocked, or tagged `noauto` / `drain-failed`.
 Use `--autonomous` (or `DRAIN_AUTONOMOUS=1`) for **opt-in** pickup — only
-tasks tagged `+auto` are eligible, and the autoscaler is launched to pick up
-new tickets.
+tasks tagged `+auto` are eligible. The `--autonomous` flag also launches the
+autoscaler; the environment variable alone only changes eligibility. In this
+mode `noauto` is not excluded: remove `auto` to withhold a task.
 
 ## Two operating modes
 
@@ -29,7 +30,7 @@ grind through the queue on their own, with a live dashboard (`drain status`
 kill switch.
 
 See [docs/operating-modes.md](docs/operating-modes.md) for the full
-comparison, and the safety rails that make Mode 2 sane
+comparison, and the operational limits of Mode 2
 (opt-in `--dangerously-skip-permissions`, `noauto` opt-out / `auto` opt-in,
 `drain-failed` parking, stale-claim release, no telemetry).
 
@@ -41,10 +42,15 @@ cd task-drain
 ./install.sh          # deps, sync server, symlinks into ~/bin, plugin build
 drain docs            # pickup rules, tags, kill switch — read this first
 drain projects        # check your project → repo mappings
-drain autoscale        # start the autoscaler (scales workers to queue depth)
+DRAIN_AUTONOMOUS=1 drain status myproject  # inspect the opt-in queue
+# After configuring the agent and tagging a reviewed task +auto:
+DRAIN_AUTONOMOUS=1 drain start 1 myproject  # one worker, no autoscaler
 ```
 
-Full instructions: [docs/installation.md](docs/installation.md).
+Requires Taskwarrior 3.x with working sync, Bash, jq, and an authenticated
+agent CLI. The plugin requires Node.js 20+; development tests use Node.js 22+.
+Read the [installation guide](docs/installation.md) before running the
+installer against an existing Taskwarrior profile.
 
 ## Usage
 
@@ -80,22 +86,21 @@ Complete command reference: [docs/cli-reference.md](docs/cli-reference.md).
 
 | Tag | Meaning |
 |-----|---------|
-| `noauto` | Opt out of worker pickup. Workers never touch these. |
+| `noauto` | Excludes default-mode pickup; autonomous mode checks `auto` instead. |
 | `auto` | Opt in to worker pickup in autonomous mode (`--autonomous` / `DRAIN_AUTONOMOUS=1`). Only these tasks are eligible. |
 | `drain-failed` | A worker tried this task and couldn't complete it. Re-queue with `task <uuid> modify -drain-failed`, or retry the set with `drain start N --failed`. |
-| `drain-claimed` | In-flight marker while a worker owns a task. Auto-released after 4h if the worker dies. |
+| `drain-claimed` | In-flight marker while a worker owns a task. Eligible for release by another running worker after 4h of active time; worker liveness is not checked. |
 
 ## Configuration
 
-Environment variables (export before `drain start`, or edit the top of
-`task-drain.sh`). The important ones:
+Environment variables (export before `drain start`). The important ones:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DRAIN_AGENT` | `opencode` | `opencode` \| `claude` \| `codex` |
 | `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs |
-| `DRAIN_SKIP_PERMISSIONS` | `0` | `1` adds `--dangerously-skip-permissions` — the main risk dial, opt-in only |
-| `DRAIN_AUTONOMOUS` | `0` | `1` = opt-in pickup (only `+auto` tasks eligible); also launches the autoscaler |
+| `DRAIN_SKIP_PERMISSIONS` | `0` | `1` adds `--dangerously-skip-permissions` to OpenCode only |
+| `DRAIN_AUTONOMOUS` | `0` | `1` = opt-in pickup; only the CLI `--autonomous` flag also starts the autoscaler |
 | `DRAIN_OWNER` | `the project owner` | Human authority for design/security/product decisions in the worker prompt |
 | `TASK_TIMEOUT_SEC` | `14400` | Per-task wall clock (needs `gtimeout`) |
 | `STALE_AFTER_SEC` | `14400` | Release worker claims older than this |
@@ -111,12 +116,16 @@ tags, `repos.conf`, state files).
 - [docs/plugin-tools.md](docs/plugin-tools.md) — all 22 plugin tools, guards, configuration
 - [docs/configuration.md](docs/configuration.md) — environment variables, tags, project → repo mapping
 - [docs/uninstall.md](docs/uninstall.md) — removal: stop, unlink, clean state, unconfigure plugin, server teardown
+- [docs/architecture.md](docs/architecture.md) — worker lifecycle, concurrency, enforcement boundaries
+- [docs/development.md](docs/development.md) — source map, tests, build, contribution workflow
+- [docs/troubleshooting.md](docs/troubleshooting.md) — diagnosis and recovery
+- [docs/DECISIONS.md](docs/DECISIONS.md) — historical decisions and current qualifications
 - [plugin/README.md](plugin/README.md) — plugin install and MCP client setup
 
 ## How the worker prompt works
 
 Every worker hands its task to the configured agent harness with a prompt
-enforcing:
+requesting:
 
 - **Discipline:** Taskwarrior is the only system of record — sync at session
   start, after every change, and at session end; never work offline; never
@@ -129,8 +138,23 @@ enforcing:
   acceptance criteria). Only then `task <uuid> done`. Partial or unverified
   work is failed, never marked done.
 
-Code changes go on feature branches; the agent pushes the branch and opens a
-PR, leaving it unmerged for human review.
+The prompt instructs the agent to use a feature branch, push it, and open a
+PR for human review. The shell only checks whether Taskwarrior reports
+`completed`; it does not independently validate tests, commits, or PRs.
+Workers share mapped checkouts, and claims are not atomic. See
+[architecture and limits](docs/architecture.md) before running concurrent workers.
+
+## Development
+
+```bash
+(cd plugin && npm ci && npm run typecheck && npm test && npm run build)
+bats tests/task-drain.bats
+bash -n drain task-drain.sh install.sh lib/display.sh lib/worker-detect.sh
+```
+
+Use Node.js 22+ and install Bats and jq for these checks. Live integration
+tests require a separate scratch Taskwarrior profile and sync pool; see
+[development](docs/development.md).
 
 ## License
 

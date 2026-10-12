@@ -39,7 +39,7 @@
   "scripts": {
     "build": "tsc",
     "prepare": "npm run build",
-    "test": "node --test tests/task.test.mjs",
+    "test": "node --experimental-strip-types --test tests/task.test.mjs tests/tools.test.mjs",
     "test:integration": "node --test tests/integration.test.mjs",
     "test:all": "npm run test && npm run test:integration",
     "typecheck": "tsc --noEmit"

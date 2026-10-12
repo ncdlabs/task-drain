@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - master
+
+jobs:
+  js-unit-tests:
+    name: JS unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install JS dependencies
+        run: npm ci
+        working-directory: plugin
+
+      - name: Run JS unit tests
+        run: npm test
+        working-directory: plugin
+
+  bats-tests:
+    name: Shell tests (bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats jq
+
+      - name: Run bats tests
+        run: bats tests/task-drain.bats

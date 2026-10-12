@@ -1,7 +1,7 @@
 # Configuration
 
 Everything is configured through environment variables (export before
-`drain start`, or edit the top of `task-drain.sh`) — no config file for the
+`drain start`) — no config file for the
 workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
 
 ## Worker (`task-drain.sh`)
@@ -12,8 +12,8 @@ workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
 | `DRAIN_AGENT` | `opencode` | Agent harness: `opencode` \| `claude` \| `codex`. Selects the invocation (`opencode run --standalone …`, `claude -p`, `codex exec`). Unknown values abort the worker. |
 | `OPENCODE_BIN` | `opencode` | Agent binary (only used when `DRAIN_AGENT=opencode`) |
 | `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs (opencode only; override per run) |
-| `OPENCODE_RUN_FLAGS` | `--standalone --model $DRAIN_MODEL` | Raw flags for `opencode run`. **Warning:** an invalid flag fails every task attempt and mass-marks the queue `drain-failed`. Test one task after changing flags. |
-| `DRAIN_SKIP_PERMISSIONS` | `0` | Set to `1` to append `--dangerously-skip-permissions`. Without it, unattended runs stall on the first approval prompt. **This is the main risk dial** — only enable if you trust the worker to operate without human approval. |
+| `OPENCODE_RUN_FLAGS` (internal array) | `--standalone --model "$DRAIN_MODEL"` | Not an environment override: the script unconditionally assigns this array. Changing additional flags requires a source change. |
+| `DRAIN_SKIP_PERMISSIONS` | `0` | Set to `1` to append `--dangerously-skip-permissions` to OpenCode only. Claude and Codex use their own configured permissions; this variable does not change them. Approval behavior depends on the installed harness. |
 | `DRAIN_OWNER` | `the project owner` | Human authority named in the worker prompt for design/security/product decisions. Workers must annotate and fail instead of deciding. |
 | `GIT_ROOT` | `$HOME/git` | Where repos live; used for project → repo auto-detection |
 | `PROJECT_FILTER` | (unset) | Limit a worker run to one project (normally set via `drain start N <project>`) |
@@ -21,13 +21,13 @@ workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
 | `DRAIN_PERSIST` | `0` | `1` = wait for new jobs after the queue empties instead of exiting (normally set via `drain start --persist`) |
 | `DRAIN_AUTONOMOUS` | `0` | `1` = opt-in pickup: only tasks tagged `+auto` are eligible (normally set via `drain start --autonomous`, which also launches the autoscaler) |
 | `DRAIN_PERSIST_POLL_SEC` | `10` | Seconds between queue polls in persist mode |
-| `STALE_AFTER_SEC` | `14400` (4h) | Worker claims active longer than this with no completion are released. Only worker claims — interactive agents' tasks are never touched. |
+| `STALE_AFTER_SEC` | `14400` (4h) | Active `drain-claimed` tasks older than this are released by a running worker, even if their agent is still alive. Reclamation is global, not project-scoped. |
 | `TASK_TIMEOUT_SEC` | `14400` (4h) | Per-task wall clock, enforced with `gtimeout` (coreutils). Without `gtimeout`, tasks run unbounded. Timed-out tasks are marked failed, not retried. |
 | `DRAIN_SYNC_RETRY_DELAY` | `3` | Base seconds between sync retries (exponential backoff, 3 attempts) |
 | `DRAIN_HISTORY_LIMIT` | `20` | Rolling-window size for `drain history` |
-| `DRAIN_ERROR_WEBHOOK` | (unset) | Slack/Discord webhook URL. Critical worker failures are POSTed here (and always logged locally). |
+| `DRAIN_ERROR_WEBHOOK` | (unset) | Webhook accepting a JSON `text` field (for example Slack). Selected error paths POST worker, hostname, and error details; not every task failure triggers it. Discord compatibility is not implemented explicitly. |
 | `DRAIN_DEBUG` | `0` | Set to `1` for verbose worker logging |
-| `TASKRC` | (unset) | Passed through to the **sudo sync fallback only** (`sudo task sync`) so the task DB stays user-owned. Regular task operations use the default `~/.taskrc` pool and do not read this variable. |
+| `TASKRC` | (unset) | Taskwarrior profile; forwarded to sudo sync with HOME. Does not guarantee file ownership or forward TASKDATA explicitly |
 
 ## Autoscaler
 
@@ -36,7 +36,7 @@ workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
 | `DRAIN_MIN_WORKERS` | `1` | Minimum workers to keep running (normally set via `drain autoscale --min`) |
 | `DRAIN_MAX_WORKERS` | `8` | Maximum workers to start (normally set via `drain autoscale --max`) |
 | `DRAIN_AUTOSCALE_INTERVAL` | `30` | Seconds between queue-depth checks |
-| `DRAIN_TASKS_PER_WORKER` | `2` | Eligible tasks per worker before scaling up (clamped to ≥ 1) |
+| `DRAIN_TASKS_PER_WORKER` | `2` | Eligible tasks per worker before scaling up (invalid or nonpositive values reset to 2) |
 
 Desired workers = `ceil(eligible / DRAIN_TASKS_PER_WORKER)`, clamped to
 `[min, max]`; `0` eligible with `min 0` scales to zero.
@@ -75,10 +75,10 @@ Desired workers = `ceil(eligible / DRAIN_TASKS_PER_WORKER)`, clamped to
 
 | Tag | Set by | Meaning |
 |---|---|---|
-| `noauto` | you | Opt out of worker pickup. Workers never touch these. |
+| `noauto` | you | Excludes default-mode pickup, but is not excluded in autonomous mode. |
 | `auto` | you | Opt in to worker pickup in autonomous mode (`DRAIN_AUTONOMOUS=1` / `--autonomous`). Only these tasks are eligible. |
 | `drain-failed` | workers | A worker attempt ended without completion. Regular workers skip it; clear with `task <uuid> modify -drain-failed` or retry the set with `drain start N --failed`. |
-| `drain-claimed` | workers | In-flight marker while a worker owns a task. Auto-released after `STALE_AFTER_SEC` if the worker dies. Never set it by hand. |
+| `drain-claimed` | workers | In-flight marker while a worker owns a task. Released based on active age by a running worker; no process-liveness check. Never set it by hand. |
 
 ## Project → repo mapping (`~/.task-drain/repos.conf`)
 
@@ -91,6 +91,35 @@ myproject=$HOME/git/myrepo
 website=~/git/website
 ```
 
-`~` and `$HOME` are expanded. `drain projects` shows the effective mapping
-from all three sources. Tasks with no resolvable repo run with `$HOME` as
+Only a leading `~` and literal `$HOME` are expanded; this is not a shell
+file (do not quote paths or put spaces around `=`). The first exact project
+match wins. Precedence is `repos.conf`, matching directory under `GIT_ROOT`,
+then the built-in table. `drain projects` lists sources, not a deduplicated
+resolution report. Subprojects need their own mappings. Tasks with no resolvable repo run with `$HOME` as
 their working directory.
+
+## Environment and process scope
+
+Both shell entry points replace PATH with `/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+Use an absolute `TASK` or `OPENCODE_BIN` when needed. Claude and Codex must
+be available on that PATH. Worker `TASK` and plugin `TASK_BIN` are different
+settings; configure both if they should use the same binary.
+
+Configuration is inherited at launch. Changing an export does not reconfigure
+existing workers or the autoscaler. `DRAIN_AUTONOMOUS=1 drain start 1` changes
+pickup without starting a supervisor; `drain start --autonomous` does both.
+An existing supervisor is reused without changing its settings. Stop and
+restart it explicitly to change its project or pickup mode.
+
+`PROJECT_FILTER` already exported in the shell can survive `drain start all`
+and `drain autoscale all`; unset it explicitly for an unrestricted launch.
+Worker detection, stop files, history, and the supervisor PID file are shared
+under HOME, not isolated by project or TASKRC. Direct supervisor mode also
+accepts `DRAIN_SCRIPT` and `LOG_DIR`; these are internal launch controls.
+`DRAIN_NO_SYNC` suppresses dashboard sync when nonempty and is set internally
+on watch refreshes. It is not a worker offline-mode switch.
+
+The default OpenCode model string is a source default, not a guarantee of
+provider availability or price. Validate it in your installed harness before
+starting a queue. Invalid agent flags or unavailable models can fail every
+eligible task in succession.

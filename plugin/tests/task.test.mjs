@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   UUID_RE,
@@ -11,16 +11,27 @@ import {
   buildModifyArgs,
   buildSetArgs,
   claimGuard,
+  checkSync,
+  checkTaskBinary,
   completeGuard,
+  countTasks,
+  doctor,
+  exportTasks,
   formatAnnotation,
+  generateSetupScript,
+  getInstallInstructions,
+  getTask,
   hasTag,
   lastClaimActor,
   normalizeTag,
   normalizeTags,
   parseListing,
   resolveConfig,
+  runTask,
   startGuard,
+  sync,
 } from "../src/task.mjs";
+import { createFakeTask } from "./helpers/fake-task.mjs";
 
 const UUID_A = "27594f5a-7c89-4d88-8b08-f33b7ef33b6e";
 const UUID_B = "675eb484-efe2-4e3f-9929-ff257db7c9c0";
@@ -278,5 +289,307 @@ describe("parseListing", () => {
       "sol-foundation",
     ]);
     assert.deepEqual(parseListing(""), []);
+  });
+});
+
+describe("runTask", () => {
+  let fake;
+  beforeEach(() => { fake = createFakeTask(); });
+  afterEach(() => { fake.cleanup(); });
+
+  it("returns trimmed stdout on success", async () => {
+    fake.setResponses([{ match: "sync", stdout: "  Sync complete  \n" }]);
+    const result = await runTask(fake.config, ["sync"]);
+    assert.equal(result, "Sync complete");
+  });
+
+  it("rejects with stderr context on failure", async () => {
+    fake.setResponses([{ match: "sync", stderr: "connection refused\n", exit: 1 }]);
+    await assert.rejects(
+      () => runTask(fake.config, ["sync"]),
+      /connection refused/,
+    );
+  });
+
+  it("includes the command in the error message", async () => {
+    fake.setResponses([{ match: "sync", stderr: "boom\n", exit: 1 }]);
+    await assert.rejects(
+      () => runTask(fake.config, ["sync"]),
+      /task sync failed/,
+    );
+  });
+});
+
+describe("sync", () => {
+  let fake;
+  beforeEach(() => { fake = createFakeTask(); });
+  afterEach(() => { fake.cleanup(); });
+
+  it("returns ok with output on success", async () => {
+    fake.setResponses([{ match: "sync", stdout: "Sync complete\n" }]);
+    const result = await sync(fake.config);
+    assert.equal(result.ok, true);
+    assert.equal(result.output, "Sync complete");
+  });
+
+  it("wraps failure with stop-don't-retry message", async () => {
+    fake.setResponses([{ match: "sync", stderr: "connection refused\n", exit: 1 }]);
+    await assert.rejects(
+      () => sync(fake.config),
+      /report and stop, do not retry/,
+    );
+  });
+});
+
+describe("exportTasks", () => {
+  let fake;
+  beforeEach(() => { fake = createFakeTask(); });
+  afterEach(() => { fake.cleanup(); });
+
+  it("returns empty array for empty output", async () => {
+    fake.setResponses([{ match: "export", stdout: "" }]);
+    const result = await exportTasks(fake.config, ["status:pending"]);
+    assert.deepEqual(result, []);
+  });
+
+  it("parses NDJSON lines into task objects", async () => {
+    const t1 = { uuid: UUID_A, status: "pending" };
+    const t2 = { uuid: UUID_B, status: "pending" };
+    fake.setResponses([
+      { match: "export", stdout: JSON.stringify(t1) + "\n" + JSON.stringify(t2) + "\n" },
+    ]);
+    const result = await exportTasks(fake.config, ["status:pending"]);
+    assert.equal(result.length, 2);
+    assert.equal(result[0].uuid, UUID_A);
+    assert.equal(result[1].uuid, UUID_B);
+  });
+
+  it("skips blank lines", async () => {
+    const t1 = { uuid: UUID_A, status: "pending" };
+    fake.setResponses([
+      { match: "export", stdout: "\n" + JSON.stringify(t1) + "\n\n" },
+    ]);
+    const result = await exportTasks(fake.config, []);
+    assert.equal(result.length, 1);
+  });
+
+  it("throws on malformed JSON line", async () => {
+    fake.setResponses([
+      { match: "export", stdout: "not json\n" },
+    ]);
+    await assert.rejects(
+      () => exportTasks(fake.config, []),
+      /Failed to parse/,
+    );
+  });
+});
+
+describe("getTask", () => {
+  let fake;
+  beforeEach(() => { fake = createFakeTask(); });
+  afterEach(() => { fake.cleanup(); });
+
+  it("returns the single matching task", async () => {
+    const t = { uuid: UUID_A, status: "pending" };
+    fake.setResponses([{ match: "export", stdout: JSON.stringify(t) + "\n" }]);
+    const result = await getTask(fake.config, UUID_A);
+    assert.equal(result.uuid, UUID_A);
+  });
+
+  it("throws when zero tasks match", async () => {
+    fake.setResponses([{ match: "export", stdout: "" }]);
+    await assert.rejects(
+      () => getTask(fake.config, UUID_A),
+      /Expected one task/,
+    );
+  });
+
+  it("throws when multiple tasks match", async () => {
+    const t1 = { uuid: UUID_A, status: "pending" };
+    const t2 = { uuid: UUID_A, status: "pending" };
+    fake.setResponses([
+      { match: "export", stdout: JSON.stringify(t1) + "\n" + JSON.stringify(t2) + "\n" },
+    ]);
+    await assert.rejects(
+      () => getTask(fake.config, UUID_A),
+      /Expected one task/,
+    );
+  });
+});
+
+describe("countTasks", () => {
+  let fake;
+  beforeEach(() => { fake = createFakeTask(); });
+  afterEach(() => { fake.cleanup(); });
+
+  it("returns the parsed count", async () => {
+    fake.setResponses([{ match: "count", stdout: "42\n" }]);
+    const result = await countTasks(fake.config, ["status:pending"]);
+    assert.equal(result, 42);
+  });
+
+  it("throws on non-numeric output", async () => {
+    fake.setResponses([{ match: "count", stdout: "unknown\n" }]);
+    await assert.rejects(
+      () => countTasks(fake.config, []),
+      /Failed to parse/,
+    );
+  });
+});
+
+describe("checkTaskBinary and checkSync", () => {
+  let fake;
+  beforeEach(() => { fake = createFakeTask(); });
+  afterEach(() => { fake.cleanup(); });
+
+  it("checkTaskBinary returns ok with version", async () => {
+    fake.setResponses([{ match: "--version", stdout: "Task 3.5.0\n" }]);
+    const result = await checkTaskBinary(fake.config);
+    assert.equal(result.ok, true);
+    assert.equal(result.version, "Task 3.5.0");
+  });
+
+  it("checkTaskBinary returns error when binary missing", async () => {
+    fake.setResponses([{ match: "--version", stderr: "not found\n", exit: 127 }]);
+    const result = await checkTaskBinary(fake.config);
+    assert.equal(result.ok, false);
+    assert.ok(result.error);
+  });
+
+  it("checkSync returns ok on success", async () => {
+    fake.setResponses([{ match: "sync", stdout: "Sync complete\n" }]);
+    const result = await checkSync(fake.config);
+    assert.equal(result.ok, true);
+  });
+
+  it("checkSync returns error on failure", async () => {
+    fake.setResponses([{ match: "sync", stderr: "fail\n", exit: 1 }]);
+    const result = await checkSync(fake.config);
+    assert.equal(result.ok, false);
+    assert.ok(result.error);
+  });
+});
+
+describe("doctor", () => {
+  let fake;
+  beforeEach(() => { fake = createFakeTask(); });
+  afterEach(() => { fake.cleanup(); });
+
+  it("returns all-pass summary when both checks succeed", async () => {
+    fake.setResponses([
+      { match: "--version", stdout: "Task 3.5.0\n" },
+      { match: "sync", stdout: "Sync complete\n" },
+    ]);
+    const result = await doctor(fake.config);
+    assert.equal(result.summary, "All checks passed ✓");
+  });
+
+  it("returns issues summary when sync fails", async () => {
+    fake.setResponses([
+      { match: "--version", stdout: "Task 3.5.0\n" },
+      { match: "sync", stderr: "fail\n", exit: 1 },
+    ]);
+    const result = await doctor(fake.config);
+    assert.ok(result.summary.includes("Issues"));
+  });
+});
+
+describe("getInstallInstructions", () => {
+  it("returns platform and arch info", () => {
+    const info = getInstallInstructions();
+    assert.ok(info.platform);
+    assert.ok(info.arch);
+    assert.ok(Array.isArray(info.instructions));
+    assert.ok(info.instructions.length > 0);
+  });
+
+  it("includes a command in each instruction", () => {
+    const info = getInstallInstructions();
+    for (const instr of info.instructions) {
+      assert.ok(instr.command, `instruction missing command: ${instr.manager}`);
+      assert.ok(instr.manager, "instruction missing manager");
+    }
+  });
+});
+
+describe("generateSetupScript", () => {
+  it("generates a bash script with task install command", () => {
+    const script = generateSetupScript({ includeVerify: true });
+    assert.ok(script.includes("#!/usr/bin/env bash"));
+    assert.ok(script.includes("task"));
+  });
+
+  it("includes verify section when includeVerify is true", () => {
+    const script = generateSetupScript({ includeVerify: true });
+    assert.ok(script.includes("# Verify installation"));
+    assert.ok(script.includes("task --version"));
+    assert.ok(script.includes("task sync"));
+  });
+
+  it("omits verify section when includeVerify is false", () => {
+    const script = generateSetupScript({ includeVerify: false });
+    assert.ok(!script.includes("# Verify installation"));
+    assert.ok(!script.includes("task --version"));
+  });
+});
+
+describe("edge cases", () => {
+  it("normalizeTag rejects non-string input", () => {
+    assert.throws(() => normalizeTag(123), /Invalid tag/);
+    assert.throws(() => normalizeTag(null), /Invalid tag/);
+    assert.throws(() => normalizeTag(undefined), /Invalid tag/);
+  });
+
+  it("hasTag works on tasks with no tags field", () => {
+    assert.equal(hasTag({}, "claimed"), false);
+    assert.equal(hasTag({ tags: undefined }, "claimed"), false);
+  });
+
+  it("applyTagFilter handles both include and exclude", () => {
+    const tasks = [
+      { uuid: UUID_A, tags: ["bug", "ready-for-review"] },
+      { uuid: UUID_B, tags: ["bug"] },
+    ];
+    const result = applyTagFilter(tasks, ["bug"], ["ready-for-review"]);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].uuid, UUID_B);
+  });
+
+  it("applyTagFilter returns all tasks when no filters given", () => {
+    const tasks = [
+      { uuid: UUID_A, tags: ["bug"] },
+      { uuid: UUID_B, tags: ["feature"] },
+    ];
+    assert.equal(applyTagFilter(tasks).length, 2);
+  });
+
+  it("lastClaimActor handles non-array annotations", () => {
+    assert.equal(lastClaimActor({ annotations: "not-array" }), undefined);
+    assert.equal(lastClaimActor({ annotations: null }), undefined);
+    assert.equal(lastClaimActor({}), undefined);
+  });
+
+  it("assertActionable handles missing status field", () => {
+    assert.throws(() => assertActionable({}), /not pending/);
+    assert.throws(() => assertActionable({ status: null }), /not pending/);
+  });
+
+  it("buildSetArgs handles recur field", () => {
+    const args = buildSetArgs({ recur: "weekly" });
+    assert.ok(args.includes("recur:weekly"));
+  });
+
+  it("buildSetArgs handles depends as scalar string", () => {
+    const args = buildSetArgs({ depends: UUID_B });
+    assert.ok(args.includes(`depends:${UUID_B}`));
+  });
+
+  it("buildModifyArgs with no changes returns empty array", () => {
+    assert.deepEqual(buildModifyArgs({}), []);
+  });
+
+  it("formatAnnotation accepts actor at exactly 80 chars", () => {
+    const actor80 = "x".repeat(80);
+    assert.doesNotThrow(() => formatAnnotation(actor80, "a", "d"));
   });
 });
