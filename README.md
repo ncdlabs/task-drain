@@ -57,15 +57,18 @@ drain start --autonomous       # opt-in mode: only +auto tasks; launches autosca
 drain status                   # queue dashboard: workers, counts, failed list
 drain status -w                # live dashboard (q quits)
 drain status --workers         # live per-worker view
+drain status --verbose         # show full task lists instead of capped summary
 drain logs [-f]                # tail worker logs
 drain unfail [project]         # remove drain-failed tag, return to regular queue
 drain stop                     # graceful stop (finish current task, then exit)
+drain stop --force             # immediate stop (TERM mid-task, like drain kill)
 drain kill                     # immediate stop (claims released; autoscaler stopped too)
 drain autoscale [project]      # supervisor daemon: auto-scale workers to queue depth
 drain autoscale-stop           # stop the autoscaler (workers keep running)
 drain resume                   # clear the STOP file (doesn't start workers)
 drain pr list [--json]         # list open PRs from drain agents (PENDING APPROVAL)
 drain history [--limit N]      # show last N processed tasks (default 20)
+drain projects merge <dst> <src...>  # merge source projects into destination
 ```
 
 The kill switch also works by hand: `touch ~/.task-drain/STOP` stops workers
