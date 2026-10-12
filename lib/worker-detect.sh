@@ -3,7 +3,9 @@
 
 # Get PIDs of running task-drain.sh workers (newest first).
 # Never matches self or ancestors (a caller whose own command line names the
-# worker script is not a worker).
+# worker script is not a worker). The autoscale supervisor ("...task-drain.sh
+# autoscale") is not a worker either: it is tracked separately via
+# ~/.task-drain/autoscale.pid and shown as AUTOSCALE in drain status.
 drain_worker_pids() {
 	local skip="$$" p=$PPID ppid guard=0
 	while [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -gt 1 ] && [ "$guard" -lt 64 ]; do
@@ -14,7 +16,7 @@ drain_worker_pids() {
 		guard=$((guard + 1))
 	done
 	ps -eo pid,command 2>/dev/null |
-		awk -v skip="^($skip)$" '/(^|[^A-Za-z0-9_-])[t]ask-drain\.sh/ && !/ status/ && !/ watch/ && !/ workers/ && $1 !~ skip {print $1}' |
+		awk -v skip="^($skip)$" '/(^|[^A-Za-z0-9_-])[t]ask-drain\.sh/ && !/ status/ && !/ watch/ && !/ workers/ && !/ autoscale/ && $1 !~ skip {print $1}' |
 		sort -rn || true
 }
 
@@ -30,5 +32,5 @@ drain_worker_info() {
 		guard=$((guard + 1))
 	done
 	ps -eo pid,ppid,etime,command 2>/dev/null |
-		awk -v skip="^($skip)$" '/(^|[^A-Za-z0-9_-])[t]ask-drain\.sh/ && !/ status/ && !/ watch/ && !/ workers/ && $1 !~ skip { pid=$1; ppid=$2; pids[pid]=1; parent[pid]=ppid; et[pid]=$3; $1=$2=$3=""; sub(/^   */, ""); cmd[pid]=$0; next } END { for (p in pids) if (!(parent[p] in pids)) print p, et[p], cmd[p] }' | sort -n || true
+		awk -v skip="^($skip)$" '/(^|[^A-Za-z0-9_-])[t]ask-drain\.sh/ && !/ status/ && !/ watch/ && !/ workers/ && !/ autoscale/ && $1 !~ skip { pid=$1; ppid=$2; pids[pid]=1; parent[pid]=ppid; et[pid]=$3; $1=$2=$3=""; sub(/^   */, ""); cmd[pid]=$0; next } END { for (p in pids) if (!(parent[p] in pids)) print p, et[p], cmd[p] }' | sort -n || true
 }

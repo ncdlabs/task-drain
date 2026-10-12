@@ -505,3 +505,77 @@ FAKESUDO
     run "$SCRIPT_DIR/drain" history --limit 10
     [ "$status" -eq 0 ]
 }
+
+# --- claim-failure handling (audit fix) ---
+
+@test "claim_task returns 1 when post-claim sync fails" {
+    load_functions
+    # Smart mock: mutations succeed, sync always fails (even via the sudo fallback)
+    cat > "$TASK" << 'MOCK'
+#!/usr/bin/env bash
+if [ "$1" = "sync" ]; then exit 1; fi
+exit 0
+MOCK
+    chmod +x "$TASK"
+    mkdir -p "$BATS_TEST_DIRNAME/bin"
+    printf '#!/usr/bin/env bash\nexec "$@"\n' > "$BATS_TEST_DIRNAME/bin/sudo"
+    chmod +x "$BATS_TEST_DIRNAME/bin/sudo"
+    export PATH="$BATS_TEST_DIRNAME/bin:$PATH"
+    export DRAIN_SYNC_RETRY_DELAY=0
+    run claim_task "aaaa1111-1111-1111-1111-111111111111"
+    [ "$status" -eq 1 ]
+    rm -rf "$BATS_TEST_DIRNAME/bin"
+}
+
+@test "run_one skips the task without launching the agent when claim fails" {
+    load_functions
+    # Force the claim to fail; the worker must survive and move on
+    claim_task() { return 1; }
+    mkdir -p "$BATS_TEST_DIRNAME/bin"
+    printf '#!/usr/bin/env bash\ntouch "%s/agent-launched"\nexit 0\n' "$BATS_TEST_DIRNAME" > "$BATS_TEST_DIRNAME/bin/opencode"
+    chmod +x "$BATS_TEST_DIRNAME/bin/opencode"
+    export PATH="$BATS_TEST_DIRNAME/bin:$PATH"
+    export OPENCODE_BIN="$BATS_TEST_DIRNAME/bin/opencode"
+    export DRAIN_SYNC_RETRY_DELAY=0
+    run run_one '{"uuid":"aaaa1111-1111-1111-1111-111111111111","project":"myproject","priority":"H","description":"test task"}'
+    [ "$status" -eq 1 ]
+    [ ! -f "$BATS_TEST_DIRNAME/agent-launched" ]
+    rm -rf "$BATS_TEST_DIRNAME/bin" "$BATS_TEST_DIRNAME/agent-launched"
+}
+
+# --- autoscaler worker counting (audit fix) ---
+
+@test "autoscaler worker-count pattern excludes the supervisor itself" {
+    mkdir -p "$BATS_TEST_DIRNAME/stubs"
+    printf '#!/usr/bin/env bash\nsleep 60\n' > "$BATS_TEST_DIRNAME/stubs/task-drain.sh"
+    chmod +x "$BATS_TEST_DIRNAME/stubs/task-drain.sh"
+    local S="$BATS_TEST_DIRNAME/stubs/task-drain.sh"
+    bash "$S" &
+    local worker=$!
+    bash "$S" autoscale &
+    local sup=$!
+    sleep 0.5
+    # Same pattern the autoscaler uses: must count the worker, never the supervisor
+    local counted
+    counted=$(pgrep -f "bash $S$" | wc -l | tr -d ' ')
+    kill "$worker" "$sup" 2>/dev/null || true
+    wait 2>/dev/null || true
+    [ "$counted" = "1" ]
+    rm -rf "$BATS_TEST_DIRNAME/stubs"
+}
+
+# --- kill-switch coverage (audit fix) ---
+
+@test "stop_autoscaler stops the supervisor via pidfile and removes it" {
+    eval "$(sed -n '/^stop_autoscaler() {/,/^}/p' "$SCRIPT_DIR/drain")"
+    export DRAIN_HOME="$HOME/.task-drain"
+    sleep 60 &
+    local sup=$!
+    echo "$sup" > "$DRAIN_HOME/autoscale.pid"
+    run stop_autoscaler
+    [ "$status" -eq 0 ]
+    [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+    sleep 0.2
+    ! kill -0 "$sup" 2>/dev/null
+    wait "$sup" 2>/dev/null || true
+}
