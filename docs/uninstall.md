@@ -80,8 +80,8 @@ task +drain-claimed modify -drain-claimed
 task sync
 ```
 
-`noauto` tags are yours — keep them if you still want those tasks excluded
-from any future worker runs.
+`noauto` and `auto` tags are yours — keep them if you still want those tasks
+excluded from (`noauto`) or eligible for (`auto`) any future worker runs.
 
 ## What stays behind
 

@@ -19,6 +19,7 @@ workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
 | `PROJECT_FILTER` | (unset) | Limit a worker run to one project (normally set via `drain start N <project>`) |
 | `DRAIN_RETRY_FAILED` | `0` | `1` = reprocess `drain-failed` tasks instead of the regular queue (normally set via `drain start --failed`) |
 | `DRAIN_PERSIST` | `0` | `1` = wait for new jobs after the queue empties instead of exiting (normally set via `drain start --persist`) |
+| `DRAIN_AUTONOMOUS` | `0` | `1` = opt-in pickup: only tasks tagged `+auto` are eligible (normally set via `drain start --autonomous`, which also launches the autoscaler) |
 | `DRAIN_PERSIST_POLL_SEC` | `10` | Seconds between queue polls in persist mode |
 | `STALE_AFTER_SEC` | `14400` (4h) | Worker claims active longer than this with no completion are released. Only worker claims — interactive agents' tasks are never touched. |
 | `TASK_TIMEOUT_SEC` | `14400` (4h) | Per-task wall clock, enforced with `gtimeout` (coreutils). Without `gtimeout`, tasks run unbounded. Timed-out tasks are marked failed, not retried. |
@@ -75,6 +76,7 @@ Desired workers = `ceil(eligible / DRAIN_TASKS_PER_WORKER)`, clamped to
 | Tag | Set by | Meaning |
 |---|---|---|
 | `noauto` | you | Opt out of worker pickup. Workers never touch these. |
+| `auto` | you | Opt in to worker pickup in autonomous mode (`DRAIN_AUTONOMOUS=1` / `--autonomous`). Only these tasks are eligible. |
 | `drain-failed` | workers | A worker attempt ended without completion. Regular workers skip it; clear with `task <uuid> modify -drain-failed` or retry the set with `drain start N --failed`. |
 | `drain-claimed` | workers | In-flight marker while a worker owns a task. Auto-released after `STALE_AFTER_SEC` if the worker dies. Never set it by hand. |
 

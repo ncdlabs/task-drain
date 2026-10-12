@@ -39,6 +39,10 @@ source "$SCRIPT_DIR/lib/worker-detect.sh"
 #                    task being completed; clear it to re-queue:
 #                      task <uuid> modify -drain-failed
 #
+# AUTONOMOUS MODE (DRAIN_AUTONOMOUS=1, or `drain start --autonomous`):
+#   Pickup is OPT-IN: only tasks tagged +auto are eligible. The autoscaler
+#   is launched to pick up new tickets as they are tagged.
+#
 # RETRY MODE (DRAIN_RETRY_FAILED=1):
 #   Workers reprocess drain-failed tasks instead of the regular queue.
 #   The failed set is snapshotted at worker start; each task is retried at
@@ -100,6 +104,7 @@ _DRAIN_DEFAULT_TIMEOUT=14400
 PROJECT_FILTER="${PROJECT_FILTER:-}"
 DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-0}" # 1 = reprocess drain-failed tasks instead of the regular queue
 DRAIN_PERSIST="${DRAIN_PERSIST:-0}"           # 1 = wait for new jobs after queue empties instead of exiting
+DRAIN_AUTONOMOUS="${DRAIN_AUTONOMOUS:-0}"     # 1 = opt-in pickup (requires +auto tag); launched via `drain start --autonomous`
 
 # Single sync attempt. macOS 26 Local Network Privacy blocks third-party
 # (Homebrew, unsigned) binaries from the LAN taskserver (EHOSTUNREACH), while
@@ -307,12 +312,25 @@ repo_for_project() {
 	esac
 }
 
+# Eligibility filter shared by pick_task, status, and the autoscaler.
+# Default (DRAIN_AUTONOMOUS=0): opt-out — everything pending is eligible
+# unless tagged noauto. Autonomous mode (DRAIN_AUTONOMOUS=1): opt-in —
+# only tasks tagged +auto are eligible.
+drain_elig_filter() {
+	if [ "${DRAIN_AUTONOMOUS:-0}" = "1" ]; then
+		echo "+PENDING -ACTIVE -WAITING -BLOCKED +auto -drain-failed"
+	else
+		echo "+PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed"
+	fi
+}
+
 pick_task() {
 	if [ "$DRAIN_RETRY_FAILED" = "1" ]; then
 		pick_retry_task
 		return
 	fi
-	local filter="+PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed"
+	local filter
+	filter=$(drain_elig_filter)
 	if [ -n "$PROJECT_FILTER" ]; then filter="project:$PROJECT_FILTER $filter"; fi
 	# shellcheck disable=SC2086
 	local export_output
@@ -559,7 +577,8 @@ run_worker() {
 	if [ "$DRAIN_RETRY_FAILED" = "1" ]; then
 		done_msg="failed set reprocessed"
 		RETRY_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/drain-retry.XXXXXX")
-		local rfilter="+drain-failed -ACTIVE -WAITING -BLOCKED -noauto"
+		local rfilter="+drain-failed -ACTIVE -WAITING -BLOCKED"
+		if [ "$DRAIN_AUTONOMOUS" = "1" ]; then rfilter="$rfilter +auto"; else rfilter="$rfilter -noauto"; fi
 		if [ -n "$PROJECT_FILTER" ]; then rfilter="project:$PROJECT_FILTER $rfilter"; fi
 		# shellcheck disable=SC2086
 		$TASK $rfilter export 2>/dev/null | jq -r '.[].uuid' >"$RETRY_SNAPSHOT"
@@ -653,7 +672,8 @@ cmd_status() {
 	fi
 
 	# --- queue counts, pending-scoped to match the tagging system (see `drain docs`) ---
-	# Eligibility == pick_task(): +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed.
+	# Eligibility == pick_task(): drain_elig_filter() (+PENDING -ACTIVE -WAITING
+	# -BLOCKED -drain-failed, plus +auto in autonomous mode or -noauto otherwise).
 	# Tag counts are scoped to +PENDING so completed/deleted tasks with stale
 	# tags never inflate the dashboard. Exception: +WAITING is disjoint from
 	# +PENDING in this Taskwarrior version (+PENDING +WAITING is always 0), so
@@ -662,7 +682,7 @@ cmd_status() {
 	# for clarity.)
 	local n_elig n_active n_blocked n_waiting n_noauto n_failed n_done
 	local n_claimed_active n_interactive n_stale n_pending_total
-	n_elig=$(tq +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed count 2>/dev/null || echo "?")
+	n_elig=$(tq $(drain_elig_filter) count 2>/dev/null || echo "?")
 	n_active=$(tq +ACTIVE count 2>/dev/null || echo "?")
 	n_blocked=$(tq +PENDING +BLOCKED count 2>/dev/null || echo "?")
 	n_waiting=$(tq +WAITING count 2>/dev/null || echo "?")
@@ -689,7 +709,7 @@ cmd_status() {
 
 	# --- data exports (single shot each; tag exports scoped to +PENDING) ---
 	local eligible_json active_json failed_json review_json
-	eligible_json=$(tq +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed export 2>/dev/null || echo '[]')
+	eligible_json=$(tq $(drain_elig_filter) export 2>/dev/null || echo '[]')
 	active_json=$(tq +ACTIVE export 2>/dev/null || echo '[]')
 	failed_json=$(tq +PENDING +drain-failed export 2>/dev/null || echo '[]')
 	review_json=$(tq +COMPLETED end.after:today export 2>/dev/null |
@@ -1445,7 +1465,7 @@ autoscale_supervisor() {
 		# Sync and count eligible tasks
 		sync_with_retry >/dev/null 2>&1 || log "autoscaler: sync failed, using local state"
 		local eligible
-		eligible=$(tq +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed count 2>/dev/null || echo "0")
+		eligible=$(tq $(drain_elig_filter) count 2>/dev/null || echo "0")
 		[[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
 
 		# Count running workers.

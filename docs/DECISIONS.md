@@ -35,3 +35,25 @@ taskserver flakiness (3 attempts, exponential backoff).
 **Follow-up.** Drain workers running old code must be restarted once to
 pick up the sudo fallback (`pkill -f task-drain.sh`, then
 `drain autoscale` or start workers as usual).
+
+## 2026-10-12 — Opt-in autonomous mode
+
+**Context.** Pickup was opt-out: any pending task was eligible unless tagged
+`noauto`. This meant a freshly added task could be grabbed by a worker before
+the owner had a chance to review it. The owner asked for autonomous
+processing to be opt-in instead.
+
+**Decision.** Added `DRAIN_AUTONOMOUS` env var and `--autonomous` flag on
+`drain start`. When enabled, pickup requires `+auto` tag on each task —
+nothing is picked up unless explicitly tagged. The autoscaler is launched
+automatically to pick up new tickets as they are tagged. Default behavior
+(opt-out via `noauto`) is unchanged for existing users.
+
+**Alternatives considered.**
+- Flip the default to opt-in — rejected: breaking change for existing users;
+  the flag gives them the opt-in behavior without disrupting current setups.
+- Separate `drain autoscale --autonomous` flag — rejected: one flag on
+  `drain start` is simpler and keeps the autoscaler launch in one place.
+
+**Follow-up.** Existing users who want opt-in pickup should run
+`drain start --autonomous` and tag tasks with `+auto`.

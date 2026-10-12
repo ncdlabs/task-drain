@@ -236,6 +236,48 @@ load_functions() {
     unset DRAIN_SKIP_PERMISSIONS
 }
 
+# --- opt-in autonomous mode (DRAIN_AUTONOMOUS) ---
+
+@test "drain_elig_filter returns opt-out filter by default" {
+    load_functions
+    export DRAIN_AUTONOMOUS=0
+    result=$(drain_elig_filter)
+    [[ "$result" == *"-noauto"* ]]
+    [[ "$result" != *"+auto"* ]]
+    unset DRAIN_AUTONOMOUS
+}
+
+@test "drain_elig_filter returns opt-in filter when DRAIN_AUTONOMOUS=1" {
+    load_functions
+    export DRAIN_AUTONOMOUS=1
+    result=$(drain_elig_filter)
+    [[ "$result" == *"+auto"* ]]
+    [[ "$result" != *"-noauto"* ]]
+    unset DRAIN_AUTONOMOUS
+}
+
+@test "drain_elig_filter includes project filter when PROJECT_FILTER is set" {
+    load_functions
+    export DRAIN_AUTONOMOUS=0
+    export PROJECT_FILTER="myproject"
+    result=$(drain_elig_filter)
+    [[ "$result" == *"project:myproject"* ]]
+    unset DRAIN_AUTONOMOUS
+    unset PROJECT_FILTER
+}
+
+@test "drain help start shows --autonomous option" {
+    run "$SCRIPT_DIR/drain" help start
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--autonomous"* ]]
+}
+
+@test "drain start --autonomous flag is accepted" {
+    run "$SCRIPT_DIR/drain" start 1 --autonomous
+    [[ "$output" != *"unexpected argument"* ]]
+    [[ "$output" != *"unknown option"* ]]
+}
+
 # --- task sync with sudo fallback (macOS Local Network Privacy) ---
 
 @test "sync_with_retry succeeds when direct sync works" {

@@ -29,7 +29,7 @@ review, and today's drain completions. Optionally scoped to one project
 
 The first frame syncs; on sync failure it shows local state with a warning.
 
-### `drain start [N] [project|all] [--failed] [--persist]`
+### `drain start [N] [project|all] [--failed] [--persist] [--autonomous]`
 
 Start N background workers (default 2, max 8), optionally limited to one
 project. Clears a stale global STOP file and prunes dead per-worker STOP
@@ -42,6 +42,8 @@ files first. Each worker logs to
 - `--persist` — workers wait for new jobs (polling every
   `DRAIN_PERSIST_POLL_SEC`, default 10s) after the queue empties instead
   of exiting.
+- `--autonomous` — opt-in pickup mode: only tasks tagged `+auto` are
+  eligible. Also launches the autoscaler to pick up new tickets.
 
 Examples:
 
@@ -50,6 +52,7 @@ drain start                  # 2 workers, all projects
 drain start 4 myproject       # 4 workers, one project
 drain start 2 --failed        # retry the failed set, all projects
 drain start 2 myproject --persist
+drain start --autonomous     # opt-in mode; launches autoscaler
 ```
 
 ### `drain stop [N|all] [--force]`

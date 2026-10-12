@@ -132,14 +132,15 @@ cmd_status() { # [project] [-w|--watch] [--workers] [--verbose]
   fi
 }
 
-cmd_start() { # [N] [project|all] [--failed] [--persist]
+cmd_start() { # [N] [project|all] [--failed] [--persist] [--autonomous]
   need_script
-  local n="" project="" retry=0 persist=0 running i logf a
+  local n="" project="" retry=0 persist=0 autonomous=0 running i logf a
   for a in "$@"; do
     case "$a" in
       "") ;;
       --failed) retry=1 ;;
       --persist) persist=1 ;;
+      --autonomous) autonomous=1 ;;
       *)
         if [[ "$a" =~ ^[0-9]+$ ]] && [ -z "$n" ]; then n="$a"
         elif [ -z "$project" ]; then project="$a"
@@ -158,10 +159,12 @@ cmd_start() { # [N] [project|all] [--failed] [--persist]
   [ -n "$project" ] && export PROJECT_FILTER="$project"
   [ "$retry" = 1 ] && export DRAIN_RETRY_FAILED=1
   [ "$persist" = 1 ] && export DRAIN_PERSIST=1
+  [ "$autonomous" = 1 ] && export DRAIN_AUTONOMOUS=1
   local mode_desc=""
   [ -n "$project" ] && mode_desc=" [project=$project]"
   [ "$retry" = 1 ] && mode_desc="$mode_desc [retrying failed]"
   [ "$persist" = 1 ] && mode_desc="$mode_desc [persist]"
+  [ "$autonomous" = 1 ] && mode_desc="$mode_desc [autonomous]"
   for i in $(seq 1 "$n"); do
     # Timestamp + CLI pid in the name so a second `drain start` never
     # overwrites the logs of already-running workers.
@@ -176,6 +179,14 @@ cmd_start() { # [N] [project|all] [--failed] [--persist]
     echo "They'll work through the queue, then wait for new jobs. 'drain stop' to halt."
   else
     echo "They'll work until the queue is empty, then exit. 'drain stop' to halt."
+  fi
+  if [ "$autonomous" = 1 ]; then
+    echo "Autonomous mode: opt-in pickup (tasks need +auto tag)."
+    if [ -f "$DRAIN_HOME/autoscale.pid" ] && kill -0 "$(cat "$DRAIN_HOME/autoscale.pid")" 2>/dev/null; then
+      echo "autoscaler already running (pid $(cat "$DRAIN_HOME/autoscale.pid"))."
+    else
+      cmd_autoscale
+    fi
   fi
 }
 
@@ -524,7 +535,7 @@ HELP
 drain start — start background workers
 
 USAGE
-  drain start [N] [project|all] [--failed] [--persist]
+  drain start [N] [project|all] [--failed] [--persist] [--autonomous]
 
 ARGUMENTS
   N                Number of workers to start (default 2, max 8)
@@ -535,6 +546,8 @@ OPTIONS
   --failed         Reprocess drain-failed tasks instead of the regular queue
   --persist        Workers wait for new jobs after the queue empties
                    instead of exiting
+  --autonomous     Opt-in pickup mode: only tasks tagged +auto are eligible.
+                   Also launches the autoscaler to pick up new tickets.
 
 EXAMPLES
   drain start
@@ -544,10 +557,15 @@ EXAMPLES
   drain start 2 attendeesync --failed
   drain start 2 --persist
   drain start 2 attendeesync --persist
+  drain start --autonomous
+  drain start 2 attendeesync --autonomous
 
 Workers loop: sync -> pick highest-urgency eligible task -> claim it ->
 run `opencode run` -> verify -> repeat until queue is empty, then exit
 (or wait for new jobs if --persist).
+
+Pickup is opt-out by default (all pending tasks are eligible unless tagged
+noauto). With --autonomous, pickup is opt-in (only tasks tagged +auto).
 HELP
       ;;
     unfail)
@@ -753,7 +771,7 @@ drain docs — extended documentation
 USAGE
   drain docs
 
-Shows detailed docs on pickup rules, tags (noauto, drain-failed,
+Shows detailed docs on pickup rules, tags (noauto, auto, drain-failed,
 drain-claimed), retrying failed tasks, the agent prompt, stopping, and
 safety dials.
 HELP
@@ -790,8 +808,7 @@ WHAT IT DOES
   queue is empty, then exits.
 
 WHAT GETS PICKED UP
-  Nothing special is required. Pickup is OPT-OUT: any task is eligible
-  unless it is:
+  Pickup is OPT-OUT by default: any task is eligible unless it is:
     - already active (started by someone or something)
     - waiting (scheduled for a future date)
     - blocked (has an unmet dependency)
@@ -800,12 +817,22 @@ WHAT GETS PICKED UP
   Among eligible tasks, highest urgency goes first. Limit to one project:
     drain start 2 attendeesync
 
+  With --autonomous (or DRAIN_AUTONOMOUS=1), pickup is OPT-IN: only tasks
+  tagged +auto are eligible. The autoscaler is launched to pick up new
+  tickets as they are tagged:
+    drain start --autonomous
+    task <uuid> modify +auto   # make a task eligible for pickup
+
 TAGS
   noauto
     Tag a task and drain workers will never touch it. Use for tasks that
     need you, interactive-only work, or anything you don't want a free
     model grinding on unattended:
       task <uuid> modify +noauto
+  auto
+    In autonomous mode (DRAIN_AUTONOMOUS=1 or --autonomous), only tasks
+    with this tag are eligible for pickup. Tag a task to make it eligible:
+      task <uuid> modify +auto
   drain-failed
     Set automatically when a worker attempt ends without the task being
     completed (agent failed it, crashed, timed out, or finished nothing).

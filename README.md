@@ -9,8 +9,11 @@ Supported harnesses (set with `DRAIN_AGENT`): [OpenCode](https://opencode.ai/)
 (default), [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
 [Codex](https://github.com/openai/codex).
 
-Pickup is **opt-out**: any pending task is eligible unless it is active,
-waiting, blocked, or tagged `noauto` / `drain-failed`.
+Pickup is **opt-out** by default: any pending task is eligible unless it is
+active, waiting, blocked, or tagged `noauto` / `drain-failed`.
+Use `--autonomous` (or `DRAIN_AUTONOMOUS=1`) for **opt-in** pickup — only
+tasks tagged `+auto` are eligible, and the autoscaler is launched to pick up
+new tickets.
 
 ## Two operating modes
 
@@ -27,8 +30,8 @@ kill switch.
 
 See [docs/operating-modes.md](docs/operating-modes.md) for the full
 comparison, and the safety rails that make Mode 2 sane
-(opt-in `--dangerously-skip-permissions`, `noauto` opt-out, `drain-failed`
-parking, stale-claim release, no telemetry).
+(opt-in `--dangerously-skip-permissions`, `noauto` opt-out / `auto` opt-in,
+`drain-failed` parking, stale-claim release, no telemetry).
 
 ## Quick start
 
@@ -50,6 +53,7 @@ drain start 2                  # start 2 background workers (default)
 drain start 4 myproject        # 4 workers, one project only
 drain start 2 --failed         # retry drain-failed tasks (one retry each)
 drain start 2 --persist        # workers wait for new jobs after queue empties
+drain start --autonomous       # opt-in mode: only +auto tasks; launches autoscaler
 drain status                   # queue dashboard: workers, counts, failed list
 drain status -w                # live dashboard (q quits)
 drain status --workers         # live per-worker view
@@ -74,6 +78,7 @@ Complete command reference: [docs/cli-reference.md](docs/cli-reference.md).
 | Tag | Meaning |
 |-----|---------|
 | `noauto` | Opt out of worker pickup. Workers never touch these. |
+| `auto` | Opt in to worker pickup in autonomous mode (`--autonomous` / `DRAIN_AUTONOMOUS=1`). Only these tasks are eligible. |
 | `drain-failed` | A worker tried this task and couldn't complete it. Re-queue with `task <uuid> modify -drain-failed`, or retry the set with `drain start N --failed`. |
 | `drain-claimed` | In-flight marker while a worker owns a task. Auto-released after 4h if the worker dies. |
 
@@ -87,6 +92,7 @@ Environment variables (export before `drain start`, or edit the top of
 | `DRAIN_AGENT` | `opencode` | `opencode` \| `claude` \| `codex` |
 | `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs |
 | `DRAIN_SKIP_PERMISSIONS` | `0` | `1` adds `--dangerously-skip-permissions` — the main risk dial, opt-in only |
+| `DRAIN_AUTONOMOUS` | `0` | `1` = opt-in pickup (only `+auto` tasks eligible); also launches the autoscaler |
 | `DRAIN_OWNER` | `the project owner` | Human authority for design/security/product decisions in the worker prompt |
 | `TASK_TIMEOUT_SEC` | `14400` | Per-task wall clock (needs `gtimeout`) |
 | `STALE_AFTER_SEC` | `14400` | Release worker claims older than this |

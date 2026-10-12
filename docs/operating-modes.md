@@ -36,9 +36,12 @@ sync → release stale claims → pick highest-urgency eligible task
      → claim it → run the agent on it → verify → repeat until empty
 ```
 
-**Eligibility** is opt-out: any task is picked up unless it is already active,
-waiting, blocked, or tagged `noauto` / `drain-failed`. Details in
-`drain docs` and [Configuration](configuration.md#tags).
+**Eligibility** is opt-out by default: any task is picked up unless it is
+already active, waiting, blocked, or tagged `noauto` / `drain-failed`.
+With `--autonomous` (or `DRAIN_AUTONOMOUS=1`), eligibility is opt-in: only
+tasks tagged `+auto` are picked up, and the autoscaler is launched to pick
+up new tickets as they are tagged. Details in `drain docs` and
+[Configuration](configuration.md#tags).
 
 The agent runs under a prompt that enforces three non-negotiables:
 
@@ -81,7 +84,7 @@ while you do something else.
 | Agent acts without you | No | Yes |
 | Needs an agent CLI installed | No | Yes |
 | Needs `DRAIN_SKIP_PERMISSIONS=1` to be useful | N/A | Recommended for unattended runs |
-| Risk profile | Same as your normal agent session | Autonomous shell access — use the kill switch, `noauto`, and review PRs |
+| Risk profile | Same as your normal agent session | Autonomous shell access — use the kill switch, `noauto` / `auto`, and review PRs |
 | Start with | `plugin/` install | `drain start 2` |
 
 Most people start with Mode 1, then turn on workers for a well-specified
