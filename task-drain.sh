@@ -28,8 +28,9 @@ source "$SCRIPT_DIR/lib/worker-detect.sh"
 #   then the worker exits):
 #       touch ~/.task-drain/STOP
 #   Immediate (kills workers mid-task; the in-flight task is released back
-#   to pending, cleanly):
-#       pkill -TERM -f task-drain.sh
+#   to pending, cleanly). Also stops the autoscale supervisor so it can't
+#   respawn the workers:
+#       drain kill   (or: pkill -TERM -f task-drain.sh; pkill -TERM -f "task-drain.sh autoscale")
 #   Resume: rm ~/.task-drain/STOP   then start workers again.
 #
 # ELIGIBILITY: pending, not active, not waiting, not blocked, and NOT tagged:
@@ -172,7 +173,13 @@ claim_task() { # $1 = uuid
 		report_error "claim_task: failed to start task $1"
 		return 1
 	fi
-	sync_with_retry || report_error "claim_task: sync failed after claiming $1"
+	# The claim must reach the sync server: if it only exists on this
+	# replica, a worker on another machine will pick the same task and
+	# run a second agent on it. Abort the attempt rather than proceed.
+	if ! sync_with_retry; then
+		report_error "claim_task: sync failed after claiming $1"
+		return 1
+	fi
 }
 
 release_claim() { # $1 = uuid, $2 = reason annotation
@@ -188,7 +195,7 @@ on_signal() {
 	if [ -n "$CHILD_PID" ]; then kill "$CHILD_PID" 2>/dev/null || true; fi
 	if [ -n "$CURRENT_UUID" ]; then
 		release_claim "$CURRENT_UUID" "drain worker $WORKER_ID: stopped by signal; claim released, task left pending" || true
-		$TASK sync >/dev/null || true
+		sync_with_retry >/dev/null 2>&1 || true
 	fi
 	rm -f "${STOP_FILE}.$$"
 	cleanup_retry
@@ -352,7 +359,14 @@ run_one() { # $1 = task export JSON
 
 	log "starting: [$project] $description ($uuid)"
 	start_ts=$(date +%s)
-	claim_task "$uuid"
+	# A failed claim must skip the task, not kill the worker (set -e would
+	# otherwise abort the whole process on claim_task's non-zero return).
+	if ! claim_task "$uuid"; then
+		log "claim failed for $uuid -- skipping task"
+		release_claim "$uuid" "drain worker $WORKER_ID: claim could not be completed/published; released without running agent" || true
+		sync_with_retry >/dev/null 2>&1 || true
+		return 1
+	fi
 	CURRENT_UUID="$uuid"
 	prompt=$(build_prompt "$uuid" "$project" "$priority" "$description" "$annotations" "$repo")
 
@@ -502,13 +516,13 @@ run_worker() {
 			log "STOP requested ($scope); exiting without picking up new tasks."
 			rm -f "${STOP_FILE}.$$"
 			cleanup_retry
-			$TASK sync >/dev/null || true
+			sync_with_retry >/dev/null 2>&1 || true
 			exit 0
 		fi
 		reclaim_stale
 		task_json=$(pick_task) || task_json=""
 		if [ -z "$task_json" ]; then
-			$TASK sync >/dev/null || true
+			sync_with_retry >/dev/null 2>&1 || true
 			if [ "$DRAIN_PERSIST" = "1" ]; then
 				log "queue empty -- waiting for new jobs (persist mode)"
 				sleep "${DRAIN_PERSIST_POLL_SEC:-10}"
@@ -556,7 +570,7 @@ cmd_status() {
 	local sync_state="${DIM}sync: ok${RESET}"
 	if [ -n "${DRAIN_NO_SYNC:-}" ]; then
 		sync_state="${DIM}sync: watch (no re-sync)${RESET}"
-	elif ! $TASK sync >/dev/null 2>&1; then sync_state="${Y}sync: FAILED (showing local state)${RESET}"; fi
+	elif ! sync_with_retry >/dev/null 2>&1; then sync_state="${Y}sync: FAILED (showing local state)${RESET}"; fi
 
 	# --- workers (shared detection logic) ---
 	local worker_ps nworkers
@@ -1011,7 +1025,7 @@ cmd_workers() {
 	local sync_state="${DIM}sync: ok${RESET}"
 	if [ -n "${DRAIN_NO_SYNC:-}" ]; then
 		sync_state="${DIM}sync: live (no re-sync)${RESET}"
-	elif ! $TASK sync >/dev/null 2>&1; then sync_state="${Y}sync: FAILED (showing local state)${RESET}"; fi
+	elif ! sync_with_retry >/dev/null 2>&1; then sync_state="${Y}sync: FAILED (showing local state)${RESET}"; fi
 
 	# --- live workers, oldest first for stable rows ---
 	local worker_ps live_pids _skip="$$" _p=$PPID _ppid _guard=0
@@ -1251,6 +1265,9 @@ autoscale_supervisor() {
 	local max_w="${DRAIN_MAX_WORKERS:-8}"
 	local interval="${DRAIN_AUTOSCALE_INTERVAL:-30}"
 	local tasks_per_worker="${DRAIN_TASKS_PER_WORKER:-2}"
+	# A zero/negative tasks_per_worker would divide by zero below and kill
+	# the supervisor under set -e; clamp like the other numeric dials.
+	[[ "$tasks_per_worker" =~ ^[1-9][0-9]*$ ]] || tasks_per_worker=2
 	log "autoscaler starting (min=$min_w max=$max_w interval=${interval}s)"
 
 	trap 'log "autoscaler stopping"; exit 0' TERM INT
@@ -1263,17 +1280,17 @@ autoscale_supervisor() {
 		fi
 
 		# Sync and count eligible tasks
-		$TASK sync >/dev/null 2>&1 || log "autoscaler: sync failed, using local state"
+		sync_with_retry >/dev/null 2>&1 || log "autoscaler: sync failed, using local state"
 		local eligible
 		eligible=$(tq +PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed count 2>/dev/null || echo "0")
 		[[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
 
-		# Count running workers
+		# Count running workers.
+		# NOTE: this pattern never matches the supervisor itself (our cmdline
+		# ends with " autoscale", past the $ anchor), so no self-exclusion.
 		local running
 		running=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | wc -l | tr -d ' ' || true)
 		[[ "$running" =~ ^[0-9]+$ ]] || running=0
-		# Exclude ourselves from the count
-		running=$((running > 0 ? running - 1 : 0))
 
 		# Desired workers: enough to cover eligible tasks, clamped to [min, max]
 		local desired=$(((eligible + tasks_per_worker - 1) / tasks_per_worker))
@@ -1295,7 +1312,7 @@ autoscale_supervisor() {
 			log "autoscaler: eligible=$eligible running=$running -> stopping $to_stop worker(s) gracefully"
 			# Signal excess workers via per-worker STOP files (they finish current task)
 			local pids
-			pids=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | grep -v "^$$$" | head -"$to_stop")
+			pids=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | head -"$to_stop")
 			for pid in $pids; do
 				touch "$HOME/.task-drain/STOP.$pid" 2>/dev/null
 			done
