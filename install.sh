@@ -138,7 +138,7 @@ if [ "$SKIP_DEPS" != "1" ]; then
 			fi
 			;;
 		esac
-		command -v jq >/dev/null 2>&1 && ok "jq installed" || warn "jq install failed — queue queries need it; install manually."
+		command -v jq >/dev/null 2>&1 && ok "jq installed" || fail "jq install failed — queue queries need it; install manually."
 	fi
 
 	# --- agent CLI (warn only) ---
@@ -211,17 +211,25 @@ else
 	info "Skipping sync server setup (TASKCHAMPION_LOCAL=0 or SKIP_DEPS=1)"
 fi
 
+if [ "$TASKCHAMPION_LOCAL" = 1 ] && [ "$SKIP_DEPS" != 1 ] && [ -z "$SYNC_URL" ]; then
+	fail "Requested local sync-server setup failed; no ready server was selected"
+fi
 # --- point taskwarrior at the sync server ---
 if [ -n "$SYNC_URL" ]; then
-	existing_url="$(task show sync.server.url 2>/dev/null | awk '{print $2}' || true)"
-	if [ -n "$existing_url" ] && [ "$existing_url" != "$SYNC_URL" ]; then
-		warn "sync.server.url already set to $existing_url — leaving it (override with TASKCHAMPION_URL to change)"
+	existing_url="$(task _get rc.sync.server.url 2>/dev/null || true)"
+	if [ -n "${TASKCHAMPION_URL:-}" ]; then
+		# Explicit override always wins
+		task config sync.server.url "$SYNC_URL" >/dev/null
+		ok "sync.server.url = $SYNC_URL (from TASKCHAMPION_URL)"
+	elif [ -n "$existing_url" ] && [ "$existing_url" != "$SYNC_URL" ]; then
+		warn "Preserving existing sync.server.url=$existing_url; set TASKCHAMPION_URL to override"
+		SYNC_URL="$existing_url"
 	else
 		task config sync.server.url "$SYNC_URL" >/dev/null
 		ok "sync.server.url = $SYNC_URL"
 	fi
 
-	existing_id="$(task show sync.server.client_id 2>/dev/null | awk '{print $2}' || true)"
+	existing_id="$(task _get rc.sync.server.client_id 2>/dev/null || true)"
 	if [ -z "$existing_id" ]; then
 		if command -v uuidgen >/dev/null 2>&1; then
 			new_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
@@ -238,20 +246,18 @@ if [ -n "$SYNC_URL" ]; then
 		ok "sync.server.client_id already set"
 	fi
 
-	existing_secret="$(task show sync.encryption_secret 2>/dev/null | awk '{print $2}' || true)"
+	existing_secret="$(task _get rc.sync.encryption_secret 2>/dev/null || true)"
 	if [ -z "$existing_secret" ]; then
-		warn "sync.encryption_secret is not set — task data syncs unencrypted."
-		warn "Set one and BACK IT UP (losing it = losing access to synced data):"
-		warn "  task config sync.encryption_secret <long-random-secret>"
+		fail "sync.encryption_secret is not set. TaskChampion sync requires an encryption secret for server communication. Configure it with: task config sync.encryption_secret <secret> — then back up the secret and re-run."
 	else
-		ok "sync.encryption_secret already set"
+		ok "sync.encryption_secret is configured"
 	fi
 
 	info "Testing sync..."
 	if task sync >/dev/null 2>&1; then
 		ok "task sync succeeded"
 	else
-		warn "task sync failed — check the server is reachable at $SYNC_URL"
+		fail "task sync failed; installation is not ready. Check server connectivity and pool configuration."
 	fi
 fi
 
@@ -264,6 +270,7 @@ for script in task-drain.sh drain; do
 	[ -f "$src" ] || fail "$src not found"
 	if [ -e "$dst" ] && [ ! -L "$dst" ]; then
 		info "backing up existing $dst to $dst.bak"
+		[ ! -e "$dst.bak" ] || fail "Backup already exists: $dst.bak; preserve it before reinstalling"
 		mv "$dst" "$dst.bak"
 	fi
 	ln -sf "$src" "$dst"
@@ -277,7 +284,7 @@ ok "$HOME/.task-drain/logs ready"
 if [ "$SKIP_PLUGIN" != "1" ]; then
 	PLUGIN_DIR="${PLUGIN_DIR:-$REPO_DIR/plugin}"
 	if [ ! -f "$PLUGIN_DIR/package.json" ]; then
-		warn "no plugin at $PLUGIN_DIR — skipping build (PLUGIN_DIR= to override, SKIP_PLUGIN=1 to silence)"
+		fail "No plugin at $PLUGIN_DIR; correct PLUGIN_DIR or explicitly use SKIP_PLUGIN=1"
 	else
 		if command -v npm >/dev/null 2>&1; then
 			info "Building task plugin at $PLUGIN_DIR..."
@@ -285,16 +292,89 @@ if [ "$SKIP_PLUGIN" != "1" ]; then
 			ok "plugin built"
 			echo ""
 			echo "  Enable it:"
-			echo "    OpenCode plugin — opencode.json:  \"plugin\": [ \"$PLUGIN_DIR\" ],"
+			echo "    OpenCode plugin — opencode.json:  \"plugins\": [ \"$PLUGIN_DIR\" ],"
 			echo "    MCP server (Claude Code / Cursor / Codex) — see plugin/README.md"
 			echo "    Binary: $PLUGIN_DIR/dist/mcp-server.js"
 		else
-			warn "npm not found — skipping plugin build. Install Node.js, then run:"
+			fail "npm not found; install Node.js or explicitly use SKIP_PLUGIN=1"
 			warn "  cd $PLUGIN_DIR && npm install && npm run build"
 		fi
 	fi
 else
 	info "SKIP_PLUGIN=1 — skipping plugin build"
+fi
+
+# ---------------------------------------------------------------- readiness verification
+echo ""
+info "Verifying installation..."
+READY=1
+
+# Check task binary
+if command -v task >/dev/null 2>&1; then
+	ok "taskwarrior found: $(task --version 2>/dev/null | head -1)"
+else
+	warn "taskwarrior not found — workers will not run"
+	READY=0
+fi
+
+# Check jq
+if command -v jq >/dev/null 2>&1; then
+	ok "jq found: $(jq --version 2>/dev/null)"
+else
+	warn "jq not found — queue queries will fail"
+	READY=0
+fi
+
+# Check agent CLI
+agent_found=""
+for agent in opencode claude codex; do
+	if command -v "$agent" >/dev/null 2>&1; then
+		agent_found="$agent_found $agent"
+	fi
+done
+if [ -n "$agent_found" ]; then
+	ok "agent CLIs found:$agent_found"
+else
+	warn "No agent CLI found — workers need one"
+	READY=0
+fi
+
+# Check sync server connectivity
+if [ -n "$SYNC_URL" ]; then
+	if task sync >/dev/null 2>&1; then
+		ok "sync server reachable: $SYNC_URL"
+	else
+		warn "sync server not reachable: $SYNC_URL"
+		READY=0
+	fi
+else
+	warn "no sync server configured"
+	READY=0
+fi
+
+# Check timeout binary
+if command -v gtimeout >/dev/null 2>&1; then
+	ok "timeout binary: gtimeout"
+elif command -v timeout >/dev/null 2>&1; then
+	ok "timeout binary: timeout"
+else
+	warn "no timeout binary found — task timeout will not be enforced"
+fi
+
+# Check plugin
+if [ "$SKIP_PLUGIN" != "1" ] && [ -f "$PLUGIN_DIR/dist/mcp-server.js" ]; then
+	ok "plugin built: $PLUGIN_DIR/dist/mcp-server.js"
+elif [ "$SKIP_PLUGIN" != "1" ]; then
+	warn "plugin not built — run: cd $PLUGIN_DIR && npm install && npm run build"
+	READY=0
+fi
+
+echo ""
+if [ "$READY" = "1" ]; then
+	info "Installation verified and ready."
+else
+	warn "Installation partially complete — fix the warnings above before starting workers."
+	exit 1
 fi
 
 echo ""

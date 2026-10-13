@@ -72,7 +72,7 @@ export function runTask(config, args, { signal } = {}) {
         if (error) {
           const detail = (stderr || error.message || "").trim();
           reject(
-            new Error(`task ${args.join(" ")} failed: ${detail}`),
+            new Error(`Taskwarrior operation failed: ${detail}`),
           );
           return;
         }
@@ -241,7 +241,7 @@ export function assertActionable(task, { force = false } = {}) {
 /** Guard for claim_task. Throws on violation unless force is set. */
 export function claimGuard(task, actor, { force = false } = {}) {
   assertActionable(task, { force });
-  if (hasTag(task, "ready-for-review") || hasTag(task, "review")) {
+  if (hasTag(task, "ready-for-review") || hasTag(task, "review") || hasTag(task, "drain-claimed")) {
     throw new Error("Task is already in review and cannot be claimed");
   }
   if (tagsOf(task).includes("claimed") && !force) {
@@ -265,9 +265,9 @@ export function startGuard(task, { force = false } = {}) {
 /** Guard for complete_task. */
 export function completeGuard(task, { force = false } = {}) {
   assertActionable(task, { force });
-  if (!force && !hasTag(task, "approved") && !hasTag(task, "ready-for-review")) {
+  if (!force && !hasTag(task, "approved")) {
     throw new Error(
-      "Task completion requires +approved (use approve first) or +ready-for-review; or retry with force:true and a note",
+      "Task completion requires +approved (use approve first); or retry with force:true and a note",
     );
   }
 }
@@ -507,4 +507,19 @@ export function generateSetupScript(options = {}) {
 
   lines.push("echo \"Setup complete.\"");
   return lines.join("\n");
+}
+
+/** Serialize cooperating processes on this host; no distributed-lock guarantee. */
+export async function withTaskLock(config, id, operation) {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const os = await import('node:os');
+  const root = config.lockRoot ?? path.join(os.homedir(), '.task-drain', 'locks');
+  const lock = path.join(root, id);
+  await fs.mkdir(root, { recursive: true });
+  try { await fs.mkdir(lock); } catch { throw new Error(`Task operation busy; inspect ${lock} before retrying`); }
+  try {
+    await fs.writeFile(path.join(lock, 'pid'), String(process.pid));
+    return await operation();
+  } finally { await fs.rm(lock, { recursive: true, force: true }); }
 }

@@ -39,8 +39,8 @@
   "scripts": {
     "build": "tsc",
     "prepare": "npm run build",
-    "test": "node --experimental-strip-types --test tests/task.test.mjs tests/tools.test.mjs",
-    "test:integration": "node --test tests/integration.test.mjs",
+    "test": "npm run build && node --test tests/task.test.mjs tests/tools.test.mjs tests/regressions.test.mjs",
+    "test:integration": "npm run build && node --test --test-concurrency=1 tests/integration.test.mjs tests/handlers.integration.test.mjs",
     "test:all": "npm run test && npm run test:integration",
     "typecheck": "tsc --noEmit"
   },

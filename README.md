@@ -57,7 +57,7 @@ installer against an existing Taskwarrior profile.
 ```bash
 drain start 2                  # start 2 background workers (default)
 drain start 4 myproject        # 4 workers, one project only
-drain start 2 --failed         # retry drain-failed tasks (one retry each)
+drain start 2 --failed         # retry failed tasks (per-worker snapshot)
 drain start 2 --persist        # workers wait for new jobs after queue empties
 drain start --autonomous       # opt-in mode: only +auto tasks; launches autoscaler
 drain status                   # queue dashboard: workers, counts, failed list
@@ -68,7 +68,7 @@ drain logs [-f]                # tail worker logs
 drain unfail [project]         # remove drain-failed tag, return to regular queue
 drain stop                     # graceful stop (finish current task, then exit)
 drain stop --force             # immediate stop (TERM mid-task, like drain kill)
-drain kill                     # immediate stop (claims released; autoscaler stopped too)
+drain kill                     # send TERM; attempt claim cleanup; stop autoscaler
 drain autoscale [project]      # supervisor daemon: auto-scale workers to queue depth
 drain autoscale-stop           # stop the autoscaler (workers keep running)
 drain resume                   # clear the STOP file (doesn't start workers)
@@ -78,7 +78,7 @@ drain projects merge <dst> <src...>  # merge source projects into destination
 ```
 
 The kill switch also works by hand: `touch ~/.task-drain/STOP` stops workers
-gracefully; `drain kill` stops them immediately.
+gracefully; `drain kill` sends TERM immediately; cleanup is best-effort.
 
 Complete command reference: [docs/cli-reference.md](docs/cli-reference.md).
 
@@ -120,6 +120,7 @@ tags, `repos.conf`, state files).
 - [docs/development.md](docs/development.md) — source map, tests, build, contribution workflow
 - [docs/troubleshooting.md](docs/troubleshooting.md) — diagnosis and recovery
 - [docs/DECISIONS.md](docs/DECISIONS.md) — historical decisions and current qualifications
+- [docs/documentation-review.md](docs/documentation-review.md) — review findings and unresolved implementation limits
 - [plugin/README.md](plugin/README.md) — plugin install and MCP client setup
 
 ## How the worker prompt works

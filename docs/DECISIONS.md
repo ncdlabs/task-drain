@@ -1,7 +1,9 @@
 # Decision Records
 
-Durable infrastructure decisions for task-drain. Task annotations are
-ephemeral status; anything a future worker or owner must know goes here.
+Historical infrastructure decisions for task-drain. Taskwarrior holds work
+status; stable rationale belongs here. Incident observations below are not
+universal platform guarantees. Current behavior is documented in
+[architecture](architecture.md) and [installation](installation.md).
 
 ## 2026-10-09 — Drain sync: sudo fallback for macOS Local Network Privacy
 
@@ -57,3 +59,22 @@ automatically to pick up new tickets as they are tagged. Default behavior
 
 **Follow-up.** Existing users who want opt-in pickup should run
 `drain start --autonomous` and tag tasks with `+auto`.
+
+## 2026-10-12 — Documentation review qualifications
+
+The earlier macOS entry records a local incident, not a general assertion
+that Apple binaries or root always bypass network privacy. The implemented
+fallback is `sudo env HOME=… TASKRC=… <task> sync` after any sync failure.
+It does not preserve effective user identity, verify file ownership, or
+validate sudo policy. A NOPASSWD rule for the task binary alone may not match
+this invocation. Prefer repairing ordinary-user access.
+
+The autonomous-mode decision applies to worker selection. Setting the env
+variable alone does not launch the supervisor; `drain start --autonomous`
+does. The actual autonomous filter requires `auto` and does not exclude
+`noauto`. An already-running supervisor is not reconfigured by that command.
+These are descriptions of the current implementation, not new design decisions.
+
+Use `drain autoscale-stop` and deliberate worker stop/restart controls when
+updating installed code. The broad historical `pkill` example can match
+other worker invocations; inspect local processes before using it.

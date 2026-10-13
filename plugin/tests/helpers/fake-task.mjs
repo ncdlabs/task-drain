@@ -35,6 +35,7 @@ if (controlFile && fs.existsSync(controlFile)) {
 const key = args.join(' ');
 for (const resp of control.responses || []) {
   if (key.includes(resp.match)) {
+    if (resp.once) { control.responses.splice(control.responses.indexOf(resp), 1); fs.writeFileSync(controlFile, JSON.stringify(control)); }
     if (resp.stdout) process.stdout.write(resp.stdout);
     if (resp.stderr) process.stderr.write(resp.stderr);
     process.exit(resp.exit || 0);
@@ -63,7 +64,7 @@ export function createFakeTask() {
     bin,
     controlPath,
     logPath,
-    config: { bin, autoSync: false },
+    config: { bin, autoSync: false, lockRoot: join(dir, "locks") },
 
     setResponses(responses) {
       writeFileSync(controlPath, JSON.stringify({ responses }));

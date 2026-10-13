@@ -208,10 +208,10 @@ describe("guards", () => {
     startGuard(task());
   });
 
-  it("completeGuard requires approval or review stage", () => {
+  it("completeGuard requires approval", () => {
     assert.throws(() => completeGuard(task()), /requires \+approved/);
     completeGuard(task({ tags: ["approved"] }));
-    completeGuard(task({ tags: ["ready-for-review"] }));
+    assert.throws(() => completeGuard(task({ tags: ["ready-for-review"] })), /requires \+approved/);
     completeGuard(task(), { force: true });
   });
 
@@ -311,11 +311,11 @@ describe("runTask", () => {
     );
   });
 
-  it("includes the command in the error message", async () => {
+  it("reports operation failure without echoing arguments", async () => {
     fake.setResponses([{ match: "sync", stderr: "boom\n", exit: 1 }]);
     await assert.rejects(
       () => runTask(fake.config, ["sync"]),
-      /task sync failed/,
+      /Taskwarrior operation failed/,
     );
   });
 });

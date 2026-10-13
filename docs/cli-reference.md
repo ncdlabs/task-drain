@@ -1,7 +1,8 @@
 # CLI reference
 
 Two entry points: `drain` (the human interface) and `task-drain.sh` (the
-worker itself, usually launched via `drain`). Both are executable directly.
+worker itself, usually launched via `drain`). Invoke the worker through its real repository path; unlike `drain`, it does
+not resolve symlinks before loading `lib/`.
 
 ## `drain`
 
@@ -31,19 +32,23 @@ The first frame syncs; on sync failure it shows local state with a warning.
 
 ### `drain start [N] [project|all] [--failed] [--persist] [--autonomous]`
 
-Start N background workers (default 2, max 8), optionally limited to one
+Start N additional background workers (default 2, max 8 per invocation), optionally limited to one
 project. Clears a stale global STOP file and prunes dead per-worker STOP
 files first. Each worker logs to
 `~/.task-drain/logs/worker-<timestamp>-<pid>-N.log`.
 
 - `--failed` — reprocess `drain-failed` tasks instead of the regular queue.
   The failed set is snapshotted per worker at startup; each task gets at
-  most one retry per run, so nothing loops.
+  most one retry per worker snapshot. Multiple workers can retry the same
+  task; this is not a pool-wide guarantee. Retry selection rechecks pending,
+  failed, and idle state, but does not recheck all original eligibility filters.
 - `--persist` — workers wait for new jobs (polling every
   `DRAIN_PERSIST_POLL_SEC`, default 10s) after the queue empties instead
   of exiting.
 - `--autonomous` — opt-in pickup mode: only tasks tagged `+auto` are
-  eligible. Also launches the autoscaler to pick up new tickets.
+  eligible (even if also tagged `noauto`). Also launches the autoscaler;
+  `DRAIN_AUTONOMOUS=1` alone does not. An existing supervisor retains its
+  previous configuration. The initial N does not cap autoscaler growth.
 
 Examples:
 
@@ -62,13 +67,14 @@ drain start --autonomous     # opt-in mode; launches autoscaler
   `~/.task-drain/STOP` file.
 - `N` — gracefully stop N workers (newest first) via per-worker
   `STOP.<pid>` files. `N >= running` stops all.
-- `--force` — immediate: TERM mid-task (same as `drain kill`). In-flight
-  tasks are released back to pending. Also stops the autoscaler.
+- `--force` — immediate: TERM mid-task (same as `drain kill`). Claim release and sync are best-effort. Also stops the autoscaler when
+  workers are found. `N` cannot be combined with `--force`.
 
 ### `drain kill`
 
-Immediate stop: TERM all workers mid-task. In-flight claims are released
-back to pending by each worker's signal handler. **Also stops the autoscale
+Immediate stop: send TERM to matching local workers. Their signal handlers
+attempt to terminate the direct child, release claims, and sync; descendants
+and failed cleanup can survive. It does not wait for all work to stop. **Also stops the autoscale
 supervisor**, so it can't respawn the workers.
 
 ### `drain autoscale [project] [--min N] [--max N]`
@@ -94,8 +100,11 @@ they keep working until the queue empties or they are stopped.
 
 ### `drain unfail [project]`
 
-Remove the `drain-failed` tag from failed tasks, returning them to the
-regular queue. Lists what it will re-queue first.
+Remove `drain-failed` from tasks matching `+drain-failed -ACTIVE -WAITING
+-BLOCKED -noauto`, optionally scoped by project. Lists them and modifies
+immediately; there is no confirmation prompt. It does not sync before or
+after, and does not require `auto` in autonomous mode. Run `task sync`
+before and after when sharing a pool.
 
 ### `drain resume`
 
@@ -120,18 +129,27 @@ pending tasks.
 
 ### `drain projects merge <destination> <source...>`
 
-Move **all** tasks from each source project into the destination project
-(all statuses — pending, active, waiting, completed). Needs at least a
-destination and one source; refuses to merge a project into itself. Run
-`task sync` afterwards. If any source had a `repos.conf` mapping, you're
-reminded to update it.
+Attempts a project-wide `task project:<source> modify project:<destination>`.
+A source is skipped unless its `+PENDING -ACTIVE -WAITING` count is nonzero,
+so sources containing only completed, active, or waiting tasks can be skipped.
+Modification errors are suppressed and the reported total comes from the
+pre-count, not verified mutations. Treat output as advisory: export and check
+source/destination tasks before and after, then sync. Taskwarrior project
+matching may include subprojects. Requires a destination and at least one
+source and rejects self-merges. `repos.conf` is not updated automatically.
+The implementation references `$TASK` without initializing it in this CLI
+path; supply `TASK=/absolute/path/to/task` when using this command.
 
 ### `drain pr list [--json]`
 
 List open pull requests across all configured repos whose body references
 a task UUID (created by drain workers via the git workflow). Shows repo,
-PR number, title, URL, and linked task UUID. Use `--json` for raw JSON
-output. Also surfaced in `drain status` under **PENDING APPROVAL**.
+PR number, title, URL, and linked task UUID. Use `--json` for JSON output. Discovery requires authenticated `gh`, a
+GitHub `origin`, and a directory-valued `.git` (linked worktrees are skipped).
+It matches `Task <full-uuid>` in the body, not any UUID, and does not prove
+worker authorship. Gitea PRs are not scanned; `gh` default result limits apply.
+Missing CLI/auth/query failures can produce an empty list. Also surfaced in
+`drain status` under **PENDING APPROVAL**.
 
 ### `drain docs`
 
@@ -144,7 +162,7 @@ your first `drain start`.
 Normally launched via `drain`, but runnable directly:
 
 ```bash
-bash task-drain.sh [run|status|history|watch|workers|autoscale]
+bash /absolute/path/to/task-drain/task-drain.sh [run|status|history|pr-list|watch|workers|autoscale]
 ```
 
 | Mode | Behavior |
@@ -152,7 +170,8 @@ bash task-drain.sh [run|status|history|watch|workers|autoscale]
 | `run` (default) | Run one worker: loop until the queue is empty (or STOP), then exit |
 | `autoscale` | Run the autoscale supervisor daemon |
 | `status` | One-shot queue dashboard (same renderer as `drain status`) |
-| `history` | One-shot history view |
+| `history` | One-shot history view; accepts `--limit N` |
+| `pr-list` | PR discovery; accepts `--json` |
 | `watch` | Live `status` display (`q` quits) |
 | `workers` | Live per-worker view |
 
@@ -165,4 +184,25 @@ bash task-drain.sh [run|status|history|watch|workers|autoscale]
 | `autoscale.pid` | Running autoscaler supervisor PID |
 | `repos.conf` | Project → repo mappings (highest precedence) |
 | `history.log` | Processed-task history (TSV, rolling window) |
-| `logs/` | Per-worker logs |
+| `logs/` | Worker logs and `autoscale.log` |
+| `taskchampion-data/` | Optional installer-managed sync-server data; preserve during cleanup |
+
+## Operational caveats
+
+- `drain start` reports spawned PIDs before worker startup checks complete.
+  Read logs to confirm startup. Repeated starts add workers; 8 is not a global cap.
+- `drain autoscale` does not clear STOP. Use `drain resume` first if a previous
+  stop left it set. `drain start` does clear it, potentially allowing other
+  local workers to resume pickup too.
+- `drain stop` returns early when no workers exist, leaving any supervisor
+  untouched. `drain autoscale-stop` explicitly stops that supervisor.
+- Use `--min N` and `--max N` with spaces. The current equals-form parser
+  fails to advance its argument loop (`--min=N` / `--max=N`).
+- Worker counting/stopping is local and not isolated by project. A supervisor
+  can count or stop workers launched for another project.
+- History retention is applied on writes. A larger display `--limit` cannot
+  recover entries already pruned. Set `DRAIN_HISTORY_LIMIT` on workers too.
+- Match the dashboard's `DRAIN_AUTONOMOUS` environment to the running pool;
+  it is not inferred from workers. Watch refreshes do not continually sync.
+- The embedded `drain docs`/help text has some older claims. These Markdown
+  references describe the implementation's limits; see [architecture](architecture.md).

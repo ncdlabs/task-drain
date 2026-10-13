@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH="${PATH:-/usr/bin:/bin}:$HOME/.opencode/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin"
 #
 # drain -- CLI for the task-drain autonomous worker pool.
 # Worker logic lives in the adjacent task-drain.sh; this is the human interface.
@@ -76,6 +76,7 @@ DRAIN_SCRIPT="$SCRIPT_DIR/task-drain.sh"
 DRAIN_HOME="$HOME/.task-drain"
 LOG_DIR="$DRAIN_HOME/logs"
 STOP_FILE="$DRAIN_HOME/STOP"
+TASK="${TASK:-$(command -v task || true)}"
 
 # Source shared worker detection functions
 # shellcheck source=lib/worker-detect.sh
@@ -151,12 +152,15 @@ cmd_start() { # [N] [project|all] [--failed] [--persist] [--autonomous]
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer"
   [ "$n" -le 8 ] || die "max 8 workers"
   [ "$project" = "all" ] && project=""
+  if [ "$autonomous" = 1 ] && [ -f "$DRAIN_HOME/autoscale.pid" ] && kill -0 "$(cat "$DRAIN_HOME/autoscale.pid")" 2>/dev/null; then
+    die "Supervisor already running; use autoscale-stop before changing mode/project"
+  fi
   mkdir -p "$LOG_DIR"
   if [ -e "$STOP_FILE" ]; then rm -f "$STOP_FILE"; echo "cleared STOP file."; fi
   prune_stale_stops
   running=$(worker_count)
   if [ "$running" -gt 0 ]; then echo "note: $running worker(s) already running; starting $n more."; fi
-  [ -n "$project" ] && export PROJECT_FILTER="$project"
+  export PROJECT_FILTER="$project"
   [ "$retry" = 1 ] && export DRAIN_RETRY_FAILED=1
   [ "$persist" = 1 ] && export DRAIN_PERSIST=1
   [ "$autonomous" = 1 ] && export DRAIN_AUTONOMOUS=1
@@ -185,40 +189,29 @@ cmd_start() { # [N] [project|all] [--failed] [--persist] [--autonomous]
     if [ -f "$DRAIN_HOME/autoscale.pid" ] && kill -0 "$(cat "$DRAIN_HOME/autoscale.pid")" 2>/dev/null; then
       echo "autoscaler already running (pid $(cat "$DRAIN_HOME/autoscale.pid"))."
     else
-      cmd_autoscale
+      cmd_autoscale "${project:-all}"
     fi
   fi
 }
 
-cmd_unfail() { # [project]
-  local TASK="${TASK:-$(command -v task 2>/dev/null || echo /opt/homebrew/bin/task)}"
-  local project="" a
+cmd_unfail() { # [project] [--dry-run]
+  local project="" preview=0 a failed=0 uuid tasks
   for a in "$@"; do
-    case "$a" in
-      "") ;;
-      -*) die "unknown unfail option: $a (try: drain help)" ;;
-      *) [ -z "$project" ] || die "unexpected argument: $a (try: drain help)"; project="$a" ;;
-    esac
+    case "$a" in --dry-run) preview=1 ;; -*) die "unknown unfail option: $a" ;; *) [ -z "$project" ] || die "unexpected argument: $a"; project="$a" ;; esac
   done
-  [ "$project" = "all" ] && project=""
-  local filter="+drain-failed -ACTIVE -WAITING -BLOCKED -noauto"
-  if [ -n "$project" ]; then filter="project:$project $filter"; fi
-  # shellcheck disable=SC2086
-  local tasks
-  tasks=$("$TASK" $filter export 2>/dev/null || echo "[]")
-  local count
-  count=$(echo "$tasks" | jq 'length' 2>/dev/null || echo "0")
-  if [ "$count" -eq 0 ]; then
-    echo "No failed tasks found${project:+ in project '$project'}."
-    return 0
-  fi
-  echo "Re-queueing $count failed task(s)${project:+ in project '$project'}:"
-  echo "$tasks" | jq -r '.[] | "  \(.uuid) [\(.project // "?")] \(.description)"'
-  echo
-  echo "$tasks" | jq -r '.[].uuid' | while IFS= read -r uuid; do
-    "$TASK" "$uuid" modify -drain-failed >/dev/null 2>&1 || echo "  WARN: failed to un-fail $uuid"
-  done
-  echo "Done. These tasks are now in the regular queue."
+  [ "$project" != all ] || project=""
+  local filter=(status:pending)
+  [ -z "$project" ] || filter+=("project:$project")
+  "$TASK" sync || die "Sync failed before unfail; no changes made"
+  tasks=$("$TASK" "${filter[@]}" export | jq '[.[] | select((.tags // []) | index("drain-failed"))]') || die "Failed to query tasks"
+  echo "$tasks" | jq -r '.[] | "\(.uuid) [\(.project // "?")] \(.description)"'
+  [ "$preview" = 0 ] || return 0
+  while IFS= read -r uuid; do
+    [ -n "$uuid" ] || continue
+    "$TASK" "$uuid" modify -drain-failed || failed=1
+  done < <(echo "$tasks" | jq -r '.[].uuid')
+  "$TASK" sync || die "Local changes applied; sync failed. Inspect before retrying"
+  [ "$failed" = 0 ] || die "Some tasks could not be requeued; inspect listed UUIDs"
 }
 
 cmd_autoscale() { # [project] [--min N] [--max N]
@@ -229,8 +222,8 @@ cmd_autoscale() { # [project] [--min N] [--max N]
     case "$1" in
       --min) [ $# -ge 2 ] || die "--min requires a value"; min_w="$2"; shift 2 ;;
       --max) [ $# -ge 2 ] || die "--max requires a value"; max_w="$2"; shift 2 ;;
-      --min=*) min_w="${1#--min=}" ;;
-      --max=*) max_w="${1#--max=}" ;;
+      --min=*) min_w="${1#--min=}"; shift ;;
+      --max=*) max_w="${1#--max=}"; shift ;;
       "") shift ;;
       -*) die "unknown autoscale option: $1 (try: drain help autoscale)" ;;
       *) [ -z "$project" ] || die "unexpected argument: $1"; project="$1"; shift ;;
@@ -249,9 +242,10 @@ cmd_autoscale() { # [project] [--min N] [--max N]
   fi
 
   mkdir -p "$LOG_DIR"
-  [ -n "$project" ] && export PROJECT_FILTER="$project"
+  export PROJECT_FILTER="$project"
   export DRAIN_MIN_WORKERS="$min_w" DRAIN_MAX_WORKERS="$max_w"
 
+  [ ! -e "$STOP_FILE" ] || die "STOP is set; run drain resume before starting a supervisor"
   echo "starting autoscaler (min=$min_w max=$max_w${project:+ project=$project})..."
   nohup bash "$DRAIN_SCRIPT" autoscale >>"$LOG_DIR/autoscale.log" 2>&1 &
   echo $! > "$pidfile"
@@ -270,7 +264,7 @@ stop_autoscaler() {
   # does NOT match the worker pkill pattern (anchored at task-drain.sh$),
   # so it needs both the pidfile kill and the pattern as a backstop.
   local pidfile="$DRAIN_HOME/autoscale.pid" pid
-  pkill -TERM -f "task-drain\.sh autoscale" 2>/dev/null || true
+  # Stop only the supervisor recorded by this installation.
   [ -f "$pidfile" ] || return 0
   pid=$(cat "$pidfile" 2>/dev/null || true)
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -280,6 +274,20 @@ stop_autoscaler() {
   rm -f "$pidfile"
 }
 
+signal_workers() {
+  local pid attempt
+  local pids
+  pids=$(worker_pids)
+  for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+  for attempt in $(seq 1 10); do
+    local alive=0
+    for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ "$alive" = 1 ] || return 0
+    sleep 1
+  done
+  echo "Some workers still running after TERM; inspect before releasing claims" >&2
+  return 1
+}
 cmd_stop() { # [N|all] [--force] -- default all
   local target="all" force=0 a
   for a in "$@"; do
@@ -301,9 +309,13 @@ cmd_stop() { # [N|all] [--force] -- default all
   prune_stale_stops
   local running pids pid stopped=0
   running=$(worker_count)
+  if [ "$target" = all ] || [ "$force" = 1 ]; then
+    touch "$STOP_FILE"
+    stop_autoscaler
+  fi
   [ "$running" -gt 0 ] || { echo "no workers running."; return 0; }
   if [ "$force" = 1 ]; then
-    pkill -TERM -f "(^|[^A-Za-z0-9_-])task-drain\.sh$"
+    signal_workers
     stop_autoscaler
     echo "force stop: TERM sent to all $running worker(s). In-flight tasks released to pending."
   elif [ "$target" = "all" ]; then
@@ -328,7 +340,7 @@ cmd_stop() { # [N|all] [--force] -- default all
 
 cmd_kill() {
   if [ "$(worker_count)" -gt 0 ]; then
-    pkill -TERM -f "(^|[^A-Za-z0-9_-])task-drain\.sh$"
+    signal_workers
     echo "TERM sent. In-flight tasks are released back to pending."
   else
     echo "no workers running."
@@ -379,7 +391,7 @@ cmd_projects() { # list configured project → repo mappings
   local GIT_ROOT="${GIT_ROOT:-$HOME/git}"
   local DRAIN_SCRIPT="$SCRIPT_DIR/task-drain.sh"
   local TASK="${TASK:-$(command -v task 2>/dev/null || echo /opt/homebrew/bin/task)}"
-  echo "Configured project → repo mappings:"
+  echo "Configured project → repo mappings (source inventory; effective mappings below):"
   echo
   # 1. repos.conf entries
   if [ -f "$conf" ]; then
@@ -440,60 +452,36 @@ cmd_projects() { # list configured project → repo mappings
   else
     echo "    (none)"
   fi
+  echo "Effective mappings for task projects:"
+  PROJECT_FILTER="" bash "$DRAIN_SCRIPT" mappings
+
 }
 
-cmd_projects_merge() { # <destination> <source...>
-  if [ $# -lt 2 ]; then
-    die "usage: drain projects merge <destination> <source...> — needs at least 2 projects"
-  fi
-  local dest="$1"; shift
-  local sources=("$@")
-  # Safety: prevent merging a project into itself
-  for src in "${sources[@]}"; do
-    if [ "$src" = "$dest" ]; then
-      die "cannot merge project '$dest' into itself"
-    fi
+cmd_projects_merge() { # [--dry-run] <destination> <source...>
+  local preview=0
+  if [ "${1:-}" = --dry-run ]; then preview=1; shift; fi
+  [ "$#" -ge 2 ] || die "usage: drain projects merge [--dry-run] <destination> <source...>"
+  local dest="$1" src data uuid changed=0 failed=0 actual
+  shift
+  for src in "$@"; do [ "$src" != "$dest" ] || die "cannot merge project into itself"; done
+  "$TASK" sync || die "Sync failed before project merge"
+  for src in "$@"; do
+    # Exact project only: descendants must be explicitly named, avoiding accidental broad changes.
+    data=$("$TASK" status:pending,waiting,completed,recurring,deleted export | jq --arg src "$src" '[.[] | select(.project == $src)]') || die "Task query failed"
+    printf '%s\n' "$data" | jq -r --arg dst "$dest" '.[] | "\(.uuid) [\(.status)] \(.project) -> \($dst)"'
+    [ "$preview" = 0 ] || continue
+    while IFS= read -r uuid; do
+      [ -n "$uuid" ] || continue
+      if "$TASK" rc.confirmation=off "$uuid" modify "project:$dest"; then
+        actual=$("$TASK" "$uuid" export | jq -r '.[0].project') || actual=""
+        if [ "$actual" = "$dest" ]; then changed=$((changed + 1)); else failed=1; fi
+      else failed=1; fi
+    done < <(printf '%s' "$data" | jq -r '.[].uuid')
   done
-  local conf="$HOME/.task-drain/repos.conf"
-  echo "Merging projects into '$dest':"
-  echo "  destination: $dest"
-  echo "  sources: ${sources[*]}"
-  echo
-  # Safety: confirm destination doesn't already have tasks (unless --force)
-  local dest_count
-  dest_count=$("$TASK" "project:$dest" +PENDING -ACTIVE -WAITING count 2>/dev/null || echo "0")
-  local total_moved=0
-  for src in "${sources[@]}"; do
-    local src_count
-    src_count=$("$TASK" "project:$src" +PENDING -ACTIVE -WAITING count 2>/dev/null || echo "0")
-    if [ "$src_count" -eq 0 ]; then
-      echo "  $src: no pending tasks, skipping"
-      continue
-    fi
-    echo "  moving $src_count task(s) from $src → $dest ..."
-    # Move pending, active, waiting, and completed tasks
-    "$TASK" "project:$src" modify project:"$dest" 2>/dev/null || true
-    total_moved=$((total_moved + src_count))
-  done
-  echo
-  echo "Moved $total_moved total task(s) into '$dest'."
-  # Update repos.conf if any source had a mapping
-  if [ -f "$conf" ]; then
-    local needs_update=0
-    for src in "${sources[@]}"; do
-      if grep -q "^${src}=" "$conf"; then
-        needs_update=1
-        break
-      fi
-    done
-    if [ "$needs_update" = 1 ]; then
-      echo
-      echo "Note: some source projects have repo mappings in $conf."
-      echo "Review and update: $conf"
-    fi
-  fi
-  echo
-  echo "Run 'task sync' to sync the changes."
+  [ "$preview" = 0 ] || return 0
+  "$TASK" sync || die "Local project changes applied; sync failed; inspect before retrying"
+  echo "Verified $changed task(s) moved. Update repos.conf separately."
+  [ "$failed" = 0 ] || die "Some changes failed verification"
 }
 
 cmd_help() {
@@ -798,115 +786,8 @@ HELP
 }
 
 cmd_docs() {
-  cat <<'DOCS_EOF'
-DRAIN -- autonomous Taskwarrior queue workers
-============================================
-
-WHAT IT DOES
-  Each worker loops: sync -> pick the highest-urgency eligible task ->
-  claim it -> run `opencode run` on it -> verify -> repeat until the
-  queue is empty, then exits.
-
-WHAT GETS PICKED UP
-  Pickup is OPT-OUT by default: any task is eligible unless it is:
-    - already active (started by someone or something)
-    - waiting (scheduled for a future date)
-    - blocked (has an unmet dependency)
-    - tagged noauto        (your opt-out)
-    - tagged drain-failed  (a worker already tried and couldn't finish it)
-  Among eligible tasks, highest urgency goes first. Limit to one project:
-    drain start 2 attendeesync
-
-  With --autonomous (or DRAIN_AUTONOMOUS=1), pickup is OPT-IN: only tasks
-  tagged +auto are eligible. The autoscaler is launched to pick up new
-  tickets as they are tagged:
-    drain start --autonomous
-    task <uuid> modify +auto   # make a task eligible for pickup
-
-TAGS
-  noauto
-    Tag a task and drain workers will never touch it. Use for tasks that
-    need you, interactive-only work, or anything you don't want a free
-    model grinding on unattended:
-      task <uuid> modify +noauto
-  auto
-    In autonomous mode (DRAIN_AUTONOMOUS=1 or --autonomous), only tasks
-    with this tag are eligible for pickup. Tag a task to make it eligible:
-      task <uuid> modify +auto
-  drain-failed
-    Set automatically when a worker attempt ends without the task being
-    completed (agent failed it, crashed, timed out, or finished nothing).
-    Regular workers never retry these. To give them another shot, either
-    re-queue (a normal worker picks it up):
-      task <uuid> modify -drain-failed
-    or retry directly without untagging:
-      drain start 2 --failed                (all projects)
-      drain start 2 attendeesync --failed   (one project)
-    A --failed retry that fails again keeps drain-failed; each task gets
-    at most one retry per --failed run, so nothing loops forever.
-    Everything failed is listed under `drain status` ("needs human review").
-  drain-claimed
-    Set automatically while a worker owns a task. Don't set it by hand.
-    If a worker dies mid-task, its claim is auto-released after 4 hours.
-    Only worker claims are ever released -- your interactive sessions'
-    active tasks are never touched.
-
-RETRYING FAILED TASKS
-  drain start [N] [project] --failed
-    Spins up workers that reprocess drain-failed tasks instead of the
-    regular queue. The failed set is snapshotted when each worker starts;
-    every failed task gets at most one retry per run, so a task that fails
-    again can't loop -- it keeps drain-failed for the next explicit retry.
-    Combine with a project:  drain start 2 attendeesync --failed
-
-WHAT THE AGENT IS TOLD
-  Every worker hands its task to `opencode run` with a prompt enforcing:
-    - Taskwarrior is the only system of record. Sync at session start,
-      after every change, and at session end. Never work offline. Never
-      change the sync client ID. Reference tasks by UUID, never short IDs.
-    - Authority: design, security, product, and public-facing decisions
-      belong to the project owner (see DRAIN_OWNER in task-drain.sh).
-      If the task needs human judgment, credentials it lacks, a
-      legal/compliance declaration, or anything public or irreversible,
-      the agent must annotate what's needed and FAIL the task -- never
-      decide on its own.
-    - Completion contract: verify for real (build, tests, or the task's
-      own acceptance criteria). Only then `task <uuid> done`. Partial or
-      unverified work is failed, never marked done.
-
-STOPPING
-  drain stop        graceful all: no new pickups; in-flight tasks finish, workers exit
-  drain stop all    same as bare 'drain stop'
-  drain stop N      graceful: stop N workers (newest first); each finishes its
-                    current task, then exits. N >= running stops all.
-  drain stop --force  immediate: TERM workers mid-task; claims released to pending
-                    (same as drain kill, but via the stop command)
-  drain kill    immediate: workers die mid-task; claims released to pending;
-                also stops the autoscale supervisor so it can't respawn them
-  drain resume  clear the STOP file (doesn't start workers)
-
-LOGS
-  ~/.task-drain/logs/worker-<timestamp>-<pid>-N.log      drain logs [-f]
-
-VIEWS
-  drain status              queue dashboard (one snapshot)
-  drain status -w           same, live (q quits, DRAIN_WATCH_INTERVAL=5)
-  drain status --workers    live per-worker view: each worker's current
-                            task + time-budget meter (q quits). With a
-                            project, other projects are dimmed:
-                              drain status attendeesync --workers
-
-SAFETY DIALS (env vars, or edit at the top of task-drain.sh)
-  DRAIN_SKIP_PERMISSIONS=1      : adds --dangerously-skip-permissions to
-      opencode run flags. Without it, unattended runs stall on the first
-      approval prompt. With it, the agent can edit, run, and push without
-      asking. This is the main risk dial -- only enable if you trust the
-      autonomous worker to operate without human approval.
-  DRAIN_MODEL                  : model for worker runs
-                                  (default opencode-go/longcat-2.5-preview-free)
-  STALE_AFTER_SEC=14400  : release worker claims older than 4 hours
-  TASK_TIMEOUT_SEC=14400 : per-task wall clock (needs `gtimeout`)
-DOCS_EOF
+  cat "$SCRIPT_DIR/docs/operating-modes.md"
+  printf '\nFull command reference: %s/docs/cli-reference.md\n' "$SCRIPT_DIR"
 }
 
 # Second-level help: drain <cmd> help

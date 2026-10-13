@@ -45,6 +45,7 @@ import {
   runTask,
   startGuard,
   sync,
+  withTaskLock,
 } from "./task.mjs";
 
 type Task = Record<string, any>;
@@ -93,6 +94,7 @@ export interface TaskConfig {
   bin: string;
   taskrc?: string;
   autoSync: boolean;
+  lockRoot?: string;
 }
 
 export interface ToolDef {
@@ -123,12 +125,24 @@ export function createTools(config: TaskConfig): ToolDef[] {
     ): Promise<T> => {
       await maybeSyncBefore(context);
       const result = await fn();
-      await maybeSyncAfter(context);
+      try { await maybeSyncAfter(context); }
+      catch (error) {
+        throw new Error(`Local mutation applied but sync failed. Inspect state before retrying. Result: ${JSON.stringify(result)}; ${String(error)}`);
+      }
       return result;
     };
 
     
   const tools: ToolDef[] = [];
+    const actionableQueue = async (context: ExecContext, project?: string) => {
+      const args = ["+PENDING", "-ACTIVE", "-WAITING", "-BLOCKED"];
+      if (project) args.push(`project:${project}`);
+      const tasks = await exportTasks(config, args, { signal: context.signal }) as Task[];
+      const now = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+      return tasks.filter(t => t.status === "pending" && !t.start && (!t.scheduled || t.scheduled <= now) &&
+        !["noauto", "drain-failed", "drain-claimed", "blocked", "ready-for-review", "review", "approved"].some(tag => hasTag(t, tag)))
+        .sort((a, b) => (b.urgency ?? 0) - (a.urgency ?? 0) || String(a.uuid).localeCompare(String(b.uuid)));
+    };
 
       
 
@@ -605,7 +619,7 @@ export function createTools(config: TaskConfig): ToolDef[] {
       tools.push({
         name: "complete",
         description:
-          "Complete a task (task done). Requires +approved or +ready-for-review unless force is set.",
+          "Complete a task (task done). Requires +approved unless force is set with a note.",
         input: objectSchema(
           {
             uuid: UUID_SCHEMA,
@@ -625,6 +639,7 @@ export function createTools(config: TaskConfig): ToolDef[] {
               const task = (await getTask(config, input.uuid, {
                 signal: context.signal,
               })) as Task;
+              if (input.force === true && !input.note?.trim()) throw new Error("Forced completion requires a note");
               completeGuard(task, { force: input.force === true });
               await runTask(
                 config,
@@ -637,6 +652,7 @@ export function createTools(config: TaskConfig): ToolDef[] {
               const completedTask = await getTask(config, input.uuid, {
                 signal: context.signal,
               });
+              if (completedTask.status !== "completed") throw new Error(`Task ${input.uuid} did not reach completed status`);
               return { uuid: input.uuid, status: completedTask.status };
             }, context),
           ),
@@ -661,11 +677,7 @@ export function createTools(config: TaskConfig): ToolDef[] {
             if (hasTag(t, "ready-for-review") || hasTag(t, "review") || hasTag(t, "approved")) {
               return false;
             }
-            if (lastClaimActor(t) === input.actor) return true;
-            const notes = Array.isArray(t.annotations) ? t.annotations : [];
-            return notes.some((a: any) =>
-              String(a?.description ?? "").startsWith(`[${input.actor}]`),
-            );
+            return hasTag(t, "claimed") && lastClaimActor(t) === input.actor;
           });
           const sliced = mine.slice(0, limit);
           return text({ tasks: sliced, count: sliced.length, total_matching: mine.length });
@@ -699,10 +711,10 @@ export function createTools(config: TaskConfig): ToolDef[] {
         execute: async (input: any, context: any) => {
           await maybeSyncBefore(context);
           const limit = Math.min(Math.max(input.limit ?? 50, 1), 500);
-          const tasks = (await exportTasks(config, ["status:pending"], {
+          const tasks = (await exportTasks(config, ["status:pending", "(+BLOCKED or +blocked)"], {
             signal: context.signal,
           })) as Task[];
-          const blocked = applyTagFilter(tasks, ["blocked"]);
+          const blocked = tasks;
           const sliced = blocked.slice(0, limit);
           return text({ tasks: sliced, count: sliced.length, total_matching: blocked.length });
         },
@@ -828,6 +840,7 @@ export function createTools(config: TaskConfig): ToolDef[] {
             default: false,
             description: "Write the script to a file instead of returning it. File defaults to ./install-taskwarrior.sh.",
           },
+          overwrite: { type: "boolean", default: false, description: "Explicitly replace an existing regular output file." },
           outputPath: {
             type: "string",
             description: "Custom output path when write is true (relative to cwd).",
@@ -841,7 +854,7 @@ export function createTools(config: TaskConfig): ToolDef[] {
           if (input.write) {
             const fs = await import("node:fs/promises");
             const path = await import("node:path");
-            const cwd = process.cwd();
+            const cwd = await fs.realpath(process.cwd());
             const outPath = input.outputPath
               ? path.resolve(input.outputPath)
               : path.resolve("install-taskwarrior.sh");
@@ -849,7 +862,12 @@ export function createTools(config: TaskConfig): ToolDef[] {
             if (!outPath.startsWith(cwd + path.sep) && outPath !== cwd) {
               throw new Error(`outputPath must be within the current directory (${cwd}): ${outPath}`);
             }
-            await fs.writeFile(outPath, script, { mode: 0o755 });
+            const parent = await fs.realpath(path.dirname(outPath));
+            if (parent !== cwd && !parent.startsWith(cwd + path.sep)) throw new Error("outputPath parent escapes current directory");
+            const constants = (await import("node:fs")).constants;
+            const handle = await fs.open(outPath, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW |
+              (input.overwrite === true ? constants.O_TRUNC : constants.O_EXCL), 0o755);
+            try { await handle.writeFile(script); } finally { await handle.close(); }
             return text({ ok: true, path: outPath, message: `Script written to ${outPath} (executable)` });
           }
           return text({ script, filename: "install-taskwarrior.sh" });
@@ -911,38 +929,21 @@ export function createTools(config: TaskConfig): ToolDef[] {
             return text({ task, action: "created_and_started" });
           }
 
-          // Otherwise, pick from agent queue
-          const queue = (await exportTasks(config, ["status:pending"], {
-            signal: context.signal,
-          })) as Task[];
-          const mine = queue.filter((t) => {
-            if (hasTag(t, "ready-for-review") || hasTag(t, "review") || hasTag(t, "approved")) return false;
-            if (lastClaimActor(t) === actor) return true;
-            const notes = Array.isArray(t.annotations) ? t.annotations : [];
-            return notes.some((a: any) => String(a?.description ?? "").startsWith(`[${actor}]`));
-          });
-
-          let target = mine[0];
-
-          // If nothing claimed, find first unclaimed actionable task
-          if (!target) {
-            const unclaimed = queue.filter((t) => {
-              if (hasTag(t, "ready-for-review") || hasTag(t, "review") || hasTag(t, "approved")) return false;
-              if (hasTag(t, "blocked")) return false;
-              if (hasTag(t, "claimed")) return false;
-              return t.status === "pending";
-            });
-            target = unclaimed[0];
-          }
+          const queue = await actionableQueue(context, input.project);
+          const mine = queue.filter(t => hasTag(t, "claimed") && lastClaimActor(t) === actor);
+          const target = mine[0] ?? queue.find(t => !hasTag(t, "claimed"));
 
           if (!target) {
             return text({ task: null, action: "none_found", message: "No actionable tasks in queue." });
           }
 
           const uuid = target.uuid;
-          const task = await mutate(async () => {
+          const task = await withTaskLock(config, uuid, () => mutate(async () => {
+            const current = await getTask(config, uuid, { signal: context.signal });
+            if (!hasTag(current, "claimed")) claimGuard(current, actor);
+            else if (lastClaimActor(current) !== actor) throw new Error("Task is owned by another actor");
             // Claim if not already claimed
-            if (!hasTag(target, "claimed")) {
+            if (!hasTag(current, "claimed")) {
               await runTask(config, [uuid, "modify", "+claimed"], { signal: context.signal });
               await runTask(
                 config,
@@ -960,11 +961,21 @@ export function createTools(config: TaskConfig): ToolDef[] {
               );
             }
             return await getTask(config, uuid, { signal: context.signal });
-          }, context);
+          }, context));
 
           return text({ task, action: hasTag(target, "claimed") ? "started" : "claimed_and_started" });
         },
       });
 
+  const mutations = new Set(["add", "modify", "annotate", "add_dependency", "claim", "release", "start", "stop", "submit_for_review", "approve", "complete", "record_decision", "auto"]);
+  for (const tool of tools) {
+    if (!mutations.has(tool.name)) continue;
+    const execute = tool.execute;
+    tool.execute = async (input, context) => {
+      const id = input.uuid ?? input.taskUuid;
+      if (id) assertUuid(id);
+      return withTaskLock(config, id ?? "plugin-create", () => execute(input, context));
+    };
+  }
   return tools;
 }

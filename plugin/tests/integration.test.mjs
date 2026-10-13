@@ -31,6 +31,9 @@ import {
   getInstallInstructions,
 } from "../src/task.mjs";
 
+if (process.env.TASK_DRAIN_INTEGRATION !== "1" || !process.env.TASKRC || !process.env.TASK_BIN) {
+  throw new Error("Live tests require TASK_DRAIN_INTEGRATION=1, explicit scratch TASKRC and TASK_BIN");
+}
 const config = resolveConfig({});
 const TEST_TAG = "plugin-test";
 const TEST_ACTOR = "plugin-test";
@@ -67,6 +70,7 @@ describe("integration: plugin tools", () => {
 
   after(async () => {
     await cleanup();
+    await sync(config);
   });
 
   describe("task_sync", () => {

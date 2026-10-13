@@ -7,7 +7,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { createTools } from "../src/tools.ts";
+import { createTools } from "../dist/tools.js";
 import { createFakeTask } from "./helpers/fake-task.mjs";
 
 const UUID_A = "27594f5a-7c89-4d88-8b08-f33b7ef33b6e";
@@ -456,7 +456,8 @@ describe("complete tool", () => {
   it("completes an approved task", async () => {
     const taskData = { uuid: UUID_A, status: "pending", tags: ["approved"] };
     fake.setResponses([
-      { match: "export", stdout: JSON.stringify(taskData) + "\n" },
+      { match: "export", once: true, stdout: JSON.stringify(taskData) + "\n" },
+      { match: "export", stdout: JSON.stringify({...taskData, status:"completed"}) + "\n" },
       { match: "annotate", stdout: "Annotation added.\n" },
       { match: "done", stdout: "Completed.\n" },
     ]);
@@ -488,7 +489,7 @@ describe("complete tool", () => {
 describe("agent_queue tool", () => {
   it("returns tasks for the specified actor", async () => {
     const tasks = [
-      { uuid: UUID_A, status: "pending", annotations: [{ description: "[opencode] claimed: mine" }] },
+      { uuid: UUID_A, status: "pending", tags:["claimed"], annotations: [{ description: "[opencode] claimed: mine" }] },
       { uuid: UUID_B, status: "pending", annotations: [{ description: "[other] claimed: theirs" }] },
     ];
     fake.setResponses([
@@ -539,7 +540,6 @@ describe("blocked_tasks tool", () => {
   it("returns blocked tasks", async () => {
     const tasks = [
       { uuid: UUID_A, status: "pending", tags: ["blocked"] },
-      { uuid: UUID_B, status: "pending", tags: [] },
     ];
     fake.setResponses([
       { match: "export", stdout: tasks.map((t) => JSON.stringify(t)).join("\n") + "\n" },
@@ -719,7 +719,7 @@ describe("auto tool", () => {
     fake.setResponses([
       { match: "rc.json.array=off " + UUID_A, stdout: JSON.stringify(tasks[0]) + "\n" },
       { match: "rc.json.array=off " + UUID_B, stdout: JSON.stringify(tasks[1]) + "\n" },
-      { match: "rc.json.array=off status:pending", stdout: tasks.map((t) => JSON.stringify(t)).join("\n") + "\n" },
+      { match: "rc.json.array=off +PENDING", stdout: tasks.map((t) => JSON.stringify(t)).join("\n") + "\n" },
       { match: "rc.json.array=off", stdout: "" },
       { match: "modify", stdout: "Modified.\n" },
       { match: "annotate", stdout: "Annotation added.\n" },
@@ -733,7 +733,7 @@ describe("auto tool", () => {
 
 describe("sync behavior", () => {
   it("syncs before and after mutations when autoSync is true", async () => {
-    const syncConfig = { bin: fake.bin, autoSync: true };
+    const syncConfig = { ...fake.config, autoSync: true };
     const syncTools = createTools(syncConfig);
     const claimTool = syncTools.find((t) => t.name === "claim");
     const taskData = { uuid: UUID_A, status: "pending", tags: [] };
@@ -761,5 +761,27 @@ describe("sync behavior", () => {
     const calls = fake.getCalls();
     const syncCalls = calls.filter((c) => c[0] === "sync");
     assert.equal(syncCalls.length, 0);
+  });
+
+  it("mutate throws when sync fails after local mutation", async () => {
+    const syncConfig = { ...fake.config, autoSync: true };
+    const syncTools = createTools(syncConfig);
+    const claimTool = syncTools.find((t) => t.name === "claim");
+    const taskData = { uuid: UUID_A, status: "pending", tags: [] };
+    fake.setResponses([
+      // First sync (before mutate) succeeds
+      { match: "sync", stdout: "Sync complete\n", once: true },
+      // export for getTask inside mutate
+      { match: "export", stdout: JSON.stringify(taskData) + "\n" },
+      // Local mutation succeeds
+      { match: "modify", stdout: "Modified.\n" },
+      { match: "annotate", stdout: "Annotation added.\n" },
+      // Second sync (after mutate) fails
+      { match: "sync", stderr: "connection refused\n", exit: 1 },
+    ]);
+    await assert.rejects(
+      () => claimTool.execute({ uuid: UUID_A, actor: "opencode" }, ctx),
+      /Local mutation applied but sync failed/,
+    );
   });
 });

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH="$HOME/.opencode/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
 
 # Source shared display and worker detection functions
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+	target=$(readlink "$SCRIPT_PATH")
+	case "$target" in /*) SCRIPT_PATH="$target" ;; *) SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$target" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 # shellcheck source=lib/display.sh
 source "$SCRIPT_DIR/lib/display.sh"
 # shellcheck source=lib/worker-detect.sh
@@ -80,6 +85,12 @@ set -euo pipefail
 # Defaults to `task` on PATH, falling back to the Homebrew location on macOS.
 TASK="${TASK:-$(command -v task 2>/dev/null || echo /opt/homebrew/bin/task)}"
 OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+TIMEOUT_BIN="$(command -v gtimeout || command -v timeout || true)"
+if [ -z "$TIMEOUT_BIN" ]; then
+	log "WARNING: No timeout binary found (tried: gtimeout, timeout). Task timeout will not be enforced."
+fi
 # Model for worker runs. Override with DRAIN_MODEL in the environment.
 DRAIN_MODEL="${DRAIN_MODEL:-opencode-go/longcat-2.5-preview-free}"
 # --dangerously-skip-permissions is OPT-IN (set DRAIN_SKIP_PERMISSIONS=1).
@@ -113,7 +124,9 @@ DRAIN_AUTONOMOUS="${DRAIN_AUTONOMOUS:-0}"     # 1 = opt-in pickup (requires +aut
 # NOPASSWD for the task binary in sudoers.
 task_sync() {
 	"$TASK" sync >/dev/null 2>&1 && return 0
-	sudo env HOME="$HOME" TASKRC="${TASKRC:-$HOME/.taskrc}" "$TASK" sync >/dev/null 2>&1
+	# Bounded recovery: no sudo fallback. If sync fails, emit diagnosis.
+	log "ERROR: sync failed (server unreachable or auth expired). Run: task sync"
+	return 1
 }
 
 # Wrapper for task sync with retry. The TaskChampion sync endpoint flakes
@@ -145,12 +158,14 @@ debug() { [ "${DRAIN_DEBUG:-0}" = "1" ] && printf '[%s] [%s] DEBUG: %s\n' "$(dat
 # Error reporting: send critical failures to a webhook (Slack, Discord, etc.)
 # Set DRAIN_ERROR_WEBHOOK to enable. Errors are also always logged locally.
 report_error() { # $1 = error message
+	log "ERROR: $1"
 	local webhook="${DRAIN_ERROR_WEBHOOK:-}"
 	[ -n "$webhook" ] || return 0
 	local payload
 	payload=$(jq -nc --arg worker "$WORKER_ID" --arg msg "$1" --arg host "$(hostname -s)" \
-		'{text: "🚨 task-drain error on \($host) [\($worker)]: \($msg)"}')
-	curl -s -X POST -H 'Content-Type: application/json' -d "$payload" "$webhook" >/dev/null 2>&1 || true
+		'{text: "task-drain error on \($host) [\($worker)]: \($msg)"}')
+	if [ "${DRAIN_WEBHOOK_FORMAT:-slack}" = discord ]; then payload=$(printf '%s' "$payload" | jq '{content:.text}'); fi
+	curl --fail --silent --max-time 10 -X POST -H 'Content-Type: application/json' -d "$payload" "$webhook" >/dev/null 2>&1 || log "Webhook delivery failed"
 }
 
 stop_requested() { [ -e "$STOP_FILE" ] || [ -e "${STOP_FILE}.$$" ]; }
@@ -163,14 +178,38 @@ stop_scope() { # why this worker is stopping: global|personal|none
 	else echo none; fi
 }
 
+# Host-local ownership locks. Abandoned locks require explicit operator recovery.
+TASK_LOCK=""
+REPO_LOCK=""
+acquire_lock() {
+	mkdir -p "$HOME/.task-drain/locks"
+	mkdir "$1" 2>/dev/null || return 1
+	printf '%s\n' "$$" >"$1/pid"
+}
+release_locks() {
+	local path
+	for path in "${TASK_LOCK:-}" "${REPO_LOCK:-}"; do
+		[ -n "$path" ] || continue
+		[ "$(cat "$path/pid" 2>/dev/null)" = "$$" ] || continue
+		rm -f "$path/pid"
+		rmdir "$path" 2>/dev/null || true
+	done
+	TASK_LOCK=""
+	REPO_LOCK=""
+}
 claim_task() { # $1 = uuid
+	sync_with_retry || return 1
+	local current
+	current=$("$TASK" "$1" +PENDING -ACTIVE -WAITING -BLOCKED export | eligible_json) || return 1
+	[ "$(printf '%s' "$current" | jq length)" = 1 ] || return 1
 	if ! $TASK "$1" modify +drain-claimed >/dev/null 2>&1; then
 		report_error "claim_task: failed to add drain-claimed tag to $1"
 		return 1
 	fi
+	CLAIM_MUTATED=1
 	if [ "$DRAIN_RETRY_FAILED" = "1" ]; then
 		$TASK "$1" modify -drain-failed >/dev/null 2>&1 || true
-		$TASK "$1" annotate "drain worker $WORKER_ID retrying previously failed attempt ($(date -u +%Y-%m-%dT%H:%M:%SZ))" >/dev/null 2>&1 || true
+		$TASK "$1" annotate "claimed by $WORKER_ID retrying previously failed attempt ($(date -u +%Y-%m-%dT%H:%M:%SZ))" >/dev/null 2>&1 || true
 	else
 		$TASK "$1" annotate "claimed by $WORKER_ID at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1 || true
 	fi
@@ -195,15 +234,25 @@ release_claim() { # $1 = uuid, $2 = reason annotation
 
 cleanup_retry() { [ -n "$RETRY_SNAPSHOT" ] && rm -f "$RETRY_SNAPSHOT" "$RETRY_SNAPSHOT.tmp"; }
 
+terminate_tree() {
+	local child
+	for child in $(pgrep -P "$1" 2>/dev/null || true); do terminate_tree "$child"; done
+	kill -TERM "$1" 2>/dev/null || true
+}
 on_signal() {
 	log "signal received; stopping worker and child ${CHILD_PID:-none}"
-	if [ -n "$CHILD_PID" ]; then kill "$CHILD_PID" 2>/dev/null || true; fi
+	if [ -n "$CHILD_PID" ]; then
+		terminate_tree "$CHILD_PID"
+		wait "$CHILD_PID" 2>/dev/null || true
+	fi
+	[ -z "${ANNOTATOR_PID:-}" ] || kill "$ANNOTATOR_PID" 2>/dev/null || true
 	if [ -n "$CURRENT_UUID" ]; then
 		release_claim "$CURRENT_UUID" "drain worker $WORKER_ID: stopped by signal; claim released, task left pending" || true
 		sync_with_retry >/dev/null 2>&1 || true
 	fi
 	rm -f "${STOP_FILE}.$$"
 	cleanup_retry
+	release_locks
 	exit 130
 }
 trap on_signal INT TERM
@@ -251,17 +300,21 @@ drain_list_prs() {
 		return 0
 	}
 	command -v gh >/dev/null 2>&1 || {
-		echo "[]"
-		return 0
+		echo "gh is required for GitHub PR discovery" >&2
+		return 1
 	}
 
 	while IFS= read -r repo_path; do
 		[ -n "$repo_path" ] || continue
-		[ -d "$repo_path/.git" ] || continue
+		[ -e "$repo_path/.git" ] || continue
+		git -C "$repo_path" rev-parse --git-dir >/dev/null 2>&1 || continue
 		# Only scan GitHub repos (gh CLI)
 		remote=$(git -C "$repo_path" remote get-url origin 2>/dev/null || true)
 		[[ "$remote" == *github.com* ]] || continue
-		pr_json=$(cd "$repo_path" && gh pr list --state open --json number,title,body,url,headRefName,createdAt 2>/dev/null || echo '[]')
+		if ! pr_json=$(cd "$repo_path" && gh api --paginate --slurp 'repos/{owner}/{repo}/pulls?state=open&per_page=100' | jq '[.[][] | {number,title,body,url:.html_url,headRefName:.head.ref,createdAt:.created_at}]'); then
+			log "PR discovery failed for $repo_path (check gh authentication/network)"
+			return 1
+		fi
 		filtered=$(printf '%s' "$pr_json" | jq --arg repo "$repo_path" '
 			[.[] | select(.body // "" | test("Task [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"; "i")) |
 			{repo: $repo, number, title, url, branch: .headRefName, created: .createdAt,
@@ -318,29 +371,31 @@ repo_for_project() {
 # only tasks tagged +auto are eligible.
 drain_elig_filter() {
 	if [ "${DRAIN_AUTONOMOUS:-0}" = "1" ]; then
-		echo "+PENDING -ACTIVE -WAITING -BLOCKED +auto -drain-failed"
+		echo "+PENDING -ACTIVE -WAITING -BLOCKED -noauto -claimed -drain-claimed -ready-for-review -review -approved -drain-failed +auto"
 	else
-		echo "+PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed"
+		echo "+PENDING -ACTIVE -WAITING -BLOCKED -noauto -claimed -drain-claimed -ready-for-review -review -approved -drain-failed"
 	fi
 }
 
+eligible_json() {
+	jq --arg mode "$DRAIN_AUTONOMOUS" --arg retry "$DRAIN_RETRY_FAILED" --arg now "$(date -u +%Y%m%dT%H%M%SZ)" '
+    [.[] | select(.status == "pending" and (.start | not)) |
+      select((.scheduled // "") <= $now) |
+      select(((.tags // []) | any(. == "noauto" or . == "claimed" or . == "drain-claimed" or . == "ready-for-review" or . == "review" or . == "approved")) | not) |
+      select($mode != "1" or ((.tags // []) | index("auto"))) |
+      select(if $retry == "1" then ((.tags // []) | index("drain-failed")) else (((.tags // []) | index("drain-failed")) | not) end)]'
+}
+queue_json() {
+	local args=(+PENDING -ACTIVE -WAITING -BLOCKED)
+	[ -z "$PROJECT_FILTER" ] || args+=("project:$PROJECT_FILTER")
+	"$TASK" "${args[@]}" export | eligible_json
+}
 pick_task() {
-	if [ "$DRAIN_RETRY_FAILED" = "1" ]; then
+	if [ "$DRAIN_RETRY_FAILED" = 1 ]; then
 		pick_retry_task
 		return
 	fi
-	local filter
-	filter=$(drain_elig_filter)
-	if [ -n "$PROJECT_FILTER" ]; then filter="project:$PROJECT_FILTER $filter"; fi
-	# shellcheck disable=SC2086
-	local export_output
-	export_output=$($TASK $filter export 2>/dev/null)
-	if [ -z "$export_output" ]; then
-		report_error "pick_task: task export returned empty (binary missing or sync error?)"
-		echo ""
-		return
-	fi
-	echo "$export_output" | jq -c 'sort_by(.urgency // 0) | reverse | .[0] // empty'
+	queue_json | jq -c 'sort_by(.urgency // 0, .uuid) | reverse | .[0] // empty'
 }
 
 # Retry mode: pop UUIDs off the startup snapshot. Each failed task is retried
@@ -352,7 +407,7 @@ pick_retry_task() {
 		uuid=$(head -n 1 "$RETRY_SNAPSHOT")
 		tail -n +2 "$RETRY_SNAPSHOT" >"$RETRY_SNAPSHOT.tmp" && mv "$RETRY_SNAPSHOT.tmp" "$RETRY_SNAPSHOT"
 		[ -n "$uuid" ] || continue
-		ok=$($TASK "$uuid" export 2>/dev/null | jq -r '.[0] | select(.status=="pending" and ((.tags//[]) | index("drain-failed")) and (.start|not)) | .uuid // empty')
+		ok=$($TASK "$uuid" +PENDING -ACTIVE -WAITING -BLOCKED export 2>/dev/null | eligible_json | jq -r '.[0] | select(.status=="pending" and ((.tags//[]) | index("drain-failed")) and (.start|not)) | .uuid // empty')
 		if [ -n "$ok" ]; then
 			$TASK "$uuid" export 2>/dev/null | jq -c '.[0]'
 			return 0
@@ -374,7 +429,14 @@ reclaim_stale() {
 	fi
 	echo "$stale_uuids" | while IFS= read -r uuid; do
 		[ -n "$uuid" ] || continue
-		log "releasing stale claim: $uuid"
+		local owner pid
+		owner=$($TASK "$uuid" export | jq -r '.[0].annotations // [] | map(.description) | map(select(startswith("claimed by drain-"))) | last // ""')
+		case "$owner" in "claimed by drain-$(hostname -s)-"*) ;; *) continue ;; esac
+		pid=${owner#"claimed by drain-$(hostname -s)-"}
+		pid=${pid%% *}
+		[[ "$pid" =~ ^[0-9]+$ ]] || continue
+		kill -0 "$pid" 2>/dev/null && continue
+		log "releasing stale claim owned by dead local worker: $uuid"
 		release_claim "$uuid" "drain worker: released stale claim (active > $((STALE_AFTER_SEC / 3600))h, no completion)"
 	done
 	sync_with_retry || report_error "reclaim_stale: sync failed after releasing stale claims"
@@ -419,7 +481,7 @@ GIT WORKFLOW (when the task involves code changes)
 - Create a PR and leave it open for review. Never merge it yourself.
   - For GitHub repos: gh pr create --title "<task description>" --body "Task <uuid>. <summary>"
   - For Gitea / self-hosted forges: use the forge's API, e.g.:
-    curl -s -X POST -H "Authorization: token \$FORGE_TOKEN" -H "Content-Type: application/json" \
+    curl --fail --silent --max-time 10 -X POST -H "Authorization: token \$FORGE_TOKEN" -H "Content-Type: application/json" \
       -d '{"title":"<task description>","head":"<branch>","base":"main","body":"Task <uuid>. <summary>"}' \
       https://<your-forge-host>/api/v1/repos/<owner>/<repo>/pulls
     (Export FORGE_TOKEN in your shell environment -- e.g. ~/.zshenv or ~/.bashrc --
@@ -437,15 +499,44 @@ run_one() { # $1 = task export JSON
 	annotations=$(jq -r '(.annotations // []) | map(.description) | join("\n")' <<<"$1")
 	[ -n "$annotations" ] || annotations="(none)"
 	repo=$(repo_for_project "$project")
-	if [ -z "$repo" ] || [ ! -d "$repo" ]; then repo="$HOME"; fi
+	if [ -z "$repo" ] || [ ! -d "$repo" ]; then
+		if [ "${DRAIN_ALLOW_HOME:-0}" = 1 ]; then
+			repo="$HOME"
+		else
+			log "No existing repository mapping for $project; parking $uuid"
+			"$TASK" "$uuid" modify +drain-failed >/dev/null
+			"$TASK" "$uuid" annotate "No existing repository mapping; configure repos.conf before retry" >/dev/null
+			sync_with_retry || return 1
+			return 1
+		fi
+	fi
+	repo=$(cd "$repo" && pwd -P)
+	TASK_LOCK="$HOME/.task-drain/locks/$uuid"
+	REPO_LOCK="$HOME/.task-drain/locks/repo-$(printf '%s' "$repo" | cksum | awk '{print $1}')"
+	if ! acquire_lock "$TASK_LOCK"; then
+		TASK_LOCK=""
+		REPO_LOCK=""
+		sleep 1
+		return 1
+	fi
+	if ! acquire_lock "$REPO_LOCK"; then
+		REPO_LOCK=""
+		release_locks
+		sleep 1
+		return 1
+	fi
 
 	log "starting: [$project] $description ($uuid)"
 	start_ts=$(date +%s)
 	# A failed claim must skip the task, not kill the worker (set -e would
 	# otherwise abort the whole process on claim_task's non-zero return).
+	CLAIM_MUTATED=0
 	if ! claim_task "$uuid"; then
 		log "claim failed for $uuid -- skipping task"
-		release_claim "$uuid" "drain worker $WORKER_ID: claim could not be completed/published; released without running agent" || true
+		if [ "${CLAIM_MUTATED:-0}" = 1 ]; then
+			release_claim "$uuid" "drain worker $WORKER_ID: claim could not be published; released without running agent" || true
+		fi
+		release_locks
 		sync_with_retry >/dev/null 2>&1 || true
 		return 1
 	fi
@@ -472,26 +563,26 @@ run_one() { # $1 = task export JSON
 	# Launch the agent harness. Each harness has its own non-interactive CLI.
 	case "$DRAIN_AGENT" in
 	opencode)
-		if command -v gtimeout >/dev/null 2>&1; then
-			(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" </dev/null) &
+		if [ -n "$TIMEOUT_BIN" ]; then
+			(cd "$repo" && exec "$TIMEOUT_BIN" --kill-after=10 "$TASK_TIMEOUT_SEC" "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" </dev/null) &
 		else
 			(cd "$repo" && exec "$OPENCODE_BIN" run "${OPENCODE_RUN_FLAGS[@]}" "$prompt" </dev/null) &
 		fi
 		;;
 	claude)
-		# Claude Code headless: claude -p prints the final response and exits.
-		if command -v gtimeout >/dev/null 2>&1; then
-			(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" claude -p "$prompt" </dev/null) &
+		# Claude Code headless: "$CLAUDE_BIN" -p prints the final response and exits.
+		if [ -n "$TIMEOUT_BIN" ]; then
+			(cd "$repo" && exec "$TIMEOUT_BIN" --kill-after=10 "$TASK_TIMEOUT_SEC" "$CLAUDE_BIN" -p "$prompt" </dev/null) &
 		else
-			(cd "$repo" && exec claude -p "$prompt" </dev/null) &
+			(cd "$repo" && exec "$CLAUDE_BIN" -p "$prompt" </dev/null) &
 		fi
 		;;
 	codex)
-		# Codex CLI non-interactive: codex exec runs the prompt and exits.
-		if command -v gtimeout >/dev/null 2>&1; then
-			(cd "$repo" && exec gtimeout "$TASK_TIMEOUT_SEC" codex exec "$prompt" </dev/null) &
+		# Codex CLI non-interactive: "$CODEX_BIN" exec runs the prompt and exits.
+		if [ -n "$TIMEOUT_BIN" ]; then
+			(cd "$repo" && exec "$TIMEOUT_BIN" --kill-after=10 "$TASK_TIMEOUT_SEC" "$CODEX_BIN" exec "$prompt" </dev/null) &
 		else
-			(cd "$repo" && exec codex exec "$prompt" </dev/null) &
+			(cd "$repo" && exec "$CODEX_BIN" exec "$prompt" </dev/null) &
 		fi
 		;;
 	*)
@@ -515,12 +606,22 @@ run_one() { # $1 = task export JSON
 	kill "$ANNOTATOR_PID" 2>/dev/null || true
 	wait "$ANNOTATOR_PID" 2>/dev/null || true
 
-	sync_with_retry || true
+	if ! sync_with_retry; then
+		log "Completion sync failed for $uuid; outcome unconfirmed, stopping worker"
+		release_locks
+		return 2
+	fi
 	status=$($TASK "$uuid" export 2>/dev/null | jq -r '.[0].status // "unknown"')
 	CURRENT_UUID=""
-	if [ "$status" = "completed" ]; then
+	if [ "$status" = "completed" ] && [ "$rc" = 0 ]; then
 		log "DONE: [$project] $description"
 		history_record "$uuid" "$project" "$description" "done" "$(($(date +%s) - start_ts))" "$WORKER_ID"
+		"$TASK" "$uuid" modify -drain-claimed >/dev/null || true
+		sync_with_retry || {
+			release_locks
+			return 2
+		}
+		release_locks
 		return 0
 	fi
 	log "not completed (agent rc=$rc, status=$status) -- failed, will not auto-retry"
@@ -529,24 +630,39 @@ run_one() { # $1 = task export JSON
 		report_error "run_one: failed to tag $uuid as drain-failed (task may be re-picked)"
 	fi
 	release_claim "$uuid" "drain worker $WORKER_ID: agent exited (rc=$rc) without completing; tagged drain-failed, not auto-retried"
-	sync_with_retry || report_error "run_one: sync failed after marking $uuid as drain-failed"
+	if ! sync_with_retry; then
+		report_error "run_one: sync failed after marking $uuid as drain-failed -- failing closed"
+		release_locks
+		return 2
+	fi
+	release_locks
 	return 1
 }
 
 history_record() { # $1=uuid $2=project $3=description $4=result $5=duration_sec $6=worker_id
-	local desc
+	local desc history_lock="$HOME/.task-drain/locks/history" tries=0
+	while ! acquire_lock "$history_lock"; do
+		tries=$((tries + 1))
+		[ "$tries" -lt 100 ] || {
+			log "history lock unavailable"
+			return 1
+		}
+		sleep 0.1
+	done
 	desc=$(printf '%s' "$3" | tr '\t\n\r' ' ')
 	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 		"$(date -u '+%FT%TZ')" "$1" "$2" "$desc" "$4" "$5" "${6:-$WORKER_ID}" >>"$HISTORY_FILE"
 	# Prune to rolling window
-	tail -n "$HISTORY_LIMIT" "$HISTORY_FILE" >"$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+	tail -n "$HISTORY_LIMIT" "$HISTORY_FILE" >"$HISTORY_FILE.tmp.$$" && mv "$HISTORY_FILE.tmp.$$" "$HISTORY_FILE"
+	rm -f "$history_lock/pid"
+	rmdir "$history_lock"
 }
 
 run_worker() {
 	case "$DRAIN_AGENT" in
 	opencode) _agent_bin="$OPENCODE_BIN" ;;
-	claude) _agent_bin="claude" ;;
-	codex) _agent_bin="codex" ;;
+	claude) _agent_bin="$CLAUDE_BIN" ;;
+	codex) _agent_bin="$CODEX_BIN" ;;
 	esac
 	command -v "$_agent_bin" >/dev/null 2>&1 || {
 		log "ERROR: '$_agent_bin' (DRAIN_AGENT=$DRAIN_AGENT) not found on PATH"
@@ -560,7 +676,9 @@ run_worker() {
 		log "ERROR: $TASK not executable"
 		exit 1
 	}
-	mkdir -p "$(dirname "$STOP_FILE")"
+	mkdir -p "$(dirname "$STOP_FILE")/workers"
+	printf '%s\n' "${PROJECT_FILTER:-}" >"$HOME/.task-drain/workers/$$"
+	trap 'release_locks; rm -f "$HOME/.task-drain/workers/$$"' EXIT
 	if stop_requested; then
 		log "STOP file present ($STOP_FILE); refusing to start"
 		exit 0
@@ -577,11 +695,7 @@ run_worker() {
 	if [ "$DRAIN_RETRY_FAILED" = "1" ]; then
 		done_msg="failed set reprocessed"
 		RETRY_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/drain-retry.XXXXXX")
-		local rfilter="+drain-failed -ACTIVE -WAITING -BLOCKED"
-		if [ "$DRAIN_AUTONOMOUS" = "1" ]; then rfilter="$rfilter +auto"; else rfilter="$rfilter -noauto"; fi
-		if [ -n "$PROJECT_FILTER" ]; then rfilter="project:$PROJECT_FILTER $rfilter"; fi
-		# shellcheck disable=SC2086
-		$TASK $rfilter export 2>/dev/null | jq -r '.[].uuid' >"$RETRY_SNAPSHOT"
+		queue_json | jq -r '.[].uuid' >"$RETRY_SNAPSHOT"
 		local rcount
 		rcount=$(grep -c . "$RETRY_SNAPSHOT" || true)
 		if [ "$rcount" = "0" ]; then
@@ -602,6 +716,11 @@ run_worker() {
 			sync_with_retry >/dev/null 2>&1 || true
 			exit 0
 		fi
+		sync_with_retry || {
+			log "Queue sync failed; stopping"
+			release_locks
+			return 1
+		}
 		reclaim_stale
 		task_json=$(pick_task) || task_json=""
 		if [ -z "$task_json" ]; then
@@ -616,7 +735,11 @@ run_worker() {
 			cleanup_retry
 			exit 0
 		fi
-		if run_one "$task_json"; then completed=$((completed + 1)); else failed=$((failed + 1)); fi
+		if run_one "$task_json"; then completed=$((completed + 1)); else
+			local result=$?
+			failed=$((failed + 1))
+			[ "$result" != 2 ] || return 1
+		fi
 	done
 }
 
@@ -655,6 +778,7 @@ cmd_status() {
 		sync_state="${DIM}sync: watch (no re-sync)${RESET}"
 	elif ! sync_with_retry >/dev/null 2>&1; then sync_state="${Y}sync: FAILED (showing local state)${RESET}"; fi
 
+	printf "Pickup mode: %s (dashboard environment); future scheduled tasks excluded\n" "${DRAIN_AUTONOMOUS:-0}"
 	# --- workers (shared detection logic) ---
 	local worker_ps nworkers
 	worker_ps=$(drain_worker_info)
@@ -682,7 +806,7 @@ cmd_status() {
 	# for clarity.)
 	local n_elig n_active n_blocked n_waiting n_noauto n_failed n_done
 	local n_claimed_active n_interactive n_stale n_pending_total
-	n_elig=$(tq $(drain_elig_filter) count 2>/dev/null || echo "?")
+	n_elig=$(queue_json | jq length)
 	n_active=$(tq +ACTIVE count 2>/dev/null || echo "?")
 	n_blocked=$(tq +PENDING +BLOCKED count 2>/dev/null || echo "?")
 	n_waiting=$(tq +WAITING count 2>/dev/null || echo "?")
@@ -709,7 +833,7 @@ cmd_status() {
 
 	# --- data exports (single shot each; tag exports scoped to +PENDING) ---
 	local eligible_json active_json failed_json review_json
-	eligible_json=$(tq $(drain_elig_filter) export 2>/dev/null || echo '[]')
+	eligible_json=$(queue_json || echo '[]')
 	active_json=$(tq +ACTIVE export 2>/dev/null || echo '[]')
 	failed_json=$(tq +PENDING +drain-failed export 2>/dev/null || echo '[]')
 	review_json=$(tq +COMPLETED end.after:today export 2>/dev/null |
@@ -1432,6 +1556,17 @@ cmd_watch() { # [renderer] -- live alternate-screen display, q quits
 
 # Autoscale supervisor: watches queue depth, scales workers to match.
 # Runs as a daemon via `drain autoscale`. Stops on SIGTERM or STOP file.
+scoped_worker_pids() {
+	local f pid
+	for f in "$HOME/.task-drain/workers/"*; do
+		[ -f "$f" ] || continue
+		pid=${f##*/}
+		[[ "$pid" =~ ^[0-9]+$ ]] || continue
+		[ "$(cat "$f")" = "${PROJECT_FILTER:-}" ] || continue
+		kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+	done
+	return 0
+}
 autoscale_supervisor() {
 	: "${DRAIN_SCRIPT:=$0}"
 	: "${LOG_DIR:=$HOME/.task-drain/logs}"
@@ -1463,16 +1598,20 @@ autoscale_supervisor() {
 		fi
 
 		# Sync and count eligible tasks
-		sync_with_retry >/dev/null 2>&1 || log "autoscaler: sync failed, using local state"
+		sync_with_retry >/dev/null 2>&1 || {
+			log "autoscaler: sync failed; no scaling performed"
+			sleep "$interval"
+			continue
+		}
 		local eligible
-		eligible=$(tq $(drain_elig_filter) count 2>/dev/null || echo "0")
+		eligible=$(queue_json | jq length)
 		[[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
 
 		# Count running workers.
 		# NOTE: this pattern never matches the supervisor itself (our cmdline
 		# ends with " autoscale", past the $ anchor), so no self-exclusion.
 		local running
-		running=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | wc -l | tr -d ' ' || true)
+		running=$(scoped_worker_pids | wc -l | tr -d ' ')
 		[[ "$running" =~ ^[0-9]+$ ]] || running=0
 
 		# Desired workers: enough to cover eligible tasks, clamped to [min, max]
@@ -1495,7 +1634,7 @@ autoscale_supervisor() {
 			log "autoscaler: eligible=$eligible running=$running -> stopping $to_stop worker(s) gracefully"
 			# Signal excess workers via per-worker STOP files (they finish current task)
 			local pids
-			pids=$(pgrep -f "bash $DRAIN_SCRIPT$" 2>/dev/null | head -"$to_stop")
+			pids=$(scoped_worker_pids | head -"$to_stop")
 			for pid in $pids; do
 				touch "$HOME/.task-drain/STOP.$pid" 2>/dev/null
 			done
@@ -1505,8 +1644,17 @@ autoscale_supervisor() {
 	done
 }
 
+if [ "${DRAIN_SOURCE_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
 case "${1:-run}" in
 run) run_worker ;;
+mappings)
+	while IFS= read -r project; do
+		repo=$(repo_for_project "$project")
+		[ -n "$repo" ] && [ -d "$repo" ] || repo="UNMAPPED (tasks parked)"
+		printf '%s -> %s\n' "$project" "$repo"
+	done < <("$TASK" _projects)
+	;;
 autoscale) autoscale_supervisor ;;
 status) cmd_status ;;
 history)
