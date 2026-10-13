@@ -27,12 +27,15 @@ not verify those artifacts. See [execution boundaries](architecture.md).
 
 | Mode | Normal queue filter |
 |---|---|
-| Default | `+PENDING -ACTIVE -WAITING -BLOCKED -noauto -drain-failed` |
-| Autonomous | `+PENDING -ACTIVE -WAITING -BLOCKED +auto -drain-failed` |
+| Default | `+PENDING -ACTIVE -WAITING -BLOCKED -noauto -claimed -drain-claimed -ready-for-review -review -approved -drain-failed` |
+| Autonomous | `+PENDING -ACTIVE -WAITING -BLOCKED -noauto -claimed -drain-claimed -ready-for-review -review -approved -drain-failed +auto` |
 
-Autonomous mode does **not** exclude `noauto`. To withhold a task from both
-modes, remove `auto` and add `noauto`. A future `scheduled` date alone is not
-an exclusion in these filters; use Taskwarrior waiting state to defer pickup.
+`noauto` excludes in both modes; autonomous additionally requires `+auto`.
+To withhold a task from both modes, remove `auto` (adding `noauto` is also
+effective). Whether autonomous *should* ignore `noauto` is an open owner
+decision; the code as implemented excludes it. A future `scheduled` date is
+an exclusion (tasks scheduled in the future are not picked); use Taskwarrior
+waiting state to defer pickup.
 Project filters use Taskwarrior `project:` matching, including its subproject
 semantics; repository mapping still matches the task's exact project string.
 
@@ -51,18 +54,23 @@ count. An existing supervisor keeps its previous configuration.
 ## Operational controls
 
 - `drain stop` requests graceful completion of current tasks; `drain kill`
-  sends TERM and stops the local supervisor. Cleanup is best-effort. If no
-  workers exist, `drain stop` returns without setting STOP or stopping a
-  supervisor; use `drain autoscale-stop` explicitly.
+  sends TERM and stops the local supervisor. Cleanup is best-effort.
+  Default `drain stop` / `all` sets STOP and stops the supervisor even with
+  zero workers; `drain stop N` does neither, so use `drain autoscale-stop`
+  explicitly in that case.
 - `drain-failed` parks incomplete attempts. `--failed` snapshots retries per
   worker; it is not a global one-retry guarantee. Prefer one worker for retries.
 - `DRAIN_SKIP_PERMISSIONS=1` appends a bypass flag to OpenCode only. Claude
   and Codex retain their configured permissions. Harness behavior can include
   denying an action or failing a run, not necessarily waiting for a prompt.
-- Stale claim release is based on age and runs only when workers loop. It
-  does not establish that the previous worker died.
-- Workers share mapped working directories. Multiple workers in one checkout
-  can conflict even when they select different tasks.
+- Stale claim release is based on active age and runs only when workers
+  loop. Release additionally requires the recorded local worker PID to be
+  dead (`kill -0` check); it scans all projects but releases only this
+  host's claims, and cannot detect death on other hosts or PID reuse.
+- Workers share mapped working directories. Drain workers serialize access
+  per repository with a host-local lock, so two drain workers never run
+  agents in the same checkout concurrently; plugin-driven or interactive
+  work in the same checkout remains unsynchronized and can still conflict.
 
 Use the plugin when an agent client should manage task lifecycle explicitly.
 Use workers for well-specified tasks with suitable repository isolation and

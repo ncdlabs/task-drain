@@ -241,28 +241,28 @@ load_functions() {
     load_functions
     export DRAIN_AUTONOMOUS=0
     result=$(drain_elig_filter)
+    unset DRAIN_AUTONOMOUS
     [[ "$result" == *"-noauto"* ]]
     [[ "$result" != *"+auto"* ]]
-    unset DRAIN_AUTONOMOUS
 }
 
 @test "drain_elig_filter returns opt-in filter when DRAIN_AUTONOMOUS=1" {
     load_functions
     export DRAIN_AUTONOMOUS=1
     result=$(drain_elig_filter)
-    [[ "$result" == *"+auto"* ]]
-    [[ "$result" != *"-noauto"* ]]
     unset DRAIN_AUTONOMOUS
+    [[ "$result" == *"+auto"* ]]
+    [[ "$result" == *"-noauto"* ]]
 }
 
-@test "drain_elig_filter includes project filter when PROJECT_FILTER is set" {
+@test "drain_elig_filter is project-independent (queue_json adds project scope)" {
     load_functions
     export DRAIN_AUTONOMOUS=0
     export PROJECT_FILTER="myproject"
     result=$(drain_elig_filter)
-    [[ "$result" == *"project:myproject"* ]]
     unset DRAIN_AUTONOMOUS
     unset PROJECT_FILTER
+    [[ "$result" != *"project:"* ]]
 }
 
 @test "drain help start shows --autonomous option" {

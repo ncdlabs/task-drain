@@ -241,16 +241,15 @@ export function assertActionable(task, { force = false } = {}) {
 /** Guard for claim_task. Throws on violation unless force is set. */
 export function claimGuard(task, actor, { force = false } = {}) {
   assertActionable(task, { force });
-  if (hasTag(task, "ready-for-review") || hasTag(task, "review") || hasTag(task, "drain-claimed")) {
+  if (!force && (hasTag(task, "ready-for-review") || hasTag(task, "review") || hasTag(task, "drain-claimed"))) {
     throw new Error("Task is already in review and cannot be claimed");
   }
   if (tagsOf(task).includes("claimed") && !force) {
     const holder = lastClaimActor(task);
-    throw new Error(
-      holder && holder !== actor
-        ? `Task is already claimed by ${holder}; release it first or retry with force:true`
-        : "Task is already claimed; release it first or retry with force:true",
-    );
+    if (holder && holder !== actor) {
+      throw new Error(`Task is already claimed by ${holder}; release it first or retry with force:true`);
+    }
+    // Same actor re-claiming is allowed (idempotent)
   }
 }
 

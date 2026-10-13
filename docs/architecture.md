@@ -37,7 +37,9 @@ flowchart LR
 1. Check executable dependencies and STOP state; abort if initial sync fails.
 2. In retry mode, snapshot eligible failed-task UUIDs into a per-worker file.
 3. Before each selection, release active `drain-claimed` tasks older than
-   `STALE_AFTER_SEC`. This is global and does not check process liveness.
+   `STALE_AFTER_SEC` whose recorded local worker PID is dead (`kill -0`
+   check). The candidate scan covers all projects but releases only this
+   host's claims; it cannot detect death on other hosts or PID reuse.
 4. Normal mode exports the eligible set and selects greatest urgency. Retry
    mode consumes its snapshot, rechecking pending, failed, and idle state.
 5. Add `drain-claimed`, annotate, start the task, and sync the claim before
@@ -45,9 +47,10 @@ flowchart LR
    to release the claim.
 6. Run one agent in the mapped directory (or HOME if unresolved), with stdin
    closed. A background annotator records progress approximately every 30s.
-7. After the agent exits, attempt sync and inspect task status. `completed`
-   counts as success regardless of the exit code. Otherwise record failure,
-   add `drain-failed`, release the claim, and attempt sync.
+7. After the agent exits, attempt sync and inspect task status. Success
+   requires status `completed` **and** agent exit code 0; otherwise record
+   failure, add `drain-failed`, release the claim, and attempt sync. The
+   shell runs no acceptance tests and validates no commits or PRs.
 8. Repeat; an empty queue causes exit unless `DRAIN_PERSIST=1`. The empty
    path attempts sync but does not reselect before a nonpersistent exit.
 
@@ -78,10 +81,12 @@ can leave local mutations applied. None of these operations is transactional.
 - Selection and claim are separate operations without a distributed lock or
   compare-and-swap. Two workers can execute the same task. A published claim
   reduces this window but does not provide exactly-once execution.
-- Workers use the mapped checkout directly. They do not create worktrees or
-  serialize Git operations. Different tasks can change the same working tree
-  concurrently. Use a single worker for a shared checkout or provide isolated
-  mappings and tasks deliberately.
+- Workers use the mapped checkout directly and do not create worktrees.
+  Drain workers serialize Git operations per repository with a host-local
+  lock, so two drain workers never run agents in the same checkout
+  concurrently. Plugin-driven or interactive work in the same checkout is
+  unsynchronized: different tasks can still change the same working tree
+  concurrently. Use isolated mappings and tasks deliberately.
 - Stale reclamation can release a still-running task, especially when the
   task timeout is disabled or longer than the stale threshold.
 - Retry snapshots and consumption are per worker. With multiple workers,
@@ -96,8 +101,9 @@ can leave local mutations applied. None of these operations is transactional.
 
 Plugin ownership is `claimed` plus `[actor] claimed:` annotations; workers
 use `drain-claimed` plus `claimed by drain-...` annotations. They are different
-protocols. The worker excludes active tasks but does not explicitly exclude
-`claimed`, `ready-for-review`, `review`, or `approved` tags.
+protocols. The worker eligibility filter excludes `claimed`,
+`drain-claimed`, `ready-for-review`, `review`, and `approved` tags in both
+pickup modes, so shell workers do not pick up plugin-owned or in-review tasks.
 
 For an interactive task withheld from both shell pickup modes, add `noauto`
 and remove `auto` before releasing active work. Plugin `task_auto` does not
@@ -105,8 +111,8 @@ honor those worker tags. Explicitly select UUIDs when mixing workflows.
 
 Plugin actors are caller-provided annotation labels, not authenticated
 identities. Approval tools do not establish that a human approved anything.
-`task_complete` accepts `ready-for-review` as well as `approved`, and
-`force:true` bypasses some guards. See [tool semantics](plugin-tools.md).
+`task_complete` requires `+approved` (use `approve` first); `force:true`
+bypasses the approval check but requires a `note`. See [tool semantics](plugin-tools.md).
 
 ## Data and network access
 

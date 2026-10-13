@@ -47,8 +47,8 @@ before retrying. The write may already have happened; blindly repeating
 Export that UUID and inspect status, `start`, tags, dependency state, and
 project. Compare with the exact filters in [operating modes](operating-modes.md).
 A future scheduled date is not the same as waiting state. Autonomous mode
-requires `auto` but ignores `noauto`. Review/approval and plugin `claimed`
-tags are not worker exclusions. Project filtering and repo mapping use
+requires `+auto`, and `noauto` still excludes. Review/approval (`ready-for-review`/`review`/`approved`) and `claimed`/`drain-claimed` tags
+are worker exclusions in both modes. Project filtering and repo mapping use
 different matching rules: map subprojects explicitly.
 
 For a task to remain outside both shell modes, add `noauto`, remove `auto`,
@@ -75,8 +75,9 @@ it is not a timer service that runs while all workers are stopped.
 
 ## Stopping does not seem to stop everything
 
-`drain stop` is graceful and returns early if no workers are found. Stop the
-supervisor explicitly with `drain autoscale-stop`. `drain kill` sends TERM;
+Default `drain stop` / `all` is graceful and sets STOP plus stops the
+supervisor even with zero workers. `drain stop N` does neither, so stop the
+supervisor explicitly with `drain autoscale-stop` in that case. `drain kill` sends TERM;
 it does not wait for descendants or guarantee remote claim publication.
 Inspect remaining agent processes and task state. Coordinate other hosts
 before releasing shared claims. `drain resume` clears stop files but starts

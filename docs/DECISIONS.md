@@ -71,10 +71,26 @@ this invocation. Prefer repairing ordinary-user access.
 
 The autonomous-mode decision applies to worker selection. Setting the env
 variable alone does not launch the supervisor; `drain start --autonomous`
-does. The actual autonomous filter requires `auto` and does not exclude
-`noauto`. An already-running supervisor is not reconfigured by that command.
+does. The implemented autonomous filter requires `auto` and still excludes
+`noauto` (code-as-is); whether autonomous *should* ignore `noauto` is an
+open owner decision. An already-running supervisor is not reconfigured by that command.
 These are descriptions of the current implementation, not new design decisions.
 
 Use `drain autoscale-stop` and deliberate worker stop/restart controls when
 updating installed code. The broad historical `pkill` example can match
 other worker invocations; inspect local processes before using it.
+
+## 2026-10-13 — Plugin completion requires +approved; doc-review verification pass
+
+`completeGuard` requires `+approved`; `+ready-for-review` no longer suffices.
+`force:true` bypasses the approval check but requires a `note`. This
+describes the implemented policy, not a human-approval authentication
+mechanism: actor labels remain caller-provided annotations.
+
+The 2026-10-12 documentation review findings were verified against the
+current source. Eight findings were documentation lag behind already-landed
+code (merge verification, stop/autoscaler ordering, completion exit-code
+conjunction, reclaim liveness check, worker claim/review exclusions,
+setup overwrite/symlink handling) and were corrected in place. The
+`noauto`-in-autonomous question is recorded as pending owner policy, not
+decided here.

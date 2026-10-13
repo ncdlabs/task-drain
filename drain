@@ -749,7 +749,7 @@ EXAMPLES
   drain projects merge myproject old-project-a old-project-b
   drain projects merge solfoundation solfoundation.brevo-cleanup
 
-After merging, run: task sync
+Changes are synced automatically. Update repos.conf separately.
 HELP
       ;;
     docs)

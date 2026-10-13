@@ -46,7 +46,8 @@ files first. Each worker logs to
   `DRAIN_PERSIST_POLL_SEC`, default 10s) after the queue empties instead
   of exiting.
 - `--autonomous` — opt-in pickup mode: only tasks tagged `+auto` are
-  eligible (even if also tagged `noauto`). Also launches the autoscaler;
+  eligible (`noauto` still excludes in this mode, matching the current
+  filter). Also launches the autoscaler;
   `DRAIN_AUTONOMOUS=1` alone does not. An existing supervisor retains its
   previous configuration. The initial N does not cap autoscaler growth.
 
@@ -67,8 +68,7 @@ drain start --autonomous     # opt-in mode; launches autoscaler
   `~/.task-drain/STOP` file.
 - `N` — gracefully stop N workers (newest first) via per-worker
   `STOP.<pid>` files. `N >= running` stops all.
-- `--force` — immediate: TERM mid-task (same as `drain kill`). Claim release and sync are best-effort. Also stops the autoscaler when
-  workers are found. `N` cannot be combined with `--force`.
+- `--force` — immediate: TERM mid-task (same as `drain kill`). Claim release and sync are best-effort. Also stops the autoscaler (before checking worker count). `N` cannot be combined with `--force`.
 
 ### `drain kill`
 
@@ -100,8 +100,9 @@ they keep working until the queue empties or they are stopped.
 
 ### `drain unfail [project]`
 
-Remove `drain-failed` from tasks matching `+drain-failed -ACTIVE -WAITING
--BLOCKED -noauto`, optionally scoped by project. Lists them and modifies
+Remove `drain-failed` from pending tasks (optionally scoped by project).
+The implementation selects `status:pending` tasks carrying `drain-failed`;
+there is no `noauto` exclusion. Lists them and modifies
 immediately; there is no confirmation prompt. It does not sync before or
 after, and does not require `auto` in autonomous mode. Run `task sync`
 before and after when sharing a pool.
@@ -130,15 +131,16 @@ pending tasks.
 ### `drain projects merge <destination> <source...>`
 
 Attempts a project-wide `task project:<source> modify project:<destination>`.
-A source is skipped unless its `+PENDING -ACTIVE -WAITING` count is nonzero,
-so sources containing only completed, active, or waiting tasks can be skipped.
-Modification errors are suppressed and the reported total comes from the
-pre-count, not verified mutations. Treat output as advisory: export and check
-source/destination tasks before and after, then sync. Taskwarrior project
-matching may include subprojects. Requires a destination and at least one
+Every named source is processed with exact project matching (descendants
+must be named explicitly) across `pending`, `waiting`, `completed`,
+`recurring`, and `deleted` statuses; a source with no matching tasks moves
+nothing. Each mutation is verified by re-export and only verified moves are
+counted (`Verified N task(s) moved`). Modification or verification failures
+abort with an error, and changes are synced automatically. Treat output as
+advisory until confirmed: export and check source/destination tasks before
+and after, then sync. Requires a destination and at least one
 source and rejects self-merges. `repos.conf` is not updated automatically.
-The implementation references `$TASK` without initializing it in this CLI
-path; supply `TASK=/absolute/path/to/task` when using this command.
+`$TASK` resolves from the environment or PATH like every other command.
 
 ### `drain pr list [--json]`
 
@@ -194,8 +196,9 @@ bash /absolute/path/to/task-drain/task-drain.sh [run|status|history|pr-list|watc
 - `drain autoscale` does not clear STOP. Use `drain resume` first if a previous
   stop left it set. `drain start` does clear it, potentially allowing other
   local workers to resume pickup too.
-- `drain stop` returns early when no workers exist, leaving any supervisor
-  untouched. `drain autoscale-stop` explicitly stops that supervisor.
+- Default `drain stop` / `all` sets STOP and stops the autoscaler even when
+  no workers exist. `drain stop N` does neither; use `drain autoscale-stop`
+  explicitly for the supervisor in that case.
 - Use `--min N` and `--max N` with spaces. The current equals-form parser
   fails to advance its argument loop (`--min=N` / `--max=N`).
 - Worker counting/stopping is local and not isolated by project. A supervisor

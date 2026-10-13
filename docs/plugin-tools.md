@@ -20,9 +20,9 @@ These are workflow checks, not authenticated authorization.
 
 | Tool | Guards |
 |---|---|
-| `claim` | Refuses tasks already in review (`ready-for-review`/`review`) or already claimed, including by the same actor; `force` bypasses the claim/status checks but never the in-review rejection |
+| `claim` | Refuses tasks already in review (`ready-for-review`/`review`/`drain-claimed`) or already claimed, including by the same actor; `force` bypasses the claim/status checks but never the in-review rejection |
 | `start` | Refuses already-started tasks |
-| `complete` | Requires `+approved` or `+ready-for-review` |
+| `complete` | Requires `+approved` (use `approve` first); `force:true` bypasses the approval check but requires a `note` |
 | `approve` | Requires `+ready-for-review` |
 
 Custom UDA writes are not supported by these schemas/helpers. This reflects
@@ -94,7 +94,7 @@ Approve a `ready-for-review` task: `-ready-for-review -review +approved`,
 with an annotation. Inputs: `uuid`, `actor` (required), `note`, `force`.
 
 ### `complete`
-`task done`. Requires `+approved` or `+ready-for-review` (or `force`),
+`task done`. Requires `+approved` (or `force:true` with a `note`),
 with a completion annotation. Inputs: `uuid`, `actor` (required), `note`,
 `force`.
 
@@ -130,9 +130,11 @@ sync client is built into 3.x; a shared remote pool still requires a separate
 sync server. This tool neither executes the generated script nor provisions
 the server.
 Inputs: `includeVerify` (default true), `write` (save to a file instead of
-returning text), `outputPath` (lexically restricted to the current directory; existing
-symlinks are not resolved by the containment check). `includeSyncService`
-is accepted for compatibility but deprecated. `write:true` can overwrite
+returning text), `overwrite` (required to replace an existing file),
+`outputPath` (restricted to the current directory; symlinked working
+directory and parent paths are resolved before the containment check, and a
+symlink at the final path component is refused). `includeSyncService`
+is accepted for compatibility but deprecated. `write:true` alone fails on
 an existing file; no confirmation is built into the handler.
 
 ### `auto`
@@ -173,8 +175,8 @@ unmet dependencies or tasks already active under another workflow.
 
 `start` does not require `claimed`; `stop` retains the claim; `release`
 removes `claimed` and stops work but does not verify the caller owns it.
-`complete` accepts `ready-for-review` without a separate approval and does
-not run tests or check evidence. `record_decision` does not write
+`complete` requires `+approved` (or `force:true` with a `note`)
+and does not run tests or check evidence. `record_decision` does not write
 `docs/DECISIONS.md`; promote durable decisions there explicitly.
 
 MCP names are `task_<name>`; OpenCode registers the `task` namespace with

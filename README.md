@@ -13,8 +13,9 @@ Pickup is **opt-out** by default: any pending task is eligible unless it is
 active, waiting, blocked, or tagged `noauto` / `drain-failed`.
 Use `--autonomous` (or `DRAIN_AUTONOMOUS=1`) for **opt-in** pickup — only
 tasks tagged `+auto` are eligible. The `--autonomous` flag also launches the
-autoscaler; the environment variable alone only changes eligibility. In this
-mode `noauto` is not excluded: remove `auto` to withhold a task.
+autoscaler; the environment variable alone only changes eligibility. `noauto`
+still excludes in this mode: remove `auto` (adding `noauto` is also
+effective) to withhold a task.
 
 ## Two operating modes
 
@@ -86,10 +87,10 @@ Complete command reference: [docs/cli-reference.md](docs/cli-reference.md).
 
 | Tag | Meaning |
 |-----|---------|
-| `noauto` | Excludes default-mode pickup; autonomous mode checks `auto` instead. |
+| `noauto` | Excludes worker pickup in both modes; autonomous mode additionally requires `+auto`. |
 | `auto` | Opt in to worker pickup in autonomous mode (`--autonomous` / `DRAIN_AUTONOMOUS=1`). Only these tasks are eligible. |
 | `drain-failed` | A worker tried this task and couldn't complete it. Re-queue with `task <uuid> modify -drain-failed`, or retry the set with `drain start N --failed`. |
-| `drain-claimed` | In-flight marker while a worker owns a task. Eligible for release by another running worker after 4h of active time; worker liveness is not checked. |
+| `drain-claimed` | In-flight marker while a worker owns a task. Eligible for release by another running worker after 4h of active time, and only when the recorded local worker PID is dead (host-local check; no cross-host detection). |
 
 ## Configuration
 
@@ -140,8 +141,8 @@ requesting:
   work is failed, never marked done.
 
 The prompt instructs the agent to use a feature branch, push it, and open a
-PR for human review. The shell only checks whether Taskwarrior reports
-`completed`; it does not independently validate tests, commits, or PRs.
+PR for human review. Success requires Taskwarrior status `completed` and
+agent exit code 0; the shell does not independently validate tests, commits, or PRs.
 Workers share mapped checkouts, and claims are not atomic. See
 [architecture and limits](docs/architecture.md) before running concurrent workers.
 

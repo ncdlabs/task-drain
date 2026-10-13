@@ -136,7 +136,7 @@ or environment:
 | `task_start` / `task_stop` | Active-work markers |
 | `task_submit_for_review` | → `+ready-for-review` with evidence (never completes) |
 | `task_approve` | Reviewer approval (`-ready-for-review +approved`) |
-| `task_complete` | `task done`; requires `+approved` or `+ready-for-review` (or `force`) |
+| `task_complete` | `task done`; requires `+approved` (or `force` with a `note`) |
 | `task_agent_queue` | Actor's actionable queue (claimed/annotated, not in review) |
 | `task_review_queue` | All `ready-for-review` tasks |
 | `task_blocked_tasks` | All `+blocked` tasks |
