@@ -123,3 +123,61 @@ The default OpenCode model string is a source default, not a guarantee of
 provider availability or price. Validate it in your installed harness before
 starting a queue. Invalid agent flags or unavailable models can fail every
 eligible task in succession.
+
+## YAML Configuration (config.yaml)
+
+Configuration is centralized in `~/.task-drain/config.yaml` (override with `$DRAIN_CONFIG`).
+Environment variables still work and take precedence over the config file.
+
+```yaml
+# Remote hosts for drain CLI management
+remotes:
+  llama:
+    ssh: /home/hatch/bin/llama-ssh   # SSH helper command
+    git_root: /Users/lou/git          # for reference
+
+# Default remote for `drain` commands (empty = local)
+default_remote: llama
+
+# Autoscaler defaults
+autoscaler:
+  min_workers: 1
+  max_workers: 8
+  interval: 30
+
+# Worker defaults (replaces DRAIN_* env vars)
+worker:
+  allow_sudo: false    # DRAIN_ALLOW_SUDO — opt-in privilege fallback for macOS daemons
+  allow_home: false    # DRAIN_ALLOW_HOME — use $HOME when no repo mapping exists
+  autonomous: false    # DRAIN_AUTONOMOUS — opt-in pickup (requires +auto tag)
+  retry_failed: false  # DRAIN_RETRY_FAILED — reprocess drain-failed tasks
+  persist: false       # DRAIN_PERSIST — wait for new jobs after queue empties
+
+# Repository mappings (replaces repos.conf)
+# path: local checkout path (auto-detected as $GIT_ROOT/<project> if omitted)
+# url: remote URL for auto-clone when the repo is missing
+repos:
+  wp-solfoundation-plugin:
+    url: https://github.com/The-Sol-Foundation/wp-solfoundation-plugin.git
+  myproject:
+    path: ~/custom/path
+    url: git@github.com:org/myproject.git
+```
+
+### Remote management
+
+If `default_remote` is set, `drain` commands run on the remote host:
+
+```bash
+drain status              # runs on default_remote (llama)
+drain --local status      # force local execution
+drain --remote llama stop # explicit remote
+```
+
+The remote is accessed via the `ssh` command from the config.
+
+### Auto-clone
+
+When a worker needs a repo that isn't checked out locally, it looks up
+`repos.<project>.url` from the config and clones it to `$GIT_ROOT/<project>`.
+If no URL is configured, the task is parked with `drain-failed`.
