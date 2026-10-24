@@ -83,6 +83,18 @@ Inspect remaining agent processes and task state. Coordinate other hosts
 before releasing shared claims. `drain resume` clears stop files but starts
 nothing; `drain autoscale` does not clear them automatically.
 
+## Supervisor will not start, or two seem to run
+
+Only one supervisor runs per host. `drain autoscale` refuses to start a
+second while the registered supervisor is alive (PID plus command-line
+check). If it reports "already running" for a PID that is not a supervisor
+(`ps -o command= -p <pid>` shows something else), that PID reused the number
+of a dead supervisor: `drain autoscale-stop` clears the stale registration
+without touching that process, then start again. If the pidfile is gone but
+a supervisor process remains (`drain status` warns about orphans), stop that
+PID by hand (`kill -TERM <pid>`), verify it exited, then start again. Never
+delete another host's state; each host owns only its `~/.task-drain/`.
+
 ## Dashboard or PR list is incomplete
 
 Watch syncs only its first frame; restart it to refresh remote state. History

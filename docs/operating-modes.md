@@ -54,7 +54,15 @@ count. An existing supervisor keeps its previous configuration.
 ## Operational controls
 
 - `drain stop` requests graceful completion of current tasks; `drain kill`
-  sends TERM and stops the local supervisor. Cleanup is best-effort.
+  sends TERM and stops the local supervisor. `drain autoscale-stop` signals
+  only the identity-verified supervisor (PID alive plus supervisor command
+  line), waits ~10s, and never kills a reused PID owned by an unrelated
+  process; stale registrations are cleared without signaling anyone.
+  Supervisor shutdown is prompt (interruptible poll sleep) and removes its
+  pidfile only when it still names the stopped process. A supervisor killed
+  with KILL, or one whose pidfile was deleted, leaves stale-or-orphan state
+  that the next `drain autoscale` recovers from instead of being blocked by.
+  Cleanup is otherwise best-effort.
   Default `drain stop` / `all` sets STOP and stops the supervisor even with
   zero workers; `drain stop N` does neither, so use `drain autoscale-stop`
   explicitly in that case.

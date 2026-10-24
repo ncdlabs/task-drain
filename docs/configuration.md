@@ -35,8 +35,9 @@ workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
 |---|---|---|
 | `DRAIN_MIN_WORKERS` | `1` | Minimum workers to keep running (normally set via `drain autoscale --min`) |
 | `DRAIN_MAX_WORKERS` | `8` | Maximum workers to start (normally set via `drain autoscale --max`) |
-| `DRAIN_AUTOSCALE_INTERVAL` | `30` | Seconds between queue-depth checks |
+| `DRAIN_AUTOSCALE_INTERVAL` | `30` | Seconds between queue-depth checks (the poll sleep is interruptible, so SIGTERM stops the supervisor promptly) |
 | `DRAIN_TASKS_PER_WORKER` | `2` | Eligible tasks per worker before scaling up (invalid or nonpositive values reset to 2) |
+| `DRAIN_STARTUP_LOCK_MAX_AGE_SEC` | `120` | A `drain autoscale` launch mutex older than this is treated as stale (crashed starter) and broken by the next starter |
 
 Desired workers = `ceil(eligible / DRAIN_TASKS_PER_WORKER)`, clamped to
 `[min, max]`; `0` eligible with `min 0` scales to zero.
@@ -113,8 +114,10 @@ restart it explicitly to change its project or pickup mode.
 
 `PROJECT_FILTER` already exported in the shell can survive `drain start all`
 and `drain autoscale all`; unset it explicitly for an unrestricted launch.
-Worker detection, stop files, history, and the supervisor PID file are shared
-under HOME, not isolated by project or TASKRC. Direct supervisor mode also
+Worker detection, stop files, history, worker registry, and the supervisor PID file are shared
+under HOME, not isolated by project or TASKRC. Supervisor single-instance
+state is host-local (PID plus command-line identity with a transient launch
+mutex); it does not coordinate supervisors across machines. Direct supervisor mode also
 accepts `DRAIN_SCRIPT` and `LOG_DIR`; these are internal launch controls.
 `DRAIN_NO_SYNC` suppresses dashboard sync when nonempty and is set internally
 on watch refreshes. It is not a worker offline-mode switch.

@@ -81,6 +81,8 @@ TASK="${TASK:-$(command -v task || true)}"
 # Source shared worker detection functions
 # shellcheck source=lib/worker-detect.sh
 source "$SCRIPT_DIR/lib/worker-detect.sh"
+# shellcheck source=lib/supervisor.sh
+source "$SCRIPT_DIR/lib/supervisor.sh"
 
 die() { echo "drain: $*" >&2; exit 1; }
 
@@ -152,7 +154,7 @@ cmd_start() { # [N] [project|all] [--failed] [--persist] [--autonomous]
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer"
   [ "$n" -le 8 ] || die "max 8 workers"
   [ "$project" = "all" ] && project=""
-  if [ "$autonomous" = 1 ] && [ -f "$DRAIN_HOME/autoscale.pid" ] && kill -0 "$(cat "$DRAIN_HOME/autoscale.pid")" 2>/dev/null; then
+  if [ "$autonomous" = 1 ] && supervisor_is_live; then
     die "Supervisor already running; use autoscale-stop before changing mode/project"
   fi
   mkdir -p "$LOG_DIR"
@@ -186,8 +188,8 @@ cmd_start() { # [N] [project|all] [--failed] [--persist] [--autonomous]
   fi
   if [ "$autonomous" = 1 ]; then
     echo "Autonomous mode: opt-in pickup (tasks need +auto tag)."
-    if [ -f "$DRAIN_HOME/autoscale.pid" ] && kill -0 "$(cat "$DRAIN_HOME/autoscale.pid")" 2>/dev/null; then
-      echo "autoscaler already running (pid $(cat "$DRAIN_HOME/autoscale.pid"))."
+    if supervisor_is_live; then
+      echo "autoscaler already running (pid $(supervisor_registered_pid))."
     else
       cmd_autoscale "${project:-all}"
     fi
@@ -236,20 +238,42 @@ cmd_autoscale() { # [project] [--min N] [--max N]
   [[ "$max_w" =~ ^[1-9][0-9]*$ ]] || die "--max must be a positive integer"
   [ "$min_w" -le "$max_w" ] || die "--min cannot exceed --max"
 
-  local pidfile="$DRAIN_HOME/autoscale.pid"
-  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-    die "autoscaler already running (pid $(cat "$pidfile")). 'drain autoscale-stop' first."
+  local pidfile
+  pidfile="$(supervisor_pidfile)"
+  # Serialize the check-and-launch window so two concurrent invocations
+  # cannot both pass the liveness check and start duplicate supervisors.
+  # One short retry covers the millisecond window where a legitimate
+  # starter holds the mutex between its check and its pidfile write.
+  if ! supervisor_acquire_launch_lock; then
+    sleep 2
+    if ! supervisor_acquire_launch_lock; then
+      if supervisor_is_live; then
+        die "autoscaler already running (pid $(supervisor_registered_pid)). 'drain autoscale-stop' first."
+      fi
+      die "another autoscale startup is in progress; retry in a few seconds."
+    fi
+  fi
+  if supervisor_is_live; then
+    supervisor_release_launch_lock
+    die "autoscaler already running (pid $(supervisor_registered_pid)). 'drain autoscale-stop' first."
+  fi
+  # Stale pidfile (dead PID, PID reuse by an unrelated process, or garbage):
+  # never blocks startup. Remove only when provably not a live supervisor.
+  if [ -f "$pidfile" ]; then
+    rm -f "$pidfile"
+    echo "note: removed stale supervisor state."
   fi
 
   mkdir -p "$LOG_DIR"
   export PROJECT_FILTER="$project"
   export DRAIN_MIN_WORKERS="$min_w" DRAIN_MAX_WORKERS="$max_w"
 
-  [ ! -e "$STOP_FILE" ] || die "STOP is set; run drain resume before starting a supervisor"
+  [ ! -e "$STOP_FILE" ] || { supervisor_release_launch_lock; die "STOP is set; run drain resume before starting a supervisor"; }
   echo "starting autoscaler (min=$min_w max=$max_w${project:+ project=$project})..."
   nohup bash "$DRAIN_SCRIPT" autoscale >>"$LOG_DIR/autoscale.log" 2>&1 &
   echo $! > "$pidfile"
   echo "autoscaler running (pid $!). 'drain autoscale-stop' to halt."
+  supervisor_release_launch_lock
 }
 
 cmd_autoscale_stop() {
@@ -259,19 +283,34 @@ cmd_autoscale_stop() {
 }
 
 stop_autoscaler() {
-  # TERM the autoscale supervisor so it can't respawn workers after a
-  # kill/force stop. The supervisor's cmdline ("...task-drain.sh autoscale")
-  # does NOT match the worker pkill pattern (anchored at task-drain.sh$),
-  # so it needs both the pidfile kill and the pattern as a backstop.
-  local pidfile="$DRAIN_HOME/autoscale.pid" pid
-  # Stop only the supervisor recorded by this installation.
+  # TERM only the verified supervisor: the pidfile PID must be alive AND
+  # its command line must match the supervisor pattern. A stale pidfile
+  # (dead PID, garbage, or a reused PID now owned by an unrelated process)
+  # never authorizes a kill — it is cleaned up without signaling anyone.
+  # The pidfile is removed only when it still names the PID we stopped
+  # (or a provably non-supervisor value), never a successor's file.
+  local pidfile pid attempt
+  pidfile="$(supervisor_pidfile)"
   [ -f "$pidfile" ] || return 0
-  pid=$(cat "$pidfile" 2>/dev/null || true)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
-    echo "autoscaler (pid $pid) stopping."
+  if ! supervisor_is_live; then
+    pid=$(cat "$pidfile" 2>/dev/null | tr -d ' \t\n' || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ! supervisor_cmd_matches "$pid"; then
+      echo "stale supervisor state (pid $pid is not a supervisor); leaving that process alone." >&2
+    fi
+    rm -f "$pidfile"
+    return 0
   fi
-  rm -f "$pidfile"
+  pid=$(supervisor_registered_pid)
+  kill -TERM "$pid" 2>/dev/null || true
+  echo "autoscaler (pid $pid) stopping."
+  for attempt in $(seq 1 10); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "autoscaler (pid $pid) still running after TERM; not escalating automatically. Inspect before 'kill -KILL $pid'." >&2
+  fi
+  supervisor_remove_pidfile_if "$pid" || true
 }
 
 signal_workers() {

@@ -94,3 +94,37 @@ conjunction, reclaim liveness check, worker claim/review exclusions,
 setup overwrite/symlink handling) and were corrected in place. The
 `noauto`-in-autonomous question is recorded as pending owner policy, not
 decided here.
+
+## 2026-10-24 — Supervisor single-instance guard and PID-identity checks
+
+**Context.** Regression testing launched several real autoscalers that
+survived as PPID-1 orphans with no pidfile registration, while `drain status`
+reported zero workers (supervisors are tracked separately and were never
+counted). SIGTERM did not stop them within seconds, and the old
+check-then-launch (`[ -f pidfile ] && kill -0 $(cat pidfile)`) had a
+check-and-launch race, trusted PIDs without command-line verification, and
+removed the pidfile unconditionally on stop.
+
+**Decision.** Guard `drain autoscale` / `autoscale-stop` / `status` with
+`lib/supervisor.sh`: liveness is PID plus `task-drain.sh … autoscale`
+command-line identity; concurrent launches serialize through a transient
+`autoscale.starting` mkdir mutex; stale registrations (dead PID, garbage,
+or PID reuse) never block startup and never authorize a kill; the
+supervisor's poll sleep is interruptible so TERM exits promptly; pidfile
+removal happens only under the launch mutex while it still names the exiting
+process. `drain status` warns about unregistered (orphan) supervisors and no
+longer aborts its queue section when the task query fails.
+
+**Alternatives considered.**
+- `flock`-based locking — rejected: not installed by default on macOS and
+  a new dependency for a shell project; `mkdir` atomicity is sufficient for
+  the millisecond check-and-launch window.
+- A per-project supervisor registry — rejected: changes the existing
+  one-supervisor-per-host behavior and CLI contract; the guard preserves it.
+- Claiming the supervisor lock also fixes cross-host double-claim — rejected
+  as a claim: host-local state cannot coordinate machines sharing the
+  TaskChampion pool. Documented as a remaining risk instead.
+
+**Follow-up.** Each host still runs at most one supervisor; operators must
+coordinate across hosts. Test fixtures use isolated HOME plus stub scripts
+named `task-drain.sh`, never real workers or the production queue.

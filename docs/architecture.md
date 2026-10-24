@@ -94,8 +94,14 @@ can leave local mutations applied. None of these operations is transactional.
 - Stop controls are host-local. They do not stop workers on other machines
   sharing the same TaskChampion pool. TERM cleanup is best-effort; hard kills,
   detached descendants, or sync failures can leave work or claims behind.
-- The autoscaler counts host processes matching the script path, not just
-  workers for its project. Its one PID file is shared across project runs.
+- The autoscaler counts host processes matching the script path whose recorded
+  project filter matches its own (file-backed worker registry), not just
+  workers for its project. Its one PID file is shared across project runs:
+  only one supervisor runs per host, and a second `drain autoscale` (any
+  project) is rejected while it is alive. Liveness is verified by PID plus
+  command-line identity, so PID reuse by an unrelated process can neither
+  block startup nor cause a kill; a transient `autoscale.starting` mutex
+  serializes concurrent launches.
 
 ## Plugin and worker coexistence
 

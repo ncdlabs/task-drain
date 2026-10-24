@@ -84,8 +84,16 @@ Supervisor daemon: watches queue depth and scales workers to match —
 (defaults 1 and 8; env: `DRAIN_MIN_WORKERS`, `DRAIN_MAX_WORKERS`).
 Checks every `DRAIN_AUTOSCALE_INTERVAL` seconds (default 30). Scale-down is
 graceful (per-worker STOP files — workers finish their current task).
-Exits on the global STOP file or SIGTERM. PID tracked in
-`~/.task-drain/autoscale.pid`.
+Exits on the global STOP file or SIGTERM (TERM is handled promptly; the
+poll sleep is interruptible). Single instance per host: concurrent launches
+serialize through a transient `autoscale.starting` mutex and a second
+launch is rejected while the registered supervisor is alive. Liveness is
+PID plus command-line identity — a pidfile pointing at a dead PID, garbage,
+or a reused PID now owned by an unrelated process is stale: it never blocks
+a fresh start and never authorizes a kill. Registration lives in
+`~/.task-drain/autoscale.pid`. Always start via `drain autoscale`; a
+supervisor launched by hand (`bash task-drain.sh autoscale`) runs
+unregistered and is reported as an orphan by `drain status`.
 
 ```bash
 drain autoscale                       # min 1, max 8, all projects
@@ -95,7 +103,11 @@ drain autoscale --min 0 --max 10      # scales to zero when the queue is empty
 
 ### `drain autoscale-stop`
 
-Stop the autoscaler daemon. Workers already running are **not** affected —
+Stop the autoscaler daemon. Signals only the identity-verified supervisor
+(PID alive and command line matches); a reused PID owned by an unrelated
+process is left alone and the stale registration is cleared. Waits up to
+~10s after TERM and warns instead of escalating to KILL automatically.
+Workers already running are **not** affected —
 they keep working until the queue empties or they are stopped.
 
 ### `drain unfail [project]`
@@ -183,7 +195,8 @@ bash /absolute/path/to/task-drain/task-drain.sh [run|status|history|pr-list|watc
 |---|---|
 | `STOP` | Global kill switch — graceful stop for workers and autoscaler |
 | `STOP.<pid>` | Per-worker graceful stop |
-| `autoscale.pid` | Running autoscaler supervisor PID |
+| `autoscale.pid` | Running autoscaler supervisor PID (advisory; liveness is PID + command-line identity) |
+| `autoscale.starting` | Transient launch mutex, held only during `drain autoscale` startup; a leftover older than `DRAIN_STARTUP_LOCK_MAX_AGE_SEC` (default 120s) is treated as stale |
 | `repos.conf` | Project → repo mappings (highest precedence) |
 | `history.log` | Processed-task history (TSV, rolling window) |
 | `logs/` | Worker logs and `autoscale.log` |

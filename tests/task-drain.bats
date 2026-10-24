@@ -77,6 +77,7 @@ teardown() {
 # Source shared libraries first
 source "$SCRIPT_DIR/lib/display.sh"
 source "$SCRIPT_DIR/lib/worker-detect.sh"
+source "$SCRIPT_DIR/lib/supervisor.sh"
 
 # Extract and source only the function/variable definitions from task-drain.sh
 # (everything before the "case" statement at the bottom)
@@ -333,13 +334,47 @@ load_functions() {
     [ "$status" -ne 0 ]
 }
 
-@test "drain autoscale --min 2 --max 4 parses correctly" {
-    # Pre-seed the pidfile with a live PID so the "already running" guard
-    # fires and the command exits without spawning a real autoscaler daemon
-    # (setup fakes HOME, so the real pidfile is never seen here).
-    echo $$ > "$HOME/.task-drain/autoscale.pid"
-    run "$SCRIPT_DIR/drain" autoscale --min 2 --max 4
-    [[ "$output" != *"unexpected argument"* ]]
+@test "drain autoscale rejects --min exceeding --max without launching" {
+    # Dies during argument validation, before any pidfile/lock is touched:
+    # no supervisor can be started by this invocation.
+    rm -f "$HOME/.task-drain/autoscale.pid"
+    run "$SCRIPT_DIR/drain" autoscale --min 5 --max 2
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot exceed"* ]]
+    [ ! -f "$HOME/.task-drain/autoscale.pid" ]
+}
+
+@test "drain autoscale rejects non-numeric --min without launching" {
+    rm -f "$HOME/.task-drain/autoscale.pid"
+    run "$SCRIPT_DIR/drain" autoscale --min abc
+    [ "$status" -ne 0 ]
+    [ ! -f "$HOME/.task-drain/autoscale.pid" ]
+}
+
+@test "drain autoscale refuses a second concurrent launch" {
+    # A live supervisor whose cmdline matches the supervisor pattern is
+    # registered; a second `drain autoscale` must be rejected, never start
+    # a duplicate. Stub path contains task-drain.sh so identity checks match.
+    local stub="$BATS_TEST_TMPDIR/task-drain.sh"
+    cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+SLEEP=""
+trap 'kill $SLEEP 2>/dev/null; exit 0' TERM INT
+while true; do sleep 30 & SLEEP=$!; wait $SLEEP || true; done
+STUB
+    chmod +x "$stub"
+    "$stub" autoscale </dev/null >>"$BATS_TEST_TMPDIR/sup.log" 2>&1 &
+    local sup=$!
+    echo "$sup" > "$HOME/.task-drain/autoscale.pid"
+    run "$SCRIPT_DIR/drain" autoscale --min 1 --max 2
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"already running"* ]]
+    # Exactly one supervisor exists: the pre-registered stub.
+    local count
+    count=$(pgrep -f "task-drain.sh.*autoscale" | wc -l | tr -d ' ')
+    kill "$sup" 2>/dev/null || true
+    wait "$sup" 2>/dev/null || true
+    [ "$count" = "1" ]
 }
 
 @test "drain help start shows --persist option" {
@@ -728,7 +763,18 @@ STUB
 @test "stop_autoscaler stops the supervisor via pidfile and removes it" {
     eval "$(sed -n '/^stop_autoscaler() {/,/^}/p' "$SCRIPT_DIR/drain")"
     export DRAIN_HOME="$HOME/.task-drain"
-    sleep 60 &
+    # Identity-verified stop requires the supervisor cmdline pattern, so the
+    # fixture is a stub named task-drain.sh running with the autoscale verb
+    # (a bare `sleep` must NOT be killable — see the PID-reuse test below).
+    local stub="$BATS_TEST_TMPDIR/task-drain.sh"
+    cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+SLEEP=""
+trap 'kill $SLEEP 2>/dev/null; exit 0' TERM INT
+while true; do sleep 30 & SLEEP=$!; wait $SLEEP || true; done
+STUB
+    chmod +x "$stub"
+    "$stub" autoscale </dev/null >>"$BATS_TEST_TMPDIR/sup.log" 2>&1 &
     local sup=$!
     echo "$sup" > "$DRAIN_HOME/autoscale.pid"
     run stop_autoscaler
@@ -1055,4 +1101,198 @@ MOCK
     grep -Eq \
       '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] \[test-worker-123\]' \
       "$stderr_file"
+}
+
+# --- supervisor lifecycle (single-instance guard, PID safety, cleanup) ---
+# All fixtures use isolated HOME (fake-home) and BATS_TEST_TMPDIR paths, so
+# production state (~/.task-drain/autoscale.pid) is never touched. Fixture
+# stdio is file-backed (never Bats pipes) and every spawned process is
+# killed and reaped before assertions.
+
+supervisor_stub() { # $1 = path to write a task-drain.sh-named stub
+    cat > "$1" <<'STUB'
+#!/usr/bin/env bash
+SLEEP=""
+trap 'kill $SLEEP 2>/dev/null; exit 0' TERM INT
+while true; do sleep 30 & SLEEP=$!; wait $SLEEP || true; done
+STUB
+    chmod +x "$1"
+}
+
+@test "supervisor first launch registers and is detected as live" {
+    supervisor_stub "$BATS_TEST_TMPDIR/task-drain.sh"
+    export DRAIN_HOME="$HOME/.task-drain"
+    "$BATS_TEST_TMPDIR/task-drain.sh" autoscale </dev/null >>"$BATS_TEST_TMPDIR/sup.log" 2>&1 &
+    local sup=$!
+    echo "$sup" > "$DRAIN_HOME/autoscale.pid"
+    run supervisor_is_live
+    [ "$status" -eq 0 ]
+    [ "$(supervisor_registered_pid)" = "$sup" ]
+    kill "$sup" 2>/dev/null || true
+    wait "$sup" 2>/dev/null || true
+}
+
+@test "supervisor concurrent second launch is rejected" {
+    supervisor_stub "$BATS_TEST_TMPDIR/task-drain.sh"
+    export DRAIN_HOME="$HOME/.task-drain"
+    "$BATS_TEST_TMPDIR/task-drain.sh" autoscale </dev/null >>"$BATS_TEST_TMPDIR/sup.log" 2>&1 &
+    local sup=$!
+    echo "$sup" > "$DRAIN_HOME/autoscale.pid"
+    # Second starter must fail to acquire meaningful ownership: liveness
+    # holds, so it must back off instead of launching a duplicate.
+    run supervisor_is_live
+    [ "$status" -eq 0 ]
+    local count
+    count=$(pgrep -f "task-drain.sh.*autoscale" | wc -l | tr -d ' ')
+    kill "$sup" 2>/dev/null || true
+    wait "$sup" 2>/dev/null || true
+    [ "$count" = "1" ]
+}
+
+@test "supervisor stale pidfile (dead PID) does not block startup" {
+    export DRAIN_HOME="$HOME/.task-drain"
+    # PID that is certainly dead: spawn and reap a trivial process.
+    true &
+    local dead=$!
+    wait "$dead" 2>/dev/null || true
+    echo "$dead" > "$DRAIN_HOME/autoscale.pid"
+    run supervisor_is_live
+    [ "$status" -ne 0 ]
+    # A fresh starter may acquire the launch mutex and clear the stale file.
+    supervisor_acquire_launch_lock
+    rm -f "$DRAIN_HOME/autoscale.pid"
+    supervisor_release_launch_lock
+    [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+}
+
+@test "supervisor stale pidfile (garbage) does not block startup" {
+    export DRAIN_HOME="$HOME/.task-drain"
+    echo "not-a-pid" > "$DRAIN_HOME/autoscale.pid"
+    run supervisor_is_live
+    [ "$status" -ne 0 ]
+    run supervisor_registered_pid
+    [ "$status" -ne 0 ]
+    rm -f "$DRAIN_HOME/autoscale.pid"
+    [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+}
+
+@test "supervisor PID reuse by an unrelated process is never treated as live" {
+    export DRAIN_HOME="$HOME/.task-drain"
+    sleep 60 </dev/null >>"$BATS_TEST_TMPDIR/sleep.log" 2>&1 &
+    local other=$!
+    echo "$other" > "$DRAIN_HOME/autoscale.pid"
+    run supervisor_is_live
+    [ "$status" -ne 0 ]
+    # stop_autoscaler must clean the stale file WITHOUT killing the process.
+    eval "$(sed -n '/^stop_autoscaler() {/,/^}/p' "$SCRIPT_DIR/drain")"
+    run stop_autoscaler
+    [ "$status" -eq 0 ]
+    [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+    kill -0 "$other" 2>/dev/null
+    kill "$other" 2>/dev/null || true
+    wait "$other" 2>/dev/null || true
+}
+
+@test "supervisor SIGTERM exits promptly and cleans its own pidfile" {
+    export DRAIN_HOME="$HOME/.task-drain"
+    export DRAIN_MIN_WORKERS=0
+    export DRAIN_MAX_WORKERS=1
+    export DRAIN_AUTOSCALE_INTERVAL=1
+    export DRAIN_SYNC_RETRY_DELAY=0
+    # Empty queue from the mock task + min 0 => desired 0: no workers spawn,
+    # so this exercises the real supervisor loop with zero side effects.
+    bash "$SCRIPT_DIR/task-drain.sh" autoscale </dev/null >>"$BATS_TEST_TMPDIR/sup.log" 2>&1 &
+    local sup=$!
+    echo "$sup" > "$DRAIN_HOME/autoscale.pid"
+    sleep 1
+    kill -0 "$sup" 2>/dev/null
+    local start end elapsed
+    start=$(date +%s)
+    kill -TERM "$sup" 2>/dev/null
+    local i
+    for i in $(seq 1 10); do
+        kill -0 "$sup" 2>/dev/null || break
+        sleep 0.5
+    done
+    end=$(date +%s)
+    elapsed=$((end - start))
+    ! kill -0 "$sup" 2>/dev/null
+    wait "$sup" 2>/dev/null || true
+    [ "$elapsed" -lt 5 ]
+    [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+    unset DRAIN_MIN_WORKERS DRAIN_MAX_WORKERS DRAIN_AUTOSCALE_INTERVAL DRAIN_SYNC_RETRY_DELAY
+}
+
+@test "supervisor hard termination is recoverable on next startup" {
+    supervisor_stub "$BATS_TEST_TMPDIR/task-drain.sh"
+    export DRAIN_HOME="$HOME/.task-drain"
+    "$BATS_TEST_TMPDIR/task-drain.sh" autoscale </dev/null >>"$BATS_TEST_TMPDIR/sup.log" 2>&1 &
+    local sup=$!
+    echo "$sup" > "$DRAIN_HOME/autoscale.pid"
+    kill -KILL "$sup" 2>/dev/null
+    wait "$sup" 2>/dev/null || true
+    run supervisor_is_live
+    [ "$status" -ne 0 ]
+    # Next starter acquires the mutex and clears the stale registration.
+    supervisor_acquire_launch_lock
+    rm -f "$DRAIN_HOME/autoscale.pid"
+    supervisor_release_launch_lock
+    [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+}
+
+@test "supervisor stop does not terminate unrelated workers" {
+    supervisor_stub "$BATS_TEST_TMPDIR/task-drain.sh"
+    export DRAIN_HOME="$HOME/.task-drain"
+    eval "$(sed -n '/^stop_autoscaler() {/,/^}/p' "$SCRIPT_DIR/drain")"
+    # An unrelated live process reusing the pidfile PID ...
+    sleep 60 </dev/null >>"$BATS_TEST_TMPDIR/s1.log" 2>&1 &
+    local other=$!
+    # ... plus a fake worker (matches the worker pattern, not supervisor).
+    "$BATS_TEST_TMPDIR/task-drain.sh" </dev/null >>"$BATS_TEST_TMPDIR/w.log" 2>&1 &
+    local worker=$!
+    echo "$other" > "$DRAIN_HOME/autoscale.pid"
+    run stop_autoscaler
+    [ "$status" -eq 0 ]
+    kill -0 "$other" 2>/dev/null
+    kill -0 "$worker" 2>/dev/null
+    kill "$other" "$worker" 2>/dev/null || true
+    wait "$other" 2>/dev/null || true
+    wait "$worker" 2>/dev/null || true
+}
+
+@test "supervisor repeated start-stop cycles leak no processes" {
+    supervisor_stub "$BATS_TEST_TMPDIR/task-drain.sh"
+    export DRAIN_HOME="$HOME/.task-drain"
+    eval "$(sed -n '/^stop_autoscaler() {/,/^}/p' "$SCRIPT_DIR/drain")"
+    local before after i sup
+    before=$(pgrep -f "task-drain.sh.*autoscale" | wc -l | tr -d ' ')
+    for i in 1 2 3; do
+        "$BATS_TEST_TMPDIR/task-drain.sh" autoscale </dev/null >>"$BATS_TEST_TMPDIR/cyc-$i.log" 2>&1 &
+        sup=$!
+        echo "$sup" > "$DRAIN_HOME/autoscale.pid"
+        run stop_autoscaler
+        [ "$status" -eq 0 ]
+        wait "$sup" 2>/dev/null || true
+        [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+    done
+    after=$(pgrep -f "task-drain.sh.*autoscale" | wc -l | tr -d ' ')
+    [ "$after" = "$before" ]
+}
+
+@test "supervisor TERM leaves no sleep child behind" {
+    supervisor_stub "$BATS_TEST_TMPDIR/task-drain.sh"
+    "$BATS_TEST_TMPDIR/task-drain.sh" autoscale </dev/null >>"$BATS_TEST_TMPDIR/sup.log" 2>&1 &
+    local sup=$!
+    sleep 0.5
+    kill -TERM "$sup" 2>/dev/null
+    local i
+    for i in $(seq 1 10); do
+        kill -0 "$sup" 2>/dev/null || break
+        sleep 0.5
+    done
+    wait "$sup" 2>/dev/null || true
+    # No orphaned sleep children of the dead supervisor may remain.
+    local leftovers
+    leftovers=$(pgrep -P "$sup" 2>/dev/null | wc -l | tr -d ' ')
+    [ "$leftovers" = "0" ]
 }

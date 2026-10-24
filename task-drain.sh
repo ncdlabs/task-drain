@@ -12,6 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 source "$SCRIPT_DIR/lib/display.sh"
 # shellcheck source=lib/worker-detect.sh
 source "$SCRIPT_DIR/lib/worker-detect.sh"
+# shellcheck source=lib/supervisor.sh
+source "$SCRIPT_DIR/lib/supervisor.sh"
 #
 # task-drain.sh -- autonomous drain worker for the shared Taskwarrior pool.
 #
@@ -786,14 +788,20 @@ cmd_status() {
 	[[ "$nworkers" =~ ^[0-9]+$ ]] || nworkers=0
 
 	# --- kill switch / autoscale state ---
+	# Liveness is PID + command-line identity, never the pidfile alone, so
+	# a reused PID owned by an unrelated process is not mistaken for us.
 	local ks_dot
 	if stop_requested; then
 		ks_dot="${R}■ STOPPED${RESET}"
-	elif [ -f "$HOME/.task-drain/autoscale.pid" ] && kill -0 "$(cat "$HOME/.task-drain/autoscale.pid" 2>/dev/null)" 2>/dev/null; then
+	elif supervisor_is_live; then
 		ks_dot="${C}◈ AUTOSCALE${RESET}"
 	else
 		ks_dot="${G}● LIVE${RESET}"
 	fi
+	# Orphaned supervisors: live supervisor processes with no (matching)
+	# pidfile registration — e.g. pidfile deleted, or started by hand.
+	local orphan_pids=""
+	orphan_pids=$(supervisor_orphan_pids || true)
 
 	# --- queue counts, pending-scoped to match the tagging system (see `drain docs`) ---
 	# Eligibility == pick_task(): drain_elig_filter() (+PENDING -ACTIVE -WAITING
@@ -806,7 +814,8 @@ cmd_status() {
 	# for clarity.)
 	local n_elig n_active n_blocked n_waiting n_noauto n_failed n_done
 	local n_claimed_active n_interactive n_stale n_pending_total
-	n_elig=$(queue_json | jq length)
+	n_elig=$(queue_json 2>/dev/null | jq length 2>/dev/null || echo 0)
+	[[ "$n_elig" =~ ^[0-9]+$ ]] || n_elig=0
 	n_active=$(tq +ACTIVE count 2>/dev/null || echo "?")
 	n_blocked=$(tq +PENDING +BLOCKED count 2>/dev/null || echo "?")
 	n_waiting=$(tq +WAITING count 2>/dev/null || echo "?")
@@ -845,6 +854,9 @@ cmd_status() {
 
 	# ================= header =================
 	printf '%sDRAIN STATUS%s  %s  ·  %s · %s\n' "$B" "$RESET" "$(date '+%a %F %T %Z')" "$sync_state" "$ks_dot"
+	if [ -n "$orphan_pids" ]; then
+		printf '  %s! orphan autoscaler(s) without pidfile registration (pid %s) — stop by hand or remove state, then restart via drain autoscale%s\n' "$Y" "$(printf '%s' "$orphan_pids" | tr '\n' ' ')" "$RESET"
+	fi
 	if [ -n "${PROJECT_FILTER:-}" ]; then printf '  scope: project=%s\n' "$PROJECT_FILTER"; fi
 	if [ -n "${PROJECT_FILTER:-}" ] && [ "${n_pending_total:-}" = "0" ]; then
 		printf '  %s(no pending tasks in project %s — check the name with: task _projects)%s\n' "$DIM" "$PROJECT_FILTER" "$RESET"
@@ -1571,6 +1583,33 @@ autoscale_supervisor() {
 	: "${DRAIN_SCRIPT:=$0}"
 	: "${LOG_DIR:=$HOME/.task-drain/logs}"
 	mkdir -p "$LOG_DIR" 2>/dev/null || true
+	# The supervisor's foreground sleep must be interruptible: a plain
+	# `sleep N` in the loop body defers TERM/INT trap handling until the
+	# sleep finishes (up to DRAIN_AUTOSCALE_INTERVAL). Backgrounding the
+	# sleep and waiting on it lets the trap fire immediately.
+	SLEEP_PID=""
+	_supervisor_sleep() { # $1 = seconds
+		sleep "$1" &
+		SLEEP_PID=$!
+		wait "$SLEEP_PID" || true
+		SLEEP_PID=""
+	}
+	# Pidfile lifecycle: `drain autoscale` (the parent) writes the pidfile
+	# before we start. We remove it on exit only while holding the launch
+	# mutex and only when it still names us — never a successor's file.
+	_supervisor_release_state() {
+		local cur
+		supervisor_acquire_launch_lock 2>/dev/null || return 0
+		cur=$(cat "$(supervisor_pidfile)" 2>/dev/null | tr -d ' \t\n' || true)
+		if [ "$cur" = "$$" ]; then rm -f "$(supervisor_pidfile)"; fi
+		supervisor_release_launch_lock 2>/dev/null || true
+	}
+	_supervisor_on_signal() {
+		log "autoscaler stopping"
+		[ -z "${SLEEP_PID:-}" ] || kill "$SLEEP_PID" 2>/dev/null || true
+		_supervisor_release_state
+		exit 0
+	}
 	# tq: task query helper (mirrors cmd_status's local one; not in scope here)
 	tq() {
 		if [ -n "${PROJECT_FILTER:-}" ]; then
@@ -1588,23 +1627,24 @@ autoscale_supervisor() {
 	[[ "$tasks_per_worker" =~ ^[1-9][0-9]*$ ]] || tasks_per_worker=2
 	log "autoscaler starting (min=$min_w max=$max_w interval=${interval}s)"
 
-	trap 'log "autoscaler stopping"; exit 0' TERM INT
+	trap _supervisor_on_signal TERM INT
 
 	while true; do
 		# Stop if kill switch tripped
 		if [ -e "$STOP_FILE" ]; then
 			log "autoscaler: STOP file present, exiting"
+			_supervisor_release_state
 			exit 0
 		fi
 
 		# Sync and count eligible tasks
 		sync_with_retry >/dev/null 2>&1 || {
 			log "autoscaler: sync failed; no scaling performed"
-			sleep "$interval"
+			_supervisor_sleep "$interval"
 			continue
 		}
 		local eligible
-		eligible=$(queue_json | jq length)
+		eligible=$(queue_json 2>/dev/null | jq length 2>/dev/null || echo 0)
 		[[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
 
 		# Count running workers.
@@ -1627,7 +1667,7 @@ autoscale_supervisor() {
 			for _i in $(seq 1 "$to_start"); do
 				local logf="$LOG_DIR/worker-$(date '+%Y%m%d-%H%M%S')-autoscale-$_i.log"
 				nohup bash "$DRAIN_SCRIPT" >>"$logf" 2>&1 &
-				sleep 5 # stagger spawns: concurrent initial syncs overwhelm taskserver
+				_supervisor_sleep 5 # stagger spawns: concurrent initial syncs overwhelm taskserver
 			done
 		elif [ "$desired" -lt "$running" ]; then
 			local to_stop=$((running - desired))
@@ -1640,7 +1680,7 @@ autoscale_supervisor() {
 			done
 		fi
 
-		sleep "$interval"
+		_supervisor_sleep "$interval"
 	done
 }
 
