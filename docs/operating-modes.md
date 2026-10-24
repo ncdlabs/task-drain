@@ -82,5 +82,8 @@ count. An existing supervisor keeps its previous configuration.
 
 Use the plugin when an agent client should manage task lifecycle explicitly.
 Use workers for well-specified tasks with suitable repository isolation and
-an understood permission configuration. See [troubleshooting](troubleshooting.md)
+an understood permission configuration. Run autonomous workers or a
+supervisor on at most one host: cross-host task claiming has no atomicity
+(see [architecture](architecture.md)), so a second autonomous host can
+double-execute tasks. See [troubleshooting](troubleshooting.md)
 for recovery and [uninstall](uninstall.md) for preserving server data.

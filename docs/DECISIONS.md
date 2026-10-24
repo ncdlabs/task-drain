@@ -128,3 +128,37 @@ longer aborts its queue section when the task query fails.
 **Follow-up.** Each host still runs at most one supervisor; operators must
 coordinate across hosts. Test fixtures use isolated HOME plus stub scripts
 named `task-drain.sh`, never real workers or the production queue.
+
+## 2026-10-24 — Final review: worker registry pruning, cross-host claim analysis
+
+**Context.** Independent re-review of `8390832` plus controlled production
+validation. The registry `~/.task-drain/workers/<pid>` (written once at
+worker startup, removed on EXIT trap) was never pruned: a worker killed with
+KILL leaves a stale entry, and a later PID reuse matching the recorded
+project filter miscounts scale-up/scale-down. The cross-host claim window
+was demonstrated empirically: two `claim_task` runs against replicas that
+had not yet synced each other's claim both succeeded (both would launch
+agents), because Taskwarrior/TaskChampion offer no compare-and-swap —
+`modify`/`annotate`/`start`/`sync` is a non-atomic sequence and
+last-writer-wins on convergence.
+
+**Decision.** Prune dead-PID registry entries inside `scoped_worker_pids`
+(remove the entry file only, only when `kill -0` fails, never signaling
+anyone). Same-host double execution stays prevented by the per-task
+`locks/<uuid>` mutex (verified in code and covered by the existing
+exactly-one-acquires test). Cross-host gets no code change: without a
+server-side atomic primitive any client-side check is still racy, so the
+fix is a deployment constraint — autonomous execution on at most one host —
+plus a fail-closed rule (sync failure aborts the claim; `start` failure
+aborts the claim) and an operator rule (never `force:true`-claim
+`drain-claimed` tasks while workers run). Task-lock (`locks/<uuid>`)
+staleness after KILL remains operator-recovered (`rm` the entry); only the
+registry is auto-pruned.
+
+**Alternatives considered.**
+- Client-side post-claim re-verification (re-export, check our annotation
+  is last) — rejected: still racy under the same sync latency, adds
+  complexity without atomicity.
+- Redis/Postgres/Kubernetes coordination — rejected per scope: unneeded for
+  the documented single-host deployment model; recorded as the prerequisite
+  if multi-host autonomy is ever required.

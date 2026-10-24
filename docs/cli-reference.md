@@ -197,6 +197,7 @@ bash /absolute/path/to/task-drain/task-drain.sh [run|status|history|pr-list|watc
 | `STOP.<pid>` | Per-worker graceful stop |
 | `autoscale.pid` | Running autoscaler supervisor PID (advisory; liveness is PID + command-line identity) |
 | `autoscale.starting` | Transient launch mutex, held only during `drain autoscale` startup; a leftover older than `DRAIN_STARTUP_LOCK_MAX_AGE_SEC` (default 120s) is treated as stale |
+| `workers/` | Per-worker registry (`workers/<pid>` = project filter); entries for dead PIDs are pruned by the supervisor's count pass, never signaled |
 | `repos.conf` | Project → repo mappings (highest precedence) |
 | `history.log` | Processed-task history (TSV, rolling window) |
 | `logs/` | Worker logs and `autoscale.log` |

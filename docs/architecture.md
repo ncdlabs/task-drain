@@ -79,8 +79,16 @@ can leave local mutations applied. None of these operations is transactional.
 ## Concurrency and isolation
 
 - Selection and claim are separate operations without a distributed lock or
-  compare-and-swap. Two workers can execute the same task. A published claim
-  reduces this window but does not provide exactly-once execution.
+  compare-and-swap. On one host, simultaneous workers are serialized by a
+  host-local per-task lock (`~/.task-drain/locks/<uuid>`), so two local
+  workers cannot execute the same task. Across hosts there is no mutual
+  exclusion: two machines whose pre-claim syncs both predate the other's
+  published claim will each run an agent on the same task. A published claim
+  narrows this window but does not provide exactly-once execution.
+  **Autonomous execution is therefore single-host: run workers or a
+  supervisor on at most one machine.** A plugin `claim` with `force:true`
+  can take over a `drain-claimed` task; never force-claim drain-owned tasks
+  while autonomous workers run.
 - Workers use the mapped checkout directly and do not create worktrees.
   Drain workers serialize Git operations per repository with a host-local
   lock, so two drain workers never run agents in the same checkout

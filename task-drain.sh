@@ -1568,14 +1568,24 @@ cmd_watch() { # [renderer] -- live alternate-screen display, q quits
 
 # Autoscale supervisor: watches queue depth, scales workers to match.
 # Runs as a daemon via `drain autoscale`. Stops on SIGTERM or STOP file.
+# Dead registry entries (workers killed with KILL, which skips their EXIT
+# trap) are pruned here: only the entry FILE is removed, and only for PIDs
+# that no longer exist. A live worker's entry is never touched, so pruning
+# cannot orphan or terminate active workers; PID reuse cannot authorize a
+# kill because this path never signals anyone. Removal is idempotent and
+# safe under concurrent pruners (double rm is harmless).
 scoped_worker_pids() {
 	local f pid
 	for f in "$HOME/.task-drain/workers/"*; do
 		[ -f "$f" ] || continue
 		pid=${f##*/}
 		[[ "$pid" =~ ^[0-9]+$ ]] || continue
+		if ! kill -0 "$pid" 2>/dev/null; then
+			rm -f "$f" 2>/dev/null || true
+			continue
+		fi
 		[ "$(cat "$f")" = "${PROJECT_FILTER:-}" ] || continue
-		kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+		printf '%s\n' "$pid"
 	done
 	return 0
 }

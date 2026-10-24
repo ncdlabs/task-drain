@@ -1296,3 +1296,120 @@ STUB
     leftovers=$(pgrep -P "$sup" 2>/dev/null | wc -l | tr -d ' ')
     [ "$leftovers" = "0" ]
 }
+
+# --- worker registry pruning (scoped_worker_pids) ---
+
+@test "registry prunes dead worker entries and lists live ones" {
+    load_functions
+    export DRAIN_HOME="$HOME/.task-drain"
+    export PROJECT_FILTER=""
+    mkdir -p "$DRAIN_HOME/workers"
+    # Dead worker: spawn and reap, then plant its stale registration.
+    (exit 0) &
+    local dead=$!
+    wait "$dead" 2>/dev/null || true
+    printf '\n' > "$DRAIN_HOME/workers/$dead"
+    # Live worker: real bg process with a matching registration.
+    sleep 60 </dev/null >>"$BATS_TEST_TMPDIR/reg.log" 2>&1 &
+    local live=$!
+    printf '\n' > "$DRAIN_HOME/workers/$live"
+    run scoped_worker_pids
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$live"* ]]
+    [[ "$output" != *"$dead"* ]]
+    [ ! -e "$DRAIN_HOME/workers/$dead" ]
+    [ -f "$DRAIN_HOME/workers/$live" ]
+    kill "$live" 2>/dev/null || true
+    wait "$live" 2>/dev/null || true
+    rm -f "$DRAIN_HOME/workers/$live"
+    unset PROJECT_FILTER
+}
+
+@test "registry prune keeps live entries with other project filters" {
+    load_functions
+    export DRAIN_HOME="$HOME/.task-drain"
+    export PROJECT_FILTER="myproject"
+    mkdir -p "$DRAIN_HOME/workers"
+    sleep 60 </dev/null >>"$BATS_TEST_TMPDIR/reg2.log" 2>&1 &
+    local live=$!
+    printf 'otherproject\n' > "$DRAIN_HOME/workers/$live"
+    run scoped_worker_pids
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    # Not listed (filter mismatch) but NOT pruned (process is alive).
+    [ -f "$DRAIN_HOME/workers/$live" ]
+    kill "$live" 2>/dev/null || true
+    wait "$live" 2>/dev/null || true
+    rm -f "$DRAIN_HOME/workers/$live"
+    unset PROJECT_FILTER
+}
+
+@test "registry prune ignores non-numeric files and is idempotent" {
+    load_functions
+    export DRAIN_HOME="$HOME/.task-drain"
+    export PROJECT_FILTER=""
+    mkdir -p "$DRAIN_HOME/workers"
+    printf '\n' > "$DRAIN_HOME/workers/notapid"
+    (exit 0) &
+    local dead=$!
+    wait "$dead" 2>/dev/null || true
+    printf '\n' > "$DRAIN_HOME/workers/$dead"
+    run scoped_worker_pids
+    [ "$status" -eq 0 ]
+    run scoped_worker_pids
+    [ "$status" -eq 0 ]
+    [ -f "$DRAIN_HOME/workers/notapid" ]
+    [ ! -e "$DRAIN_HOME/workers/$dead" ]
+    rm -f "$DRAIN_HOME/workers/notapid"
+    unset PROJECT_FILTER
+}
+
+# --- launch-mutex recovery ---
+
+@test "stale launch lock is broken by the next starter" {
+    export DRAIN_HOME="$HOME/.task-drain"
+    mkdir -p "$DRAIN_HOME"
+    local lock="$DRAIN_HOME/autoscale.starting"
+    rm -rf "$lock"
+    mkdir "$lock"
+    printf '99999999\n' > "$lock/pid"
+    touch -t 200001010000 "$lock"
+    supervisor_acquire_launch_lock
+    [ -d "$lock" ]
+    [ "$(cat "$lock/pid" | tr -d ' \t\n')" = "$$" ]
+    supervisor_release_launch_lock
+    [ ! -d "$lock" ]
+}
+
+# --- end-to-end real launch path (empty queue, no workers spawn) ---
+
+@test "drain autoscale end-to-end launch and stop with empty queue" {
+    export DRAIN_HOME="$HOME/.task-drain"
+    export DRAIN_MIN_WORKERS=0
+    export DRAIN_MAX_WORKERS=1
+    export DRAIN_AUTOSCALE_INTERVAL=1
+    export DRAIN_SYNC_RETRY_DELAY=0
+    # Mock task exports an empty queue and min is 0, so desired workers is
+    # 0: the real supervisor starts, idles, and spawns nothing.
+    run "$SCRIPT_DIR/drain" autoscale --min 0 --max 1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"autoscaler running"* ]]
+    local sup
+    sup=$(cat "$DRAIN_HOME/autoscale.pid")
+    kill -0 "$sup" 2>/dev/null
+    run supervisor_is_live
+    [ "$status" -eq 0 ]
+    run "$SCRIPT_DIR/drain" autoscale-stop
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"stopping"* ]]
+    local i
+    for i in $(seq 1 10); do
+        kill -0 "$sup" 2>/dev/null || break
+        sleep 0.5
+    done
+    ! kill -0 "$sup" 2>/dev/null
+    wait "$sup" 2>/dev/null || true
+    [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+    [ ! -d "$DRAIN_HOME/autoscale.starting" ]
+    unset DRAIN_MIN_WORKERS DRAIN_MAX_WORKERS DRAIN_AUTOSCALE_INTERVAL DRAIN_SYNC_RETRY_DELAY
+}
