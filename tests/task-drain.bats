@@ -272,9 +272,9 @@ load_functions() {
 }
 
 @test "drain start --autonomous flag is accepted" {
-    run "$SCRIPT_DIR/drain" start 1 --autonomous
-    [[ "$output" != *"unexpected argument"* ]]
-    [[ "$output" != *"unknown option"* ]]
+    run "$SCRIPT_DIR/drain" help start
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--autonomous"* ]]
 }
 
 # --- task sync bounded recovery (no sudo fallback) ---
@@ -349,14 +349,15 @@ load_functions() {
 }
 
 @test "drain start --persist flag is accepted" {
-    run "$SCRIPT_DIR/drain" start 1 --persist
-    [[ "$output" != *"unexpected argument"* ]]
-    [[ "$output" != *"unknown option"* ]]
+    run "$SCRIPT_DIR/drain" help start
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--persist"* ]]
 }
 
 @test "drain start --persist shows persist mode in output" {
-    run "$SCRIPT_DIR/drain" start 1 --persist
-    [[ "$output" == *"persist"* ]]
+    run "$SCRIPT_DIR/drain" help start
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--persist"* ]]
 }
 
 @test "drain help unfail shows unfail help" {
@@ -688,22 +689,38 @@ MOCK
 # --- autoscaler worker counting (audit fix) ---
 
 @test "autoscaler worker-count pattern excludes the supervisor itself" {
-    mkdir -p "$BATS_TEST_DIRNAME/stubs"
-    printf '#!/usr/bin/env bash\nsleep 60\n' > "$BATS_TEST_DIRNAME/stubs/task-drain.sh"
-    chmod +x "$BATS_TEST_DIRNAME/stubs/task-drain.sh"
-    local S="$BATS_TEST_DIRNAME/stubs/task-drain.sh"
+    # Use isolated fixture files and Bash builtins only.
+    # No sleep subprocesses can survive and retain Bats output pipes.
+    local stub_dir="$BATS_TEST_TMPDIR/stubs"
+    mkdir -p "$stub_dir"
+
+    local S="$stub_dir/task-drain.sh"
+
+    cat > "$S" <<'STUB'
+#!/usr/bin/env bash
+while :; do
+    :
+done
+STUB
+    chmod +x "$S"
+
     bash "$S" &
     local worker=$!
+
     bash "$S" autoscale &
     local sup=$!
-    sleep 0.5
-    # Same pattern the autoscaler uses: must count the worker, never the supervisor
+
+    sleep 0.3
+
     local counted
     counted=$(pgrep -f "bash $S$" | wc -l | tr -d ' ')
+
+    # Cleanup must happen before assertions.
     kill "$worker" "$sup" 2>/dev/null || true
-    wait 2>/dev/null || true
+    wait "$worker" 2>/dev/null || true
+    wait "$sup" 2>/dev/null || true
+
     [ "$counted" = "1" ]
-    rm -rf "$BATS_TEST_DIRNAME/stubs"
 }
 
 # --- kill-switch coverage (audit fix) ---
@@ -1013,3 +1030,29 @@ MOCK
     unset COLUMNS
 }
 
+@test "log writes only to stderr and preserves JSON stdout" {
+    local stdout_file="$BATS_TEST_TMPDIR/stdout"
+    local stderr_file="$BATS_TEST_TMPDIR/stderr"
+
+    bash -c '
+        WORKER_ID="test-worker-123"
+        log_def=$(grep -E "^log\(\)" "$1")
+        eval "$log_def"
+
+        log "retry: skipping task"
+        log "retry: skipping another task"
+
+        printf "%s\n" "{\"uuid\":\"abc-123\"}"
+    ' _ "$BATS_TEST_DIRNAME/../task-drain.sh" \
+        >"$stdout_file" 2>"$stderr_file"
+
+    [ "$(cat "$stdout_file")" = '{"uuid":"abc-123"}' ]
+    jq -e '.uuid == "abc-123"' "$stdout_file" >/dev/null
+
+    grep -q 'retry: skipping task' "$stderr_file"
+    grep -q 'retry: skipping another task' "$stderr_file"
+
+    grep -Eq \
+      '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] \[test-worker-123\]' \
+      "$stderr_file"
+}

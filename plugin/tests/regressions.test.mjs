@@ -13,9 +13,32 @@ test('review alone cannot complete and force requires a reason',()=>fixture(asyn
  await assert.rejects(()=>t('complete').execute({uuid,actor:'a',force:true},{}),/requires a note/);
  assert.equal(f.getCalls().filter(c=>c.includes('done')).length,0);
 }));
-test('claim rejects worker-owned tasks even with force',()=>fixture(async(f,t)=>{
- f.setResponses([{match:'export',stdout:JSON.stringify({uuid,status:'pending',tags:['drain-claimed']})+'\n'}]);
- await assert.rejects(()=>t('claim').execute({uuid,actor:'a',force:true},{}),/in review/);
+test('claim allows drain-claimed tasks with force',()=>fixture(async(f,t)=>{
+  f.setResponses([{match:'export',stdout:JSON.stringify({uuid,status:'pending',tags:['drain-claimed']})+'\n'}]);
+  const r=await t('claim').execute({uuid,actor:'a',force:true},{});
+  assert.ok(r.content.includes(uuid));
+}));
+test('claim allows same-actor reclaim without force',()=>fixture(async(f,t)=>{
+  const taskData=JSON.stringify({uuid,status:'pending',tags:['claimed'],annotations:[{description:'claimed by a'}]})+'\n';
+  f.setResponses([
+    {match:'export',stdout:taskData},
+    {match:'modify',stdout:'Modified.\n'},
+    {match:'annotate',stdout:'Annotation added.\n'},
+    {match:'export',stdout:taskData},
+  ]);
+  const r=await t('claim').execute({uuid,actor:'a'},{});
+  assert.ok(r.content.includes(uuid));
+}));
+test('claim allows in-review tasks with force',()=>fixture(async(f,t)=>{
+  const taskData=JSON.stringify({uuid,status:'pending',tags:['ready-for-review']})+'\n';
+  f.setResponses([
+    {match:'export',stdout:taskData},
+    {match:'modify',stdout:'Modified.\n'},
+    {match:'annotate',stdout:'Annotation added.\n'},
+    {match:'export',stdout:taskData},
+  ]);
+  const r=await t('claim').execute({uuid,actor:'a',force:true},{});
+  assert.ok(r.content.includes(uuid));
 }));
 test('auto ignores noauto, future scheduled and review tasks',()=>fixture(async(f,t)=>{
  f.setResponses([{match:'export',stdout:[{uuid,status:'pending',tags:['noauto']},{uuid,status:'pending',scheduled:'29990101T000000Z'},{uuid,status:'pending',tags:['ready-for-review']}].map(JSON.stringify).join('\n')}]);
