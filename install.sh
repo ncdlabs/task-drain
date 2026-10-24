@@ -141,6 +141,22 @@ if [ "$SKIP_DEPS" != "1" ]; then
 		command -v jq >/dev/null 2>&1 && ok "jq installed" || fail "jq install failed — queue queries need it; install manually."
 	fi
 
+	# --- gh CLI (for GitHub PR discovery) ---
+	if command -v gh >/dev/null 2>&1; then
+		ok "gh already installed"
+		if gh auth status >/dev/null 2>&1; then
+			ok "gh authenticated"
+		else
+			warn "gh is installed but not authenticated."
+			warn "Run 'gh auth login' to enable PR discovery (drain pr list, status PR section)."
+			warn "PR features will be skipped until authenticated."
+		fi
+	else
+		warn "gh not found — GitHub PR discovery (drain pr list) will be skipped."
+		warn "Install it to enable: brew install gh (macOS) or see https://cli.github.com"
+		warn "Then run 'gh auth login'."
+	fi
+
 	# --- agent CLI (warn only) ---
 	agent_found=""
 	for agent in opencode claude codex; do

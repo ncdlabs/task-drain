@@ -84,7 +84,54 @@ source "$SCRIPT_DIR/lib/worker-detect.sh"
 # shellcheck source=lib/supervisor.sh
 source "$SCRIPT_DIR/lib/supervisor.sh"
 
+# Source config loader (YAML)
+# shellcheck source=lib/config.sh
+source "$SCRIPT_DIR/lib/config.sh"
+
 die() { echo "drain: $*" >&2; exit 1; }
+
+# Remote execution support.
+# If DRAIN_REMOTE_EXEC is set (we're already on the remote), skip.
+# Otherwise, check --remote/--local flags and default_remote config.
+DRAIN_TARGET_REMOTE=""
+DRAIN_FORCE_LOCAL=""
+
+# Parse --remote/--local before the command
+_DRAIN_ARGS=()
+for _a in "$@"; do
+	case "$_a" in
+	--remote) _DRAIN_REMOTE_NEXT=1 ;;
+	--remote=*) DRAIN_TARGET_REMOTE="${_a#--remote=}" ;;
+	--local) DRAIN_FORCE_LOCAL=1 ;;
+	*)
+		if [ -n "${_DRAIN_REMOTE_NEXT:-}" ]; then
+			DRAIN_TARGET_REMOTE="$_a"
+			_DRAIN_REMOTE_NEXT=""
+		else
+			_DRAIN_ARGS+=("$_a")
+		fi
+		;;
+	esac
+done
+if [ -n "${_DRAIN_REMOTE_NEXT:-}" ]; then
+	die "--remote requires a name"
+fi
+set -- "${_DRAIN_ARGS[@]}"
+
+# Resolve target remote: explicit flag > config default > local
+if [ -z "$DRAIN_FORCE_LOCAL" ] && [ -z "${DRAIN_REMOTE_EXEC:-}" ]; then
+	if [ -z "$DRAIN_TARGET_REMOTE" ]; then
+		DRAIN_TARGET_REMOTE=$(config_get default_remote "")
+	fi
+fi
+
+# If targeting a remote, exec via SSH helper
+if [ -n "$DRAIN_TARGET_REMOTE" ] && [ -z "${DRAIN_REMOTE_EXEC:-}" ]; then
+	_ssh=$(config_get "remotes.${DRAIN_TARGET_REMOTE}.ssh" "")
+	[ -n "$_ssh" ] || die "remote '$DRAIN_TARGET_REMOTE' not configured (remotes.${DRAIN_TARGET_REMOTE}.ssh)"
+	# Prevent recursion on the remote
+	exec env DRAIN_REMOTE_EXEC=1 $_ssh "bash ~/bin/drain $*"
+fi
 
 need_script() { [ -f "$DRAIN_SCRIPT" ] || die "worker script not found: $DRAIN_SCRIPT"; }
 

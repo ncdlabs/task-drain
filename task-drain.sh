@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-export PATH="$HOME/.opencode/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
+# Guard: workers inherit the autoscaler's environment, which may be nearly
+# empty if it was launched from a clean shell (no HOME, no PATH). task(1)
+# segfaults when HOME is unset, so derive it from the passwd entry.
+if [ -z "${HOME:-}" ]; then
+	HOME="$(eval echo "~$(/usr/bin/id -un)")"
+	export HOME
+fi
+export PATH="$HOME/.opencode/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}"
+# Unset proxy vars: daemons may inherit dead proxy settings from the
+# launching session, breaking task sync with "error sending request".
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 
 # Source shared display and worker detection functions
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -10,6 +20,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 # shellcheck source=lib/display.sh
 source "$SCRIPT_DIR/lib/display.sh"
+# shellcheck source=lib/config.sh
+source "$SCRIPT_DIR/lib/config.sh"
 # shellcheck source=lib/worker-detect.sh
 source "$SCRIPT_DIR/lib/worker-detect.sh"
 # shellcheck source=lib/supervisor.sh
@@ -115,18 +127,26 @@ TASK_TIMEOUT_SEC="${TASK_TIMEOUT_SEC:-14400}" # 4 hours per task (gtimeout only)
 # Default timeout used in cmd_workers display (kept in sync with above)
 _DRAIN_DEFAULT_TIMEOUT=14400
 PROJECT_FILTER="${PROJECT_FILTER:-}"
-DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-0}" # 1 = reprocess drain-failed tasks instead of the regular queue
-DRAIN_PERSIST="${DRAIN_PERSIST:-0}"           # 1 = wait for new jobs after queue empties instead of exiting
-DRAIN_AUTONOMOUS="${DRAIN_AUTONOMOUS:-0}"     # 1 = opt-in pickup (requires +auto tag); launched via `drain start --autonomous`
+DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-$(config_get_bool worker.retry_failed 0)}" # 1 = reprocess drain-failed tasks instead of the regular queue
+DRAIN_PERSIST="${DRAIN_PERSIST:-$(config_get_bool worker.persist 0)}"                # 1 = wait for new jobs after queue empties instead of exiting
+DRAIN_AUTONOMOUS="${DRAIN_AUTONOMOUS:-$(config_get_bool worker.autonomous 0)}"       # 1 = opt-in pickup (requires +auto tag); launched via `drain start --autonomous`
 
-# Single sync attempt. macOS 26 Local Network Privacy blocks third-party
-# (Homebrew, unsigned) binaries from the LAN taskserver (EHOSTUNREACH), while
-# root bypasses it -- so fall back to sudo when the direct sync fails. sudo
-# runs with the user's HOME/TASKRC, keeping the task DB user-owned. Requires
-# NOPASSWD for the task binary in sudoers.
+# Single sync attempt. No privilege-escalation fallback: this script ships as
+# a public MIT tool and must run unprivileged. task(1) needs HOME set to
+# locate its config (it segfaults without it); the guard at the top of this
+# script derives HOME from the passwd entry when the inherited environment
+# is empty (e.g. autoscaler launched from a clean shell).
 task_sync() {
 	"$TASK" sync >/dev/null 2>&1 && return 0
-	# Bounded recovery: no sudo fallback. If sync fails, emit diagnosis.
+	# Opt-in privilege fallback for private deployments: daemons spawned from
+	# a closed SSH session on macOS lose network access ("error sending
+	# request"). If DRAIN_ALLOW_SUDO=1, retry via passwordless sudo which
+	# runs in a fresh session context. Default off: the public MIT tool
+	# must not escalate privileges.
+	if [ "${DRAIN_ALLOW_SUDO:-$(config_get_bool worker.allow_sudo 0)}" = "1" ]; then
+		# Preserve HOME so the task wrapper resolves the correct TASKRC.
+		sudo -n HOME="$HOME" "$TASK" sync >/dev/null 2>&1 && return 0
+	fi
 	log "ERROR: sync failed (server unreachable or auth expired). Run: task sync"
 	return 1
 }
@@ -301,10 +321,10 @@ drain_list_prs() {
 		echo "[]"
 		return 0
 	}
-	command -v gh >/dev/null 2>&1 || {
-		echo "gh is required for GitHub PR discovery" >&2
-		return 1
-	}
+	command -v gh >/dev/null 2>&1 || return 0
+	# Skip silently if gh is not authenticated — PR discovery is optional.
+	# The installer (install.sh) handles gh setup; runtime just skips.
+	gh auth status >/dev/null 2>&1 || return 0
 
 	while IFS= read -r repo_path; do
 		[ -n "$repo_path" ] || continue
@@ -313,10 +333,10 @@ drain_list_prs() {
 		# Only scan GitHub repos (gh CLI)
 		remote=$(git -C "$repo_path" remote get-url origin 2>/dev/null || true)
 		[[ "$remote" == *github.com* ]] || continue
-		if ! pr_json=$(cd "$repo_path" && gh api --paginate --slurp 'repos/{owner}/{repo}/pulls?state=open&per_page=100' | jq '[.[][] | {number,title,body,url:.html_url,headRefName:.head.ref,createdAt:.created_at}]'); then
-			log "PR discovery failed for $repo_path (check gh authentication/network)"
-			return 1
-		fi
+		pr_json=$(cd "$repo_path" && gh api --paginate --slurp 'repos/{owner}/{repo}/pulls?state=open&per_page=100' 2>/dev/null | jq '[.[][] | {number,title,body,url:.html_url,headRefName:.head.ref,createdAt:.created_at}]' 2>/dev/null) || {
+			log "PR discovery skipped for $repo_path (gh api failed)"
+			continue
+		}
 		filtered=$(printf '%s' "$pr_json" | jq --arg repo "$repo_path" '
 			[.[] | select(.body // "" | test("Task [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"; "i")) |
 			{repo: $repo, number, title, url, branch: .headRefName, created: .createdAt,
@@ -334,7 +354,15 @@ drain_list_prs() {
 # 3. Built-in table below is the fallback (for backwards compatibility)
 repo_for_project() {
 	local conf="$HOME/.task-drain/repos.conf" proj path
-	# 1. repos.conf (primary)
+	# 0. YAML config (primary): repos.<project>.path
+	path=$(config_get "repos.${1:-}.path" "")
+	if [ -n "$path" ]; then
+		path="${path/#\~/$HOME}"
+		path="${path//\$HOME/$HOME}"
+		echo "$path"
+		return 0
+	fi
+	# 1. repos.conf (legacy)
 	if [ -f "$conf" ]; then
 		while IFS='=' read -r proj path; do
 			case "$proj" in '' | \#*) continue ;; esac
@@ -363,8 +391,66 @@ repo_for_project() {
 	gitseer) echo "$GIT_ROOT/gitseer" ;;
 	meridian) echo "$GIT_ROOT/meridian" ;;
 	solfoundation) echo "$GIT_ROOT/wp-solfoundation-plugin" ;;
+	wp-solfoundation-plugin) echo "$GIT_ROOT/wp-solfoundation-plugin" ;;
 	*) echo "" ;;
 	esac
+}
+
+# Remote URL for auto-clone. Checked in order:
+# 1. repos.conf: <project>.url=<git-url>
+# 2. Built-in table of known remotes
+remote_url_for_project() {
+	local conf="$HOME/.task-drain/repos.conf" proj url
+	# 0. YAML config: repos.<project>.url
+	url=$(config_get "repos.${1:-}.url" "")
+	if [ -n "$url" ]; then
+		echo "$url"
+		return 0
+	fi
+	# 1. repos.conf legacy: <project>.url=<url>
+	if [ -f "$conf" ]; then
+		while IFS='=' read -r proj url; do
+			case "$proj" in '' | \#*) continue ;; esac
+			if [ "$proj" = "${1:-}.url" ]; then
+				echo "$url"
+				return 0
+			fi
+		done <"$conf"
+	fi
+	case "${1:-}" in
+	wp-solfoundation-plugin) echo "https://github.com/The-Sol-Foundation/wp-solfoundation-plugin.git" ;;
+	*) echo "" ;;
+	esac
+}
+
+# Ensure the repo exists locally, cloning if a remote URL is known.
+# Prints the repo path on success, empty on failure.
+ensure_repo() {
+	local project="$1" repo url
+	repo=$(repo_for_project "$project")
+	if [ -n "$repo" ] && [ -d "$repo" ]; then
+		echo "$repo"
+		return 0
+	fi
+	# Not found locally — try to clone
+	url=$(remote_url_for_project "$project")
+	if [ -z "$url" ]; then
+		echo ""
+		return 1
+	fi
+	repo="$GIT_ROOT/$project"
+	if [ ! -d "$repo" ]; then
+		log "Cloning $project from $url"
+		if git clone --quiet "$url" "$repo" 2>/dev/null; then
+			log "Cloned $project to $repo"
+		else
+			log "Failed to clone $project from $url"
+			echo ""
+			return 1
+		fi
+	fi
+	echo "$repo"
+	return 0
 }
 
 # Eligibility filter shared by pick_task, status, and the autoscaler.
@@ -500,9 +586,9 @@ run_one() { # $1 = task export JSON
 	description=$(jq -r '.description' <<<"$1")
 	annotations=$(jq -r '(.annotations // []) | map(.description) | join("\n")' <<<"$1")
 	[ -n "$annotations" ] || annotations="(none)"
-	repo=$(repo_for_project "$project")
+	repo=$(ensure_repo "$project")
 	if [ -z "$repo" ] || [ ! -d "$repo" ]; then
-		if [ "${DRAIN_ALLOW_HOME:-0}" = 1 ]; then
+		if [ "${DRAIN_ALLOW_HOME:-$(config_get_bool worker.allow_home 0)}" = 1 ]; then
 			repo="$HOME"
 		else
 			log "No existing repository mapping for $project; parking $uuid"
@@ -821,6 +907,7 @@ cmd_status() {
 	n_waiting=$(tq +WAITING count 2>/dev/null || echo "?")
 	n_noauto=$(tq +PENDING +noauto count 2>/dev/null || echo "?")
 	n_failed=$(tq +PENDING +drain-failed count 2>/dev/null || echo "?")
+	n_claimed=$(tq +PENDING +drain-claimed count 2>/dev/null || echo "?")
 	n_claimed_active=$(tq +ACTIVE +drain-claimed count 2>/dev/null || echo "?")
 	n_done=$(tq +COMPLETED end.after:today count 2>/dev/null || echo "?")
 	n_pending_total=$(tq +PENDING count 2>/dev/null || echo "?")
@@ -973,8 +1060,8 @@ cmd_status() {
 				done || true
 		fi
 	else
-		printf 'Next: %snothing ready%s — %s blocked · %s started · %s opted out · %s failed · %s waiting\n' \
-			"$DIM" "$RESET" "$n_blocked" "$n_active" "$n_noauto" "$n_failed" "$n_waiting"
+		printf 'Next: %snothing ready%s — %s blocked · %s started · %s opted out · %s failed · %s waiting · %s claimed\n' \
+			"$DIM" "$RESET" "$n_blocked" "$n_active" "$n_noauto" "$n_failed" "$n_waiting" "$n_claimed"
 	fi
 
 	# ================= in progress =================
@@ -1648,11 +1735,7 @@ autoscale_supervisor() {
 		fi
 
 		# Sync and count eligible tasks
-		sync_with_retry >/dev/null 2>&1 || {
-			log "autoscaler: sync failed; no scaling performed"
-			_supervisor_sleep "$interval"
-			continue
-		}
+		sync_with_retry >/dev/null 2>&1 || log "autoscaler: sync failed, using local state"
 		local eligible
 		eligible=$(queue_json 2>/dev/null | jq length 2>/dev/null || echo 0)
 		[[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0

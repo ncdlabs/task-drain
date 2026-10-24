@@ -76,6 +76,7 @@ teardown() {
 
 # Source shared libraries first
 source "$SCRIPT_DIR/lib/display.sh"
+source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/worker-detect.sh"
 source "$SCRIPT_DIR/lib/supervisor.sh"
 
