@@ -20,8 +20,8 @@ These are workflow checks, not authenticated authorization.
 
 | Tool | Guards |
 |---|---|
-| `claim` | Refuses tasks already in review (`ready-for-review`/`review`/`drain-claimed`) or already claimed, including by the same actor; `force` bypasses the claim/status checks but never the in-review rejection |
-| `start` | Refuses already-started tasks |
+| `claim` | Refuses tasks already in review (`ready-for-review`/`review`) or already claimed, including by the same actor; `force` bypasses the claim/status checks but never the in-review rejection. Tasks owned by an active drain worker (`drain-claimed`) are additionally protected: `force:true` alone is rejected; an explicit `overrideDrainClaim:true` plus a non-empty `overrideReason` is required, and the override is recorded as a `[actor] drain-override:` annotation for audit. |
+| `start` | Refuses already-started tasks. Actively drain-worked tasks (`drain-claimed` + started) require `overrideDrainClaim:true` with `overrideReason` instead of `force` alone. |
 | `complete` | Requires `+approved` (use `approve` first); `force:true` bypasses the approval check but requires a `note` |
 | `approve` | Requires `+ready-for-review` |
 

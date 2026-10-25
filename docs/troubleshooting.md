@@ -73,6 +73,26 @@ threshold longer than the intended execution window and inspect live processes
 before manually releasing a claim. Reclamation requires another worker loop;
 it is not a timer service that runs while all workers are stopped.
 
+Host-local task/repo locks (`~/.task-drain/locks/`) recover automatically:
+a worker terminated with SIGKILL leaves its lock behind, and the next worker
+startup (and each loop iteration) reclaims it when the owner is provably
+abandoned (dead PID, or PID reuse proven by process-start mismatch on the
+same host) and the lock is older than `DRAIN_LOCK_GRACE_SEC` (default 10s).
+Live, young, partially written, cross-host, and legacy-live locks are never
+removed (fail closed). No manual filesystem intervention is needed; if a lock
+persists, its owner is either alive or unverifiable — inspect
+`locks/<uuid>/{pid,host,worker,proc_start}` and `ps` before touching it.
+
+Sync is bounded: every attempt is capped by `DRAIN_SYNC_TIMEOUT_SEC`
+(default 30s) and retried at most `DRAIN_SYNC_RETRIES` times (default 3)
+with exponential backoff from `DRAIN_SYNC_RETRY_DELAY`. A hung sync fails
+as a temporary network failure instead of hanging forever, and SIGTERM
+interrupts sync waits during shutdown. Required sync failures are fail
+closed: the worker aborts instead of executing a task whose claim cannot be
+published. Temporary (network/server) vs permanent (auth/config) failures
+are distinguished in the logs; permanent ones need operator action, not
+more retries.
+
 ## Stopping does not seem to stop everything
 
 Default `drain stop` / `all` is graceful and sets STOP plus stops the
@@ -94,6 +114,14 @@ without touching that process, then start again. If the pidfile is gone but
 a supervisor process remains (`drain status` warns about orphans), stop that
 PID by hand (`kill -TERM <pid>`), verify it exited, then start again. Never
 delete another host's state; each host owns only its `~/.task-drain/`.
+
+To prevent accidental multi-host autonomous execution, set
+`worker.primary_host` (or `DRAIN_PRIMARY_HOST`) to the designated machine:
+any other host refuses `drain start` / `drain autoscale` / workers unless
+`DRAIN_ALLOW_OTHER_HOST=1` is set explicitly. This guard cannot stop a
+deliberate second launch with the override set — true cross-host mutual
+exclusion needs an external atomic lease, which TaskChampion sync does not
+provide.
 
 ## Dashboard or PR list is incomplete
 

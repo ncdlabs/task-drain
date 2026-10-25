@@ -23,7 +23,12 @@ workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
 | `DRAIN_PERSIST_POLL_SEC` | `10` | Seconds between queue polls in persist mode |
 | `STALE_AFTER_SEC` | `14400` (4h) | Active `drain-claimed` tasks older than this are released by a running worker, even if their agent is still alive. Reclamation is global, not project-scoped. |
 | `TASK_TIMEOUT_SEC` | `14400` (4h) | Per-task wall clock, enforced with `gtimeout` (coreutils). Without `gtimeout`, tasks run unbounded. Timed-out tasks are marked failed, not retried. |
-| `DRAIN_SYNC_RETRY_DELAY` | `3` | Base seconds between sync retries (exponential backoff, 3 attempts) |
+| `DRAIN_SYNC_RETRY_DELAY` | `3` | Base seconds between sync retries (exponential backoff; attempts set by `DRAIN_SYNC_RETRIES`; floor 1s so retries never spin tightly) |
+| `DRAIN_SYNC_RETRIES` | `3` | Sync attempts before failing closed (max 10). Required sync failures abort the claim/execution — a task is never executed when its claim cannot be published. |
+| `DRAIN_SYNC_TIMEOUT_SEC` | `30` | Wall-clock bound per sync attempt (min 5s). Hung syncs fail as temporary network failures instead of blocking forever. Sync waits are SIGTERM-interruptible. |
+| `DRAIN_LOCK_GRACE_SEC` | `10` | Grace period before an unacquirable task/repo lock is even considered for automatic recovery. Covers creators still writing lock metadata and concurrent acquire-vs-cleanup races. |
+| `DRAIN_PRIMARY_HOST` | (unset) | Fail-closed single-host guard: when set (or `worker.primary_host` in config), workers and the supervisor refuse to start on any other host unless `DRAIN_ALLOW_OTHER_HOST=1`. Unset = no enforcement (accidental multi-host deployment then possible). |
+| `DRAIN_ALLOW_OTHER_HOST` | `0` | Explicit, auditable override for the primary-host guard (set to `1` for migration/recovery). The override is logged at startup. |
 | `DRAIN_HISTORY_LIMIT` | `20` | Rolling-window size for `drain history` |
 | `DRAIN_ERROR_WEBHOOK` | (unset) | Webhook accepting a JSON `text` field (for example Slack). Selected error paths POST worker, hostname, and error details; not every task failure triggers it. Discord compatibility is not implemented explicitly. |
 | `DRAIN_DEBUG` | `0` | Set to `1` for verbose worker logging |
@@ -79,7 +84,7 @@ Desired workers = `ceil(eligible / DRAIN_TASKS_PER_WORKER)`, clamped to
 | `noauto` | you | Excludes default-mode pickup, but is not excluded in autonomous mode. |
 | `auto` | you | Opt in to worker pickup in autonomous mode (`DRAIN_AUTONOMOUS=1` / `--autonomous`). Only these tasks are eligible. |
 | `drain-failed` | workers | A worker attempt ended without completion. Regular workers skip it; clear with `task <uuid> modify -drain-failed` or retry the set with `drain start N --failed`. |
-| `drain-claimed` | workers | In-flight marker while a worker owns a task. Released based on active age by a running worker; no process-liveness check. Never set it by hand. |
+| `drain-claimed` | workers | In-flight marker while a worker owns a task. Released by a running worker when older than `STALE_AFTER_SEC` and the recorded local worker PID is dead (host-local `kill -0` check; no cross-host detection). Host-local task/repo locks (`~/.task-drain/locks/`) carry verifiable owner identity (PID + hostname + process start time) and abandoned ones are reclaimed automatically; legacy pid-only locks are reclaimed only when their PID is dead. Never set either by hand. |
 
 ## Project → repo mapping (`~/.task-drain/repos.conf`)
 

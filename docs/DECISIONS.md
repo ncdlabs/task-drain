@@ -162,3 +162,74 @@ registry is auto-pruned.
 - Redis/Postgres/Kubernetes coordination — rejected per scope: unneeded for
   the documented single-host deployment model; recorded as the prerequisite
   if multi-host autonomy is ever required.
+
+## 2026-10-25 — Reliability hardening: stale-lock recovery, bounded sync, claim protection, reaping, host guard
+
+**Context.** Follow-up hardening pass over the remaining operational gaps
+left by the two prior audits. A worker terminated with SIGKILL left
+`locks/<uuid>` behind (PID-only, no ownership proof), requiring manual `rm`
+before the task could run again. Every `task sync` was unbounded: a hung
+sync blocked the worker/supervisor forever and SIGTERM deferred until the
+sync or `sleep` finished. Plugin `claim`/`start` with `force:true` could
+silently take over an active `drain-claimed` task. The supervisor spawned
+workers with `&` and never waited on them, so each exited worker lingered
+as a zombie and inflated counts until the supervisor itself exited. No
+in-app guard existed against accidentally starting a second autonomous
+deployment on another host sharing the same TaskChampion pool.
+
+**Decision.**
+- *Stale locks:* lock dirs now carry verifiable owner identity (`pid`,
+  `host`, `worker`, `created`, `proc_start` = owner process start time).
+  `acquire_lock_with_recovery` reclaims and retries once when the holder is
+  provably abandoned (dead PID, or same-host PID reuse proven by
+  process-start mismatch); `reclaim_abandoned_locks` sweeps stale dirs at
+  worker startup and each loop iteration. Live, young (within
+  `DRAIN_LOCK_GRACE_SEC`, default 10s), partially written, cross-host, and
+  legacy-live locks are kept (fail closed). Legacy pid-only locks are
+  reclaimed only when their PID is dead. Reaping removes directories only,
+  never signals anyone.
+- *Sync:* each attempt is capped by `DRAIN_SYNC_TIMEOUT_SEC` (default 30s,
+  min 5s; `timeout(1)` when available, background-watchdog emulation
+  otherwise), retried at most `DRAIN_SYNC_RETRIES` times (default 3) with
+  exponential backoff from `DRAIN_SYNC_RETRY_DELAY` (floor 1s), and all
+  waits (sync `wait`, retry sleeps) are SIGTERM-interruptible — the
+  in-flight sync child is tracked in `SYNC_PID` and killed by the signal
+  trap. Failures are logged as temporary (network/server, retryable) vs
+  permanent (auth/config, needs operator action); required sync failures
+  abort the operation and a task is never executed when its claim cannot be
+  published.
+- *Claim protection:* plugin `claimGuard`/`startGuard` reject `force:true`
+  takeover of `drain-claimed` tasks. An explicit `overrideDrainClaim:true`
+  plus a non-empty `overrideReason` is required, and the override is
+  recorded as a `[actor] drain-override:` annotation. Shell eligibility
+  already excludes plugin-`claimed` tasks, so the shell side needed no
+  protocol change.
+- *Reaping:* the supervisor tracks the workers it spawns and reaps exited
+  ones every iteration (and at shutdown); reaping only `wait`s on
+  supervisor-spawned PIDs and never signals anyone.
+- *Host guard:* optional fail-closed single-host enforcement via
+  `worker.primary_host` / `DRAIN_PRIMARY_HOST`: `drain start`,
+  `drain autoscale`, workers, and the supervisor refuse on other hosts
+  unless `DRAIN_ALLOW_OTHER_HOST=1` is set explicitly (logged). Unset means
+  no enforcement — the documented single-host constraint still applies.
+
+**Alternatives considered.**
+- Age-only lock deletion — rejected: long-running tasks legitimately hold
+  locks for hours; only provable abandonment authorizes reclamation.
+- Permanent-failure fast path with no retries — rejected: preserves the
+  existing 3-attempt semantics; permanence is a log classification, and all
+  paths still fail closed.
+- Blocking all plugin writes to `drain-claimed` tasks even with override —
+  rejected: would break deliberate administrative recovery; the explicit
+  auditable override is the middle ground.
+- Daemonizing workers under a process supervisor for reaping — rejected:
+  overkill; explicit `wait`-based reaping is the minimal correction.
+
+**Remaining limitations (not fixed here).** Cross-host duplicate execution
+is still possible when two hosts run autonomously (no atomic CAS in
+TaskChampion; the host guard only stops *accidental* deployment, not a
+deliberate override on two machines). Claim annotations carry PIDs without
+start-time identity, so stale-claim release still trusts `kill -0` plus age
+and can release a task whose PID was reused cross-invocation on the same
+host. Plugin actors are unauthenticated labels; the override annotation is
+auditable but not unforgeable. See architecture.md.
