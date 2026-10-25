@@ -95,41 +95,27 @@ source "$SCRIPT_DIR/lib/supervisor.sh"
 #
 set -euo pipefail
 
-# Taskwarrior binary. Override with TASK=/path/to/task in the environment.
-# Defaults to `task` on PATH, falling back to the Homebrew location on macOS.
-TASK="${TASK:-$(command -v task 2>/dev/null || echo /opt/homebrew/bin/task)}"
-OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
-CLAUDE_BIN="${CLAUDE_BIN:-claude}"
-CODEX_BIN="${CODEX_BIN:-codex}"
-TIMEOUT_BIN="$(command -v gtimeout || command -v timeout || true)"
-if [ -z "$TIMEOUT_BIN" ]; then
-	log "WARNING: No timeout binary found (tried: gtimeout, timeout). Task timeout will not be enforced."
-fi
-# Model for worker runs. Override with DRAIN_MODEL in the environment.
-DRAIN_MODEL="${DRAIN_MODEL:-opencode-go/longcat-2.5-preview-free}"
-# --dangerously-skip-permissions is OPT-IN (set DRAIN_SKIP_PERMISSIONS=1).
+# Canonical configuration: single authoritative resolver (lib/drain-config.py
+# via lib/config.sh). No defaults, type conversion, or validation here.
+# Precedence: CLI exports (DRAIN_* set by `drain start/autoscale` before exec)
+# > environment > ~/.task-drain/config.yaml > schema defaults in
+# lib/config-schema.json. Invalid configuration fails closed before any
+# operational side effect (see drain_config_require_valid).
+drain_config_require_valid
+drain_config_export_env
+# --dangerously-skip-permissions is OPT-IN (worker.skip_permissions).
 # Without it, unattended runs stall on the first approval prompt.
 OPENCODE_RUN_FLAGS=(--standalone --model "$DRAIN_MODEL")
 if [ "${DRAIN_SKIP_PERMISSIONS:-0}" = "1" ]; then
 	OPENCODE_RUN_FLAGS+=(--dangerously-skip-permissions)
 fi
-# Agent harness to use for worker runs: opencode | claude | codex.
-# Override with DRAIN_AGENT in the environment.
-DRAIN_AGENT="${DRAIN_AGENT:-opencode}"
-# Name shown in the worker prompt as the human authority for design/security/
-# product decisions (workers must not make these). Override with DRAIN_OWNER.
-DRAIN_OWNER="${DRAIN_OWNER:-the project owner}"
-STALE_AFTER_SEC="${STALE_AFTER_SEC:-14400}"   # 4 hours
-TASK_TIMEOUT_SEC="${TASK_TIMEOUT_SEC:-14400}" # 4 hours per task (gtimeout only)
-# Validate numeric environment variables
-[[ "$STALE_AFTER_SEC" =~ ^[0-9]+$ ]] || STALE_AFTER_SEC=14400
-[[ "$TASK_TIMEOUT_SEC" =~ ^[0-9]+$ ]] || TASK_TIMEOUT_SEC=14400
-# Default timeout used in cmd_workers display (kept in sync with above)
-_DRAIN_DEFAULT_TIMEOUT=14400
+# Default timeout used in cmd_workers display (canonical: worker.task_timeout_seconds)
+_DRAIN_DEFAULT_TIMEOUT="$TASK_TIMEOUT_SEC"
 PROJECT_FILTER="${PROJECT_FILTER:-}"
-DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-$(config_get_bool worker.retry_failed 0)}" # 1 = reprocess drain-failed tasks instead of the regular queue
-DRAIN_PERSIST="${DRAIN_PERSIST:-$(config_get_bool worker.persist 0)}"                # 1 = wait for new jobs after queue empties instead of exiting
-DRAIN_AUTONOMOUS="${DRAIN_AUTONOMOUS:-$(config_get_bool worker.autonomous 0)}"       # 1 = opt-in pickup (requires +auto tag); launched via `drain start --autonomous`
+TIMEOUT_BIN="$(command -v gtimeout || command -v timeout || true)"
+if [ -z "$TIMEOUT_BIN" ]; then
+	printf '[%s] [%s] %s\n' "$(date '+%F %T')" "${WORKER_ID:-drain-startup}" "WARNING: No timeout binary found (tried: gtimeout, timeout). Task timeout will not be enforced." >&2
+fi
 
 # Interruptible sleep: background + wait so a trapped SIGTERM/SIGINT fires
 # promptly instead of deferring until the sleep finishes.
@@ -185,7 +171,7 @@ task_sync_once() {
 			rm -f "$out"
 			return 1
 		fi
-		if [ "${DRAIN_ALLOW_SUDO:-$(config_get_bool worker.allow_sudo 0)}" = "1" ]; then
+		if [ "${DRAIN_ALLOW_SUDO:-0}" = "1" ]; then
 			# shellcheck disable=SC2024
 			"$TIMEOUT_BIN" --kill-after=5 "$timeout_sec" sudo -n HOME="$HOME" "$TASK" sync >"$out" 2>&1 &
 			SYNC_PID=$!
@@ -220,7 +206,7 @@ task_sync_once() {
 			rm -f "$out"
 			return 1
 		fi
-		if [ "${DRAIN_ALLOW_SUDO:-$(config_get_bool worker.allow_sudo 0)}" = "1" ]; then
+		if [ "${DRAIN_ALLOW_SUDO:-0}" = "1" ]; then
 			# shellcheck disable=SC2024
 			sudo -n HOME="$HOME" "$TASK" sync >"$out" 2>&1 &
 			SYNC_PID=$!
@@ -299,11 +285,13 @@ CURRENT_UUID=""
 # then possible; see docs/architecture.md).
 check_primary_host() { # $1 = role ("worker"|"supervisor")
 	local role="${1:-worker}" primary me allow
-	primary="${DRAIN_PRIMARY_HOST:-$(config_get worker.primary_host "")}"
+	primary="${DRAIN_PRIMARY_HOST:-}"
+	if [ -z "$primary" ]; then primary=$(drain_config_value worker.primary_host 2>/dev/null || true); fi
 	[ -n "$primary" ] || return 0
 	me=$(hostname -s 2>/dev/null || hostname)
 	allow="${DRAIN_ALLOW_OTHER_HOST:-0}"
-	if [ "$me" != "$primary" ]; then
+	# Short/FQDN equivalence without false positives (dot-boundary match).
+	if ! python3 "$SCRIPT_DIR/lib/drain-config.py" match-host --configured "$primary" --actual "$me" 2>/dev/null; then
 		if [ "$allow" = "1" ]; then
 			log "WARNING: $role starting on $me although primary host is $primary (DRAIN_ALLOW_OTHER_HOST=1 override)"
 			return 0
@@ -884,7 +872,7 @@ run_one() { # $1 = task export JSON
 	[ -n "$annotations" ] || annotations="(none)"
 	repo=$(ensure_repo "$project")
 	if [ -z "$repo" ] || [ ! -d "$repo" ]; then
-		if [ "${DRAIN_ALLOW_HOME:-$(config_get_bool worker.allow_home 0)}" = 1 ]; then
+		if [ "${DRAIN_ALLOW_HOME:-0}" = 1 ]; then
 			repo="$HOME"
 		else
 			log "No existing repository mapping for $project; parking $uuid"
