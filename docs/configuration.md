@@ -1,191 +1,261 @@
-# Configuration
+# Configuration (canonical reference)
 
-Everything is configured through environment variables (export before
-`drain start`) — no config file for the
-workers themselves. Project → repo mapping uses `~/.task-drain/repos.conf`.
+`~/.task-drain/config.yaml` (override with `DRAIN_CONFIG=/path/to.yaml`) is the
+human-readable source of host-specific application configuration. All
+operational settings have exactly one authoritative definition in
+`lib/config-schema.json`, resolved by `lib/drain-config.py` (shell) and
+`plugin/src/drain-config.mjs` (TypeScript plugin) with identical semantics.
 
-## Worker (`task-drain.sh`)
+Other documents link here rather than duplicating values. When in doubt,
+`drain config show` and `drain config validate` describe the running system.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `TASK` | `task` on PATH, else `/opt/homebrew/bin/task` | Taskwarrior binary. Override with a full path. |
-| `DRAIN_AGENT` | `opencode` | Agent harness: `opencode` \| `claude` \| `codex`. Selects the invocation (`opencode run --standalone …`, `claude -p`, `codex exec`). Unknown values abort the worker. |
-| `OPENCODE_BIN` | `opencode` | Agent binary (only used when `DRAIN_AGENT=opencode`) |
-| `DRAIN_MODEL` | `opencode-go/longcat-2.5-preview-free` | Model for worker runs (opencode only; override per run) |
-| `OPENCODE_RUN_FLAGS` (internal array) | `--standalone --model "$DRAIN_MODEL"` | Not an environment override: the script unconditionally assigns this array. Changing additional flags requires a source change. |
-| `DRAIN_SKIP_PERMISSIONS` | `0` | Set to `1` to append `--dangerously-skip-permissions` to OpenCode only. Claude and Codex use their own configured permissions; this variable does not change them. Approval behavior depends on the installed harness. |
-| `DRAIN_OWNER` | `the project owner` | Human authority named in the worker prompt for design/security/product decisions. Workers must annotate and fail instead of deciding. |
-| `GIT_ROOT` | `$HOME/git` | Where repos live; used for project → repo auto-detection |
-| `PROJECT_FILTER` | (unset) | Limit a worker run to one project (normally set via `drain start N <project>`) |
-| `DRAIN_RETRY_FAILED` | `0` | `1` = reprocess `drain-failed` tasks instead of the regular queue (normally set via `drain start --failed`) |
-| `DRAIN_PERSIST` | `0` | `1` = wait for new jobs after the queue empties instead of exiting (normally set via `drain start --persist`) |
-| `DRAIN_AUTONOMOUS` | `0` | `1` = opt-in pickup: only tasks tagged `+auto` are eligible (normally set via `drain start --autonomous`, which also launches the autoscaler) |
-| `DRAIN_PERSIST_POLL_SEC` | `10` | Seconds between queue polls in persist mode |
-| `STALE_AFTER_SEC` | `14400` (4h) | Active `drain-claimed` tasks older than this are released by a running worker, even if their agent is still alive. Reclamation is global, not project-scoped. |
-| `TASK_TIMEOUT_SEC` | `14400` (4h) | Per-task wall clock, enforced with `gtimeout` (coreutils). Without `gtimeout`, tasks run unbounded. Timed-out tasks are marked failed, not retried. |
-| `DRAIN_SYNC_RETRY_DELAY` | `3` | Base seconds between sync retries (exponential backoff; attempts set by `DRAIN_SYNC_RETRIES`; floor 1s so retries never spin tightly) |
-| `DRAIN_SYNC_RETRIES` | `3` | Sync attempts before failing closed (max 10). Required sync failures abort the claim/execution — a task is never executed when its claim cannot be published. |
-| `DRAIN_SYNC_TIMEOUT_SEC` | `30` | Wall-clock bound per sync attempt (min 5s). Hung syncs fail as temporary network failures instead of blocking forever. Sync waits are SIGTERM-interruptible. |
-| `DRAIN_LOCK_GRACE_SEC` | `10` | Grace period before an unacquirable task/repo lock is even considered for automatic recovery. Covers creators still writing lock metadata and concurrent acquire-vs-cleanup races. |
-| `DRAIN_PRIMARY_HOST` | (unset) | Fail-closed single-host guard: when set (or `worker.primary_host` in config), workers and the supervisor refuse to start on any other host unless `DRAIN_ALLOW_OTHER_HOST=1`. Unset = no enforcement (accidental multi-host deployment then possible). |
-| `DRAIN_ALLOW_OTHER_HOST` | `0` | Explicit, auditable override for the primary-host guard (set to `1` for migration/recovery). The override is logged at startup. |
-| `DRAIN_HISTORY_LIMIT` | `20` | Rolling-window size for `drain history` |
-| `DRAIN_ERROR_WEBHOOK` | (unset) | Webhook accepting a JSON `text` field (for example Slack). Selected error paths POST worker, hostname, and error details; not every task failure triggers it. Discord compatibility is not implemented explicitly. |
-| `DRAIN_DEBUG` | `0` | Set to `1` for verbose worker logging |
-| `TASKRC` | (unset) | Taskwarrior profile; forwarded to sudo sync with HOME. Does not guarantee file ownership or forward TASKDATA explicitly |
+## Schema
 
-## Autoscaler
+Every key below is `section.name`. Unknown keys are rejected. A missing file
+is supported (all defaults). An existing but invalid file fails closed:
+workers, supervisors, claims, and mutations refuse to start (exit 2).
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `DRAIN_MIN_WORKERS` | `1` | Minimum workers to keep running (normally set via `drain autoscale --min`) |
-| `DRAIN_MAX_WORKERS` | `8` | Maximum workers to start (normally set via `drain autoscale --max`) |
-| `DRAIN_AUTOSCALE_INTERVAL` | `30` | Seconds between queue-depth checks (the poll sleep is interruptible, so SIGTERM stops the supervisor promptly) |
-| `DRAIN_TASKS_PER_WORKER` | `2` | Eligible tasks per worker before scaling up (invalid or nonpositive values reset to 2) |
-| `DRAIN_STARTUP_LOCK_MAX_AGE_SEC` | `120` | A `drain autoscale` launch mutex older than this is treated as stale (crashed starter) and broken by the next starter |
+| Setting | Type | Default | Range / values |
+|---|---|---|---|
+| `worker.primary_host` | hostname or null | null (unset) | `[a-z0-9.-]`, short or FQDN |
+| `worker.agent` | enum | `opencode` | `opencode` \| `claude` \| `codex` |
+| `worker.model` | string | `opencode-go/longcat-2.5-preview-free` | 1–200 chars |
+| `worker.owner` | string | `the project owner` | 1–200 chars |
+| `worker.skip_permissions` | bool | `false` | `0/1`, `true/false`, `yes/no`, `on/off` (case-insensitive) |
+| `worker.autonomous` | bool | `false` | as above; CLI `--autonomous` |
+| `worker.retry_failed` | bool | `false` | as above; CLI `--failed` |
+| `worker.persist` | bool | `false` | as above; CLI `--persist` |
+| `worker.persist_poll_seconds` | int | `10` | 1–3600 |
+| `worker.allow_home` | bool | `false` | as above |
+| `worker.allow_sudo` | bool | `false` | as above |
+| `worker.task_timeout_seconds` | int | `14400` | 1–604800 |
+| `worker.stale_after_seconds` | int | `14400` | 60–604800 |
+| `supervisor.min_workers` | int | `1` | 0–32; CLI `--min`; `min <= max` enforced |
+| `supervisor.max_workers` | int | `8` | 1–32; CLI `--max` |
+| `supervisor.interval_seconds` | int | `30` | 1–3600 |
+| `supervisor.tasks_per_worker` | int | `2` | 1–100 |
+| `supervisor.startup_lock_max_age_seconds` | int | `120` | 1–3600 |
+| `sync.timeout_seconds` | int | `30` | 5–300 |
+| `sync.retries` | int | `3` | 1–10 |
+| `sync.retry_delay_seconds` | int | `3` | 1–300 |
+| `locks.grace_seconds` | int | `10` | 0–300 |
+| `history.limit` | int | `20` | 1–1000; CLI `--limit` |
+| `display.watch_interval_seconds` | int | `5` | 2–3600 |
+| `display.verbose` | bool | `false` | as above; CLI `--verbose`/`-v` |
+| `logging.level` | enum | `info` | `debug` \| `info` \| `warn` \| `error`; YAML-only (`DRAIN_DEBUG=1` is a legacy alias for `debug`) |
+| `paths.git_root` | path | `$HOME/git` | leading `~`/`$HOME` expanded |
+| `paths.task_bin` | path | `task` | dynamic fallback to `/opt/homebrew/bin/task` when present |
+| `paths.opencode_bin` | string | `opencode` | 1–500 chars |
+| `paths.claude_bin` | string | `claude` | 1–500 chars |
+| `paths.codex_bin` | string | `codex` | 1–500 chars |
+| `task.taskrc` | path or null | null | profile path |
+| `task.auto_sync` | bool | `true` | plugin only; `TASK_AUTO_SYNC=0` disables |
 
-Desired workers = `ceil(eligible / DRAIN_TASKS_PER_WORKER)`, clamped to
-`[min, max]`; `0` eligible with `min 0` scales to zero.
-
-## Display (`drain status` / `watch` / `workers`)
-
-| Variable | Purpose |
-|---|---|
-| `DRAIN_VERBOSE=1` | Full lists instead of the capped summary (same as `--verbose`) |
-| `DRAIN_WATCH_INTERVAL` | Seconds between live-display refreshes (default 5, minimum 2) |
-| `DRAIN_FORCE_COLOR=1` | Force color output when piping |
-| `NO_COLOR` | Respected — disables color |
-| `COLUMNS` | Display width (auto-detected, clamped 40–200) |
-
-## Installer (`install.sh`)
-
-| Variable | Effect |
-|---|---|
-| `PREFIX` | Install scripts to `$PREFIX/bin` instead of `~/bin` |
-| `SKIP_DEPS=1` | Skip dependency installation |
-| `SKIP_PLUGIN=1` | Skip the plugin build |
-| `TASKCHAMPION_URL` | Use this sync server URL instead of starting a local one |
-| `TASKCHAMPION_LOCAL=0` | Don't set up a local sync server |
-| `CONTAINER_RUNTIME` | Override auto-detection (tries nerdctl → docker → podman) |
-| `PLUGIN_DIR` | Plugin location (default `<repo>/plugin`) |
-
-## Plugin (`plugin/`)
-
-| Option | Env | Default |
-|---|---|---|
-| `taskBin` | `TASK_BIN` | `/opt/homebrew/bin/task` if present, else `task` on PATH |
-| `taskrc` | `TASKRC` | Default `~/.taskrc` pool |
-| `autoSync` | `TASK_AUTO_SYNC=0` disables | `true` — sync before reads, around writes |
-
-## Tags
-
-| Tag | Set by | Meaning |
-|---|---|---|
-| `noauto` | you | Excludes default-mode pickup, but is not excluded in autonomous mode. |
-| `auto` | you | Opt in to worker pickup in autonomous mode (`DRAIN_AUTONOMOUS=1` / `--autonomous`). Only these tasks are eligible. |
-| `drain-failed` | workers | A worker attempt ended without completion. Regular workers skip it; clear with `task <uuid> modify -drain-failed` or retry the set with `drain start N --failed`. |
-| `drain-claimed` | workers | In-flight marker while a worker owns a task. Released by a running worker when older than `STALE_AFTER_SEC` and the recorded local worker PID is dead (host-local `kill -0` check; no cross-host detection). Host-local task/repo locks (`~/.task-drain/locks/`) carry verifiable owner identity (PID + hostname + process start time) and abandoned ones are reclaimed automatically; legacy pid-only locks are reclaimed only when their PID is dead. Never set either by hand. |
-
-## Project → repo mapping (`~/.task-drain/repos.conf`)
-
-One `project=path` per line, `#` comments and blank lines allowed.
-Takes precedence over auto-detection and the built-in table:
-
-```
-# primary mapping — checked first
-myproject=$HOME/git/myrepo
-website=~/git/website
-```
-
-Only a leading `~` and literal `$HOME` are expanded; this is not a shell
-file (do not quote paths or put spaces around `=`). The first exact project
-match wins. Precedence is `repos.conf`, matching directory under `GIT_ROOT`,
-then the built-in table. `drain projects` lists sources, not a deduplicated
-resolution report. Subprojects need their own mappings. Tasks with no resolvable repo run with `$HOME` as
-their working directory.
-
-## Environment and process scope
-
-Both shell entry points replace PATH with `/opt/homebrew/bin:/usr/local/bin:$HOME/.opencode/bin:$HOME/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
-Use an absolute `TASK` or `OPENCODE_BIN` when needed. Claude and Codex must
-be available on that PATH. Worker `TASK` and plugin `TASK_BIN` are different
-settings; configure both if they should use the same binary.
-
-Configuration is inherited at launch. Changing an export does not reconfigure
-existing workers or the autoscaler. `DRAIN_AUTONOMOUS=1 drain start 1` changes
-pickup without starting a supervisor; `drain start --autonomous` does both.
-An existing supervisor is reused without changing its settings. Stop and
-restart it explicitly to change its project or pickup mode.
-
-`PROJECT_FILTER` already exported in the shell can survive `drain start all`
-and `drain autoscale all`; unset it explicitly for an unrestricted launch.
-Worker detection, stop files, history, worker registry, and the supervisor PID file are shared
-under HOME, not isolated by project or TASKRC. Supervisor single-instance
-state is host-local (PID plus command-line identity with a transient launch
-mutex); it does not coordinate supervisors across machines. Direct supervisor mode also
-accepts `DRAIN_SCRIPT` and `LOG_DIR`; these are internal launch controls.
-`DRAIN_NO_SYNC` suppresses dashboard sync when nonempty and is set internally
-on watch refreshes. It is not a worker offline-mode switch.
-
-The default OpenCode model string is a source default, not a guarantee of
-provider availability or price. Validate it in your installed harness before
-starting a queue. Invalid agent flags or unavailable models can fail every
-eligible task in succession.
-
-## YAML Configuration (config.yaml)
-
-Configuration is centralized in `~/.task-drain/config.yaml` (override with `$DRAIN_CONFIG`).
-Environment variables still work and take precedence over the config file.
+Free-form maps (validated structurally, not enumerated):
 
 ```yaml
-# Remote hosts for drain CLI management
+repos:
+  myproject:
+    path: ~/custom/path   # local checkout
+    url: https://example.com/myproject.git  # auto-clone source
 remotes:
   llama:
-    ssh: /home/hatch/bin/llama-ssh   # SSH helper command
-    git_root: /Users/lou/git          # for reference
-
-# Default remote for `drain` commands (empty = local)
-default_remote: llama
-
-# Autoscaler defaults
-autoscaler:
-  min_workers: 1
-  max_workers: 8
-  interval: 30
-
-# Worker defaults (replaces DRAIN_* env vars)
-worker:
-  allow_sudo: false    # DRAIN_ALLOW_SUDO — opt-in privilege fallback for macOS daemons
-  allow_home: false    # DRAIN_ALLOW_HOME — use $HOME when no repo mapping exists
-  autonomous: false    # DRAIN_AUTONOMOUS — opt-in pickup (requires +auto tag)
-  retry_failed: false  # DRAIN_RETRY_FAILED — reprocess drain-failed tasks
-  persist: false       # DRAIN_PERSIST — wait for new jobs after queue empties
-
-# Repository mappings (replaces repos.conf)
-# path: local checkout path (auto-detected as $GIT_ROOT/<project> if omitted)
-# url: remote URL for auto-clone when the repo is missing
-repos:
-  wp-solfoundation-plugin:
-    url: https://github.com/The-Sol-Foundation/wp-solfoundation-plugin.git
-  myproject:
-    path: ~/custom/path
-    url: git@github.com:org/myproject.git
+    ssh: /home/hatch/bin/llama-ssh
+    git_root: /Users/lou/git
+default_remote: ""        # empty = local
 ```
 
-### Remote management
+`repos.conf` (`~/.task-drain/repos.conf`, `project=path` plus
+`project.url=url`) remains supported as a legacy layer beneath YAML
+(`repos.<project>.path/url` wins). New installs should use YAML.
 
-If `default_remote` is set, `drain` commands run on the remote host:
+## Precedence
+
+High to low: explicit CLI arguments > environment variables > YAML >
+schema defaults.
+
+- CLI parser defaults never override YAML: unset flags fall through to the
+  resolver instead of injecting `1`/`8`/etc.
+- Unset environment variables never override anything.
+- Empty environment values are treated as unset (documented behavior).
+- `drain config show` prints the winning source per key
+  (`default` \| `yaml` \| `environment` \| `cli`).
+
+## Environment variable mapping
+
+Each canonical key has one primary `DRAIN_*` (or legacy) variable.
+`paths.task_bin` accepts `TASK` (primary) and `TASK_BIN` (plugin alias);
+setting both to different values is an error.
+
+| YAML key | Env var |
+|---|---|
+| `worker.primary_host` | `DRAIN_PRIMARY_HOST` |
+| `worker.agent` | `DRAIN_AGENT` |
+| `worker.model` | `DRAIN_MODEL` |
+| `worker.owner` | `DRAIN_OWNER` |
+| `worker.skip_permissions` | `DRAIN_SKIP_PERMISSIONS` |
+| `worker.autonomous` | `DRAIN_AUTONOMOUS` (+ CLI `--autonomous`) |
+| `worker.retry_failed` | `DRAIN_RETRY_FAILED` (+ CLI `--failed`) |
+| `worker.persist` | `DRAIN_PERSIST` (+ CLI `--persist`) |
+| `worker.persist_poll_seconds` | `DRAIN_PERSIST_POLL_SEC` |
+| `worker.allow_home` | `DRAIN_ALLOW_HOME` |
+| `worker.allow_sudo` | `DRAIN_ALLOW_SUDO` |
+| `worker.task_timeout_seconds` | `TASK_TIMEOUT_SEC` |
+| `worker.stale_after_seconds` | `STALE_AFTER_SEC` |
+| `supervisor.min_workers` | `DRAIN_MIN_WORKERS` (+ CLI `--min`) |
+| `supervisor.max_workers` | `DRAIN_MAX_WORKERS` (+ CLI `--max`) |
+| `supervisor.interval_seconds` | `DRAIN_AUTOSCALE_INTERVAL` |
+| `supervisor.tasks_per_worker` | `DRAIN_TASKS_PER_WORKER` |
+| `supervisor.startup_lock_max_age_seconds` | `DRAIN_STARTUP_LOCK_MAX_AGE_SEC` |
+| `sync.timeout_seconds` | `DRAIN_SYNC_TIMEOUT_SEC` |
+| `sync.retries` | `DRAIN_SYNC_RETRIES` |
+| `sync.retry_delay_seconds` | `DRAIN_SYNC_RETRY_DELAY` |
+| `locks.grace_seconds` | `DRAIN_LOCK_GRACE_SEC` |
+| `history.limit` | `DRAIN_HISTORY_LIMIT` (+ CLI `--limit`) |
+| `display.watch_interval_seconds` | `DRAIN_WATCH_INTERVAL` |
+| `display.verbose` | `DRAIN_VERBOSE` (+ CLI `--verbose`) |
+| `logging.level` | YAML-only (+ legacy `DRAIN_DEBUG=1` ⇒ `debug`) |
+| `paths.git_root` | `GIT_ROOT` |
+| `paths.task_bin` | `TASK` (also `TASK_BIN` for the plugin) |
+| `paths.opencode_bin` | `OPENCODE_BIN` |
+| `paths.claude_bin` | `CLAUDE_BIN` |
+| `paths.codex_bin` | `CODEX_BIN` |
+| `task.taskrc` | `TASKRC` |
+| `task.auto_sync` | `TASK_AUTO_SYNC` (`0` disables) |
+
+Deprecated generic overrides `DRAIN_CONFIG_<UPPER_DOTS_TO_UNDERSCORES>`
+(e.g. `DRAIN_CONFIG_WORKER_ALLOW_SUDO`) still map through the same
+validation but are deprecated in favor of the table above.
+
+Environment-only (never in YAML by design):
+
+| Env | Purpose |
+|---|---|
+| `DRAIN_ALLOW_OTHER_HOST=1` | Explicit auditable override for the primary-host guard |
+| `DRAIN_ERROR_WEBHOOK` | Webhook URL for critical failures (secret — never logged) |
+| `DRAIN_WEBHOOK_FORMAT` | `slack` (default) \| `discord` |
+| `DRAIN_CONFIG` | Override config file path (bootstrap) |
+| `DRAIN_HOME` | Override state dir (bootstrap) |
+| `PROJECT_FILTER` | Runtime project scope (CLI sets this) |
+| `FORGE_TOKEN` | Forge API token for PR creation (secret) |
+| `DRAIN_FORCE_COLOR`, `NO_COLOR`, `COLUMNS` | Display only |
+| Installer-only: `PREFIX`, `SKIP_DEPS`, `SKIP_PLUGIN`, `TASKCHAMPION_URL`, `TASKCHAMPION_LOCAL`, `CONTAINER_RUNTIME`, `PLUGIN_DIR` | See [installation](installation.md) |
+
+Boolean parsing is strict and identical in shell and TypeScript:
+`1/true/yes/on` ⇒ true, `0/false/no/off` ⇒ false (case-insensitive).
+Anything else fails validation with the expected set.
+
+## CLI
 
 ```bash
-drain status              # runs on default_remote (llama)
-drain --local status      # force local execution
-drain --remote llama stop # explicit remote
+drain [--config PATH] config show [--json]  # effective config + provenance; secrets never shown
+drain [--config PATH] config validate       # nonzero exit + actionable errors on failure
+drain [--config PATH] config path            # active file path
+drain [--config PATH] config defaults        # commented template to stdout; modifies nothing
+drain [--config PATH] config init            # create template (mode 600) only when absent; never overwrites
 ```
 
-The remote is accessed via the `ssh` command from the config.
+`--config` / `DRAIN_CONFIG` works consistently across all subcommands.
+Inspection commands are side-effect-free except the explicit `init` write.
 
-### Auto-clone
+## Provenance
 
-When a worker needs a repo that isn't checked out locally, it looks up
-`repos.<project>.url` from the config and clones it to `$GIT_ROOT/<project>`.
-If no URL is configured, the task is parked with `drain-failed`.
+`drain config show` prints `key  value  source`. `--json` emits
+`{values, sources, config_path, config_present}` for tooling. Secret values
+are never displayed (env-only secrets are never read from YAML).
+
+## Error handling
+
+- Missing file ⇒ defaults (supported).
+- Existing invalid file ⇒ error before any side effect (exit 2):
+  `drain start` / `drain autoscale` / workers / supervisors refuse to run.
+- Errors name the invalid key, the offending value's source, and the
+  expected type/range. Secret values are redacted.
+- No silent fallback, no partial application, no automatic overwrites.
+
+## File permissions
+
+`drain config init` and `install.sh` create `config.yaml` with mode `600`.
+The file holds no secrets by design (`DRAIN_ERROR_WEBHOOK`, `FORGE_TOKEN`
+stay in the environment). `600` is defense-in-depth for host identity and
+repo paths.
+
+## Secret management
+
+Secrets are environment-only. YAML validation rejects sensitive keys if they
+ever appear in YAML. Error messages and `config show` never echo secret
+values. Do not commit tokens or webhook URLs to the config file.
+
+## Restart requirements
+
+Configuration is a startup snapshot, loaded once per process. Changing YAML
+or environment does not reconfigure running workers or the supervisor.
+Restart them explicitly (`drain stop` / `drain autoscale-stop`, then `start` /
+`autoscale`). There is no hot-reload.
+
+## Primary-host restrictions
+
+Autonomous execution is single-host (TaskChampion sync has no atomic claim;
+see [architecture](architecture.md)). The designated executor is configured
+ once:
+
+```yaml
+worker:
+  primary_host: llama
+```
+
+- Hosts compare short names and FQDNs with dot-boundary matching only:
+  `llama` ≡ `llama.example.com`, but `llama` ≢ `llama2`.
+- Non-primary hosts refuse `drain start`, `drain autoscale`, workers, and
+  supervisors unless `DRAIN_ALLOW_OTHER_HOST=1` (auditable override, logged).
+- Unset `worker.primary_host` preserves legacy behavior (no enforcement).
+- Invalid host config fails closed.
+- Enforcement is an accident guard, not distributed coordination.
+
+## Backward compatibility and migration
+
+- All `DRAIN_*` variables in the table above keep working; env beats YAML,
+  CLI beats env.
+- `repos.conf`, `DRAIN_AUTONOMOUS=1` without `--autonomous`, and
+  config-less installs behave as before.
+- New installs get a `600` template with no autonomy and no invented
+  primary host. Existing installs are never overwritten (`drain config init`
+  refuses when the file exists; `install.sh` validates but leaves invalid
+  files untouched for the operator).
+- `DRAIN_CONFIG_WORKER_*` generic overrides still validate but are deprecated.
+
+## Verified examples
+
+MacBook-Air-3008 (non-executor) — current production file, valid as-is:
+
+```yaml
+# task-drain local configuration — MacBook-Air-3008 (non-executor)
+worker:
+  primary_host: llama
+```
+
+`drain config validate` passes; `drain start` / `drain autoscale` refuse
+without `DRAIN_ALLOW_OTHER_HOST=1`. No workers run here.
+
+`llama` (designated executor) — minimal production example:
+
+```yaml
+worker:
+  primary_host: llama
+  agent: opencode
+  model: opencode-go/longcat-2.5-preview-free
+
+supervisor:
+  min_workers: 1
+  max_workers: 8
+  interval_seconds: 30
+
+sync:
+  timeout_seconds: 30
+  retries: 3
+  retry_delay_seconds: 1
+```
+
+Only settings from the schema above are supported. Tune `supervisor.*`
+and `sync.*` per host; keep `worker.primary_host: llama` identical on all
+hosts so non-executors refuse automatically.

@@ -165,6 +165,21 @@ worker authorship. Gitea PRs are not scanned; `gh` default result limits apply.
 Missing CLI/auth/query failures can produce an empty list. Also surfaced in
 `drain status` under **PENDING APPROVAL**.
 
+### `drain [--config PATH] config ...`
+
+Unified configuration inspection (see [configuration](configuration.md)):
+
+| Command | Behavior |
+|---|---|
+| `drain config show [--json]` | Effective config with provenance (`default` \| `yaml` \| `environment` \| `cli`); secrets never shown |
+| `drain config validate` | Validate the effective config; nonzero exit with actionable errors on failure |
+| `drain config path` | Print the active config file path |
+| `drain config defaults` | Print a complete commented template (stdout only, modifies nothing) |
+| `drain config init` | Create the template (mode 600) only when no file exists; never overwrites |
+
+`--config PATH` (or `DRAIN_CONFIG=PATH`) selects the file consistently for
+every subcommand. Inspection is side-effect-free except the explicit `init`.
+
 ### `drain docs`
 
 The extended operator manual: pickup rules, tags, retrying failed tasks,

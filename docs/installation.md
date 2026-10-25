@@ -140,7 +140,14 @@ drain projects
 DRAIN_AUTONOMOUS=1 drain status myproject
 ```
 
-Configure `~/.task-drain/repos.conf` before starting workers:
+The installer provisions `~/.task-drain/config.yaml` (mode 600) for new
+installations only: defaults, no autonomous execution, no invented primary
+host. Existing files are never overwritten (`drain config init` also refuses
+when the file exists). Validate with `drain config validate` and inspect with
+`drain config show`. See the canonical [configuration](configuration.md).
+
+Configure project checkouts before starting workers (YAML first, legacy
+`~/.task-drain/repos.conf` still honored):
 
 ```text
 myproject=$HOME/git/myrepo

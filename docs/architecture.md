@@ -12,7 +12,8 @@
 | `plugin/src/tools.ts` | Shared definitions of 22 tools |
 | `plugin/src/index.ts` | OpenCode v2 plugin adapter |
 | `plugin/src/mcp-server.ts` | MCP stdio adapter exposing `task_*` tools |
-| `install.sh` | Dependency setup, optional sync container, script symlinks, plugin build |
+| `install.sh` | Dependency setup, optional sync container, script symlinks, config template, plugin build |
+| `lib/config-schema.json` + `lib/drain-config.py` + `lib/config.sh` + `plugin/src/drain-config.mjs` | Single authoritative configuration contract (schema, resolver, shell/TS adapters); `drain config` inspects it |
 
 Taskwarrior owns task data. TaskChampion synchronizes replicas. The plugin
 and shell workers invoke Taskwarrior separately; neither calls the other.

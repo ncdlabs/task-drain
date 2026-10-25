@@ -94,7 +94,11 @@ Complete command reference: [docs/cli-reference.md](docs/cli-reference.md).
 
 ## Configuration
 
-Environment variables (export before `drain start`). The important ones:
+`~/.task-drain/config.yaml` is the canonical host configuration
+(`drain config show|validate|path|defaults|init`, `--config PATH` override).
+Environment variables still override YAML; see the canonical
+[configuration reference](docs/configuration.md) for the full schema,
+precedence, and `DRAIN_*` mapping.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -105,9 +109,6 @@ Environment variables (export before `drain start`). The important ones:
 | `DRAIN_OWNER` | `the project owner` | Human authority for design/security/product decisions in the worker prompt |
 | `TASK_TIMEOUT_SEC` | `14400` | Per-task wall clock (needs `gtimeout`) |
 | `STALE_AFTER_SEC` | `14400` | Release worker claims older than this |
-
-Everything: [docs/configuration.md](docs/configuration.md) (all variables,
-tags, `repos.conf`, state files).
 
 ## Documentation
 
