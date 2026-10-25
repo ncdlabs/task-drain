@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "task-drain canonical configuration schema",
+  "description": "Single authoritative definition for every configurable operational setting. Consumed by lib/drain-config.py (authoritative resolver), lib/config.sh (shell adapter), and plugin/src/drain-config.mjs (TypeScript/JS adapter). Do not duplicate defaults, types, env mappings, or validation elsewhere.",
+  "settings": [
+    {
+      "key": "worker.primary_host",
+      "type": "hostname_or_null",
+      "default": null,
+      "env": "DRAIN_PRIMARY_HOST",
+      "description": "Designated autonomous executor hostname (short name or FQDN). When set, workers/supervisors refuse elsewhere unless DRAIN_ALLOW_OTHER_HOST=1.",
+      "sensitive": false
+    },
+    {
+      "key": "worker.agent",
+      "type": "enum",
+      "enum": [
+        "opencode",
+        "claude",
+        "codex"
+      ],
+      "default": "opencode",
+      "env": "DRAIN_AGENT",
+      "description": "Agent harness for worker runs.",
+      "sensitive": false
+    },
+    {
+      "key": "worker.model",
+      "type": "string",
+      "default": "opencode-go/longcat-2.5-preview-free",
+      "env": "DRAIN_MODEL",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Model for worker runs (opencode harness).",
+      "sensitive": false
+    },
+    {
+      "key": "worker.owner",
+      "type": "string",
+      "default": "the project owner",
+      "env": "DRAIN_OWNER",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Human authority named in worker prompt.",
+      "sensitive": false
+    },
+    {
+      "key": "worker.skip_permissions",
+      "type": "bool",
+      "default": false,
+      "env": "DRAIN_SKIP_PERMISSIONS",
+      "description": "Append --dangerously-skip-permissions (opencode only).",
+      "sensitive": false
+    },
+    {
+      "key": "worker.autonomous",
+      "type": "bool",
+      "default": false,
+      "env": "DRAIN_AUTONOMOUS",
+      "cli": [
+        "--autonomous"
+      ],
+      "description": "Opt-in pickup: only +auto tasks eligible.",
+      "sensitive": false
+    },
+    {
+      "key": "worker.retry_failed",
+      "type": "bool",
+      "default": false,
+      "env": "DRAIN_RETRY_FAILED",
+      "cli": [
+        "--failed"
+      ],
+      "description": "Reprocess drain-failed tasks instead of regular queue.",
+      "sensitive": false
+    },
+    {
+      "key": "worker.persist",
+      "type": "bool",
+      "default": false,
+      "env": "DRAIN_PERSIST",
+      "cli": [
+        "--persist"
+      ],
+      "description": "Wait for new jobs after queue empties.",
+      "sensitive": false
+    },
+    {
+      "key": "worker.persist_poll_seconds",
+      "type": "int",
+      "default": 10,
+      "min": 1,
+      "max": 3600,
+      "env": "DRAIN_PERSIST_POLL_SEC",
+      "description": "Seconds between queue polls in persist mode.",
+      "sensitive": false
+    },
+    {
+      "key": "worker.allow_home",
+      "type": "bool",
+      "default": false,
+      "env": "DRAIN_ALLOW_HOME",
+      "description": "Use $HOME when no repo mapping exists (else park task).",
+      "sensitive": false
+    },
+    {
+      "key": "worker.allow_sudo",
+      "type": "bool",
+      "default": false,
+      "env": "DRAIN_ALLOW_SUDO",
+      "description": "Opt-in privilege fallback for macOS daemon sync.",
+      "sensitive": false
+    },
+    {
+      "key": "worker.task_timeout_seconds",
+      "type": "int",
+      "default": 14400,
+      "min": 1,
+      "max": 604800,
+      "env": "TASK_TIMEOUT_SEC",
+      "description": "Per-task wall clock (enforced only with gtimeout/timeout).",
+      "sensitive": false
+    },
+    {
+      "key": "worker.stale_after_seconds",
+      "type": "int",
+      "default": 14400,
+      "min": 60,
+      "max": 604800,
+      "env": "STALE_AFTER_SEC",
+      "description": "Active drain-claimed tasks older than this are released when owner PID is dead.",
+      "sensitive": false
+    },
+    {
+      "key": "supervisor.min_workers",
+      "type": "int",
+      "default": 1,
+      "min": 0,
+      "max": 32,
+      "env": "DRAIN_MIN_WORKERS",
+      "cli": [
+        "--min"
+      ],
+      "description": "Minimum workers to keep running.",
+      "sensitive": false
+    },
+    {
+      "key": "supervisor.max_workers",
+      "type": "int",
+      "default": 8,
+      "min": 1,
+      "max": 32,
+      "env": "DRAIN_MAX_WORKERS",
+      "cli": [
+        "--max"
+      ],
+      "description": "Maximum workers to start.",
+      "sensitive": false
+    },
+    {
+      "key": "supervisor.interval_seconds",
+      "type": "int",
+      "default": 30,
+      "min": 1,
+      "max": 3600,
+      "env": "DRAIN_AUTOSCALE_INTERVAL",
+      "description": "Seconds between autoscaler queue-depth checks.",
+      "sensitive": false
+    },
+    {
+      "key": "supervisor.tasks_per_worker",
+      "type": "int",
+      "default": 2,
+      "min": 1,
+      "max": 100,
+      "env": "DRAIN_TASKS_PER_WORKER",
+      "description": "Eligible tasks per worker before scaling up.",
+      "sensitive": false
+    },
+    {
+      "key": "supervisor.startup_lock_max_age_seconds",
+      "type": "int",
+      "default": 120,
+      "min": 1,
+      "max": 3600,
+      "env": "DRAIN_STARTUP_LOCK_MAX_AGE_SEC",
+      "description": "Launch mutex older than this is treated as stale.",
+      "sensitive": false
+    },
+    {
+      "key": "sync.timeout_seconds",
+      "type": "int",
+      "default": 30,
+      "min": 5,
+      "max": 300,
+      "env": "DRAIN_SYNC_TIMEOUT_SEC",
+      "description": "Wall-clock bound per sync attempt.",
+      "sensitive": false
+    },
+    {
+      "key": "sync.retries",
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 10,
+      "env": "DRAIN_SYNC_RETRIES",
+      "description": "Sync attempts before failing closed.",
+      "sensitive": false
+    },
+    {
+      "key": "sync.retry_delay_seconds",
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 300,
+      "env": "DRAIN_SYNC_RETRY_DELAY",
+      "description": "Base seconds between sync retries (exponential backoff).",
+      "sensitive": false
+    },
+    {
+      "key": "locks.grace_seconds",
+      "type": "int",
+      "default": 10,
+      "min": 0,
+      "max": 300,
+      "env": "DRAIN_LOCK_GRACE_SEC",
+      "description": "Grace period before an unacquirable lock is considered for recovery.",
+      "sensitive": false
+    },
+    {
+      "key": "history.limit",
+      "type": "int",
+      "default": 20,
+      "min": 1,
+      "max": 1000,
+      "env": "DRAIN_HISTORY_LIMIT",
+      "cli": [
+        "--limit"
+      ],
+      "description": "Rolling-window size for drain history.",
+      "sensitive": false
+    },
+    {
+      "key": "display.watch_interval_seconds",
+      "type": "int",
+      "default": 5,
+      "min": 2,
+      "max": 3600,
+      "env": "DRAIN_WATCH_INTERVAL",
+      "description": "Seconds between live-display refreshes.",
+      "sensitive": false
+    },
+    {
+      "key": "display.verbose",
+      "type": "bool",
+      "default": false,
+      "env": "DRAIN_VERBOSE",
+      "cli": [
+        "--verbose",
+        "-v"
+      ],
+      "description": "Full lists instead of capped summary.",
+      "sensitive": false
+    },
+    {
+      "key": "logging.level",
+      "type": "enum",
+      "enum": [
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ],
+      "default": "info",
+      "env": null,
+      "description": "Worker log verbosity. YAML-only; DRAIN_DEBUG=1 remains honored as a legacy alias for debug.",
+      "sensitive": false
+    },
+    {
+      "key": "paths.git_root",
+      "type": "path",
+      "default": "$HOME/git",
+      "env": "GIT_ROOT",
+      "description": "Where repos live; used for project auto-detection.",
+      "sensitive": false
+    },
+    {
+      "key": "paths.task_bin",
+      "type": "path",
+      "default": "task",
+      "env": "TASK",
+      "env_aliases": [
+        "TASK_BIN"
+      ],
+      "description": "Taskwarrior binary. Falls back to /opt/homebrew/bin/task when present.",
+      "sensitive": false
+    },
+    {
+      "key": "paths.opencode_bin",
+      "type": "string",
+      "default": "opencode",
+      "env": "OPENCODE_BIN",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "OpenCode agent binary.",
+      "sensitive": false
+    },
+    {
+      "key": "paths.claude_bin",
+      "type": "string",
+      "default": "claude",
+      "env": "CLAUDE_BIN",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "Claude Code agent binary.",
+      "sensitive": false
+    },
+    {
+      "key": "paths.codex_bin",
+      "type": "string",
+      "default": "codex",
+      "env": "CODEX_BIN",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "Codex agent binary.",
+      "sensitive": false
+    },
+    {
+      "key": "task.taskrc",
+      "type": "path_or_null",
+      "default": null,
+      "env": "TASKRC",
+      "description": "Taskwarrior profile path.",
+      "sensitive": false
+    },
+    {
+      "key": "task.auto_sync",
+      "type": "bool",
+      "default": true,
+      "env": "TASK_AUTO_SYNC",
+      "env_negated_zero": true,
+      "description": "Plugin: sync before reads and around writes. Set TASK_AUTO_SYNC=0 to disable.",
+      "sensitive": false
+    }
+  ],
+  "map_sections": {
+    "description": "Free-form maps validated structurally but not enumerated as settings: repos.<project>.path/url, remotes.<name>.ssh/git_root, default_remote.",
+    "allowed": [
+      "repos",
+      "remotes",
+      "default_remote"
+    ]
+  },
+  "env_only": [
+    {
+      "env": "DRAIN_ALLOW_OTHER_HOST",
+      "description": "Explicit auditable override for primary-host guard. Never persisted in YAML by design.",
+      "sensitive": false
+    },
+    {
+      "env": "DRAIN_ERROR_WEBHOOK",
+      "description": "Webhook URL for critical failure reports. Environment-only: never put secrets in YAML.",
+      "sensitive": true
+    },
+    {
+      "env": "DRAIN_WEBHOOK_FORMAT",
+      "description": "Webhook payload format: slack|discord.",
+      "sensitive": false
+    },
+    {
+      "env": "DRAIN_DEBUG",
+      "description": "Legacy alias for logging.level=debug. Prefer logging.level.",
+      "sensitive": false
+    },
+    {
+      "env": "DRAIN_CONFIG",
+      "description": "Override config file path. Bootstrap only.",
+      "sensitive": false
+    },
+    {
+      "env": "DRAIN_HOME",
+      "description": "Override state directory. Bootstrap only.",
+      "sensitive": false
+    },
+    {
+      "env": "PROJECT_FILTER",
+      "description": "Runtime project scope (CLI). Not persisted.",
+      "sensitive": false
+    },
+    {
+      "env": "FORGE_TOKEN",
+      "description": "Forge API token for PR creation. Environment-only secret.",
+      "sensitive": true
+    }
+  ]
+}
