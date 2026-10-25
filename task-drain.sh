@@ -131,33 +131,150 @@ DRAIN_RETRY_FAILED="${DRAIN_RETRY_FAILED:-$(config_get_bool worker.retry_failed 
 DRAIN_PERSIST="${DRAIN_PERSIST:-$(config_get_bool worker.persist 0)}"                # 1 = wait for new jobs after queue empties instead of exiting
 DRAIN_AUTONOMOUS="${DRAIN_AUTONOMOUS:-$(config_get_bool worker.autonomous 0)}"       # 1 = opt-in pickup (requires +auto tag); launched via `drain start --autonomous`
 
-# Single sync attempt. No privilege-escalation fallback: this script ships as
-# a public MIT tool and must run unprivileged. task(1) needs HOME set to
-# locate its config (it segfaults without it); the guard at the top of this
-# script derives HOME from the passwd entry when the inherited environment
-# is empty (e.g. autoscaler launched from a clean shell).
-task_sync() {
-	"$TASK" sync >/dev/null 2>&1 && return 0
-	# Opt-in privilege fallback for private deployments: daemons spawned from
-	# a closed SSH session on macOS lose network access ("error sending
-	# request"). If DRAIN_ALLOW_SUDO=1, retry via passwordless sudo which
-	# runs in a fresh session context. Default off: the public MIT tool
-	# must not escalate privileges.
-	if [ "${DRAIN_ALLOW_SUDO:-$(config_get_bool worker.allow_sudo 0)}" = "1" ]; then
-		# Preserve HOME so the task wrapper resolves the correct TASKRC.
-		sudo -n HOME="$HOME" "$TASK" sync >/dev/null 2>&1 && return 0
+# Interruptible sleep: background + wait so a trapped SIGTERM/SIGINT fires
+# promptly instead of deferring until the sleep finishes.
+_interruptible_sleep() { # $1 = seconds
+	sleep "$1" &
+	local _spid=$!
+	wait "$_spid" 2>/dev/null || true
+}
+
+# PID of the in-flight sync child, if any. on_signal kills it so SIGTERM
+# interrupts a hung sync instead of waiting for the sync timeout.
+SYNC_PID=""
+
+# Classify sync output as temporary (retryable) vs permanent (needs admin).
+# Prints "temporary" or "permanent" on stdout.
+classify_sync_error() { # $1 = sync output text
+	local out="$1"
+	# Permanent: auth, config, client identity, local data errors. These
+	# will not resolve on retry without operator action.
+	if printf '%s' "$out" | grep -qiE "auth|unauthorized|forbidden|401|403|client_id|client id|configuration|taskrc|parse error|corrupt replica|no such"; then
+		printf 'permanent\n'
+		return 0
 	fi
-	log "ERROR: sync failed (server unreachable or auth expired). Run: task sync"
+	printf 'temporary\n'
+}
+
+# Run "$TASK sync" (plus the opt-in sudo fallback) with a wall-clock bound.
+# Uses $TIMEOUT_BIN when available, otherwise a pure-bash background
+# watchdog. Runs the sync in the background and waits, so a trapped
+# SIGTERM interrupts the wait and on_signal can kill the child.
+# Sets SYNC_PID while running. Returns 0 on success, 1 on failure.
+# Prints the sync output to stderr on failure for classification.
+task_sync_once() {
+	local timeout_sec="${DRAIN_SYNC_TIMEOUT_SEC:-30}"
+	[[ "$timeout_sec" =~ ^[0-9]+$ ]] || timeout_sec=30
+	[ "$timeout_sec" -ge 5 ] || timeout_sec=5
+	local out rc
+	out=$(mktemp "${TMPDIR:-/tmp}/drain-sync.XXXXXX") || return 1
+	rc=0
+	if [ -n "${TIMEOUT_BIN:-}" ]; then
+		# timeout(1) path: bound the direct attempt, then the sudo
+		# fallback separately so each gets the full budget.
+		"$TIMEOUT_BIN" --kill-after=5 "$timeout_sec" "$TASK" sync >"$out" 2>&1 &
+		SYNC_PID=$!
+		wait "$SYNC_PID" 2>/dev/null || rc=$?
+		SYNC_PID=""
+		if [ "$rc" -eq 0 ]; then
+			rm -f "$out"
+			return 0
+		fi
+		if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+			log "ERROR: sync timed out after ${timeout_sec}s (temporary network failure)"
+			rm -f "$out"
+			return 1
+		fi
+		if [ "${DRAIN_ALLOW_SUDO:-$(config_get_bool worker.allow_sudo 0)}" = "1" ]; then
+			# shellcheck disable=SC2024
+			"$TIMEOUT_BIN" --kill-after=5 "$timeout_sec" sudo -n HOME="$HOME" "$TASK" sync >"$out" 2>&1 &
+			SYNC_PID=$!
+			wait "$SYNC_PID" 2>/dev/null || rc=$?
+			SYNC_PID=""
+			if [ "$rc" -eq 0 ]; then
+				rm -f "$out"
+				return 0
+			fi
+			if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+				log "ERROR: sync (sudo fallback) timed out after ${timeout_sec}s (temporary network failure)"
+				rm -f "$out"
+				return 1
+			fi
+		fi
+	else
+		# No timeout binary: background watchdog emulation.
+		"$TASK" sync >"$out" 2>&1 &
+		SYNC_PID=$!
+		(sleep "$timeout_sec" && kill -TERM "$SYNC_PID" 2>/dev/null) &
+		local _watcher=$!
+		wait "$SYNC_PID" 2>/dev/null || rc=$?
+		SYNC_PID=""
+		kill "$_watcher" 2>/dev/null || true
+		wait "$_watcher" 2>/dev/null || true
+		if [ "$rc" -eq 0 ]; then
+			rm -f "$out"
+			return 0
+		fi
+		if [ "$rc" -eq 143 ] || [ "$rc" -eq 130 ]; then
+			log "ERROR: sync timed out after ${timeout_sec}s (temporary network failure)"
+			rm -f "$out"
+			return 1
+		fi
+		if [ "${DRAIN_ALLOW_SUDO:-$(config_get_bool worker.allow_sudo 0)}" = "1" ]; then
+			# shellcheck disable=SC2024
+			sudo -n HOME="$HOME" "$TASK" sync >"$out" 2>&1 &
+			SYNC_PID=$!
+			(sleep "$timeout_sec" && kill -TERM "$SYNC_PID" 2>/dev/null) &
+			_watcher=$!
+			wait "$SYNC_PID" 2>/dev/null || rc=$?
+			SYNC_PID=""
+			kill "$_watcher" 2>/dev/null || true
+			wait "$_watcher" 2>/dev/null || true
+			if [ "$rc" -eq 0 ]; then
+				rm -f "$out"
+				return 0
+			fi
+		fi
+	fi
+	local body kind
+	body=$(cat "$out" 2>/dev/null || true)
+	kind=$(classify_sync_error "$body")
+	if [ "$kind" = "permanent" ]; then
+		log "ERROR: sync failed (permanent failure; needs operator action). Run: task sync"
+	else
+		log "ERROR: sync failed (temporary network failure). Run: task sync"
+	fi
+	[ -n "${DRAIN_DEBUG:-}" ] && [ "$DRAIN_DEBUG" = "1" ] && [ -n "$body" ] && log "DEBUG: sync output: $body"
+	rm -f "$out"
 	return 1
 }
 
-# Wrapper for task sync with retry. The TaskChampion sync endpoint flakes
-# intermittently; a single failed sync must not abort a worker or fail a task.
+# Single sync attempt. No privilege-escalation by default: this script ships
+# as a public MIT tool and must run unprivileged (see task_sync_once).
+task_sync() {
+	task_sync_once
+}
+
+# Wrapper for task sync with bounded retry. The TaskChampion sync endpoint
+# flakes intermittently; a single failed sync must not abort a worker or
+# fail a task. Bounded: DRAIN_SYNC_RETRIES attempts (default 3),
+# exponential backoff from DRAIN_SYNC_RETRY_DELAY (default 3s), each attempt
+# capped by DRAIN_SYNC_TIMEOUT_SEC (default 30s). Sleeps are interruptible
+# so SIGTERM fires promptly. Never loops tightly: the delay floor is 1s.
 sync_with_retry() {
-	local attempt=1 delay="${DRAIN_SYNC_RETRY_DELAY:-3}"
-	while [ $attempt -le 3 ]; do
+	local max_attempts="${DRAIN_SYNC_RETRIES:-3}"
+	local delay="${DRAIN_SYNC_RETRY_DELAY:-3}"
+	[[ "$max_attempts" =~ ^[0-9]+$ ]] || max_attempts=3
+	[[ "$delay" =~ ^[0-9]+$ ]] || delay=3
+	[ "$max_attempts" -ge 1 ] || max_attempts=1
+	[ "$max_attempts" -le 10 ] || max_attempts=10
+	[ "$delay" -ge 1 ] || delay=1
+	local attempt=1
+	while [ $attempt -le "$max_attempts" ]; do
 		if task_sync; then return 0; fi
-		[ $attempt -lt 3 ] && sleep $delay
+		if [ $attempt -lt "$max_attempts" ]; then
+			_interruptible_sleep "$delay"
+		fi
 		attempt=$((attempt + 1))
 		delay=$((delay * 2))
 	done
@@ -171,6 +288,31 @@ HISTORY_LIMIT="${DRAIN_HISTORY_LIMIT:-20}"
 WORKER_ID="drain-$(hostname -s)-$$"
 CHILD_PID=""
 CURRENT_UUID=""
+
+# Single-host guard. Autonomous execution is single-host because
+# TaskChampion sync provides no atomic compare-and-swap claim: two hosts
+# can each claim and execute the same task. When worker.primary_host
+# (or DRAIN_PRIMARY_HOST) is configured, workers and the supervisor refuse
+# to start on any other host unless DRAIN_ALLOW_OTHER_HOST=1 is set
+# explicitly (auditable override for migration/recovery). Unset means no
+# enforcement (documented limitation: accidental multi-host deployment is
+# then possible; see docs/architecture.md).
+check_primary_host() { # $1 = role ("worker"|"supervisor")
+	local role="${1:-worker}" primary me allow
+	primary="${DRAIN_PRIMARY_HOST:-$(config_get worker.primary_host "")}"
+	[ -n "$primary" ] || return 0
+	me=$(hostname -s 2>/dev/null || hostname)
+	allow="${DRAIN_ALLOW_OTHER_HOST:-0}"
+	if [ "$me" != "$primary" ]; then
+		if [ "$allow" = "1" ]; then
+			log "WARNING: $role starting on $me although primary host is $primary (DRAIN_ALLOW_OTHER_HOST=1 override)"
+			return 0
+		fi
+		log "ERROR: $role refusing to start on $me: primary autonomous host is $primary. Set DRAIN_ALLOW_OTHER_HOST=1 to override explicitly."
+		return 1
+	fi
+	return 0
+}
 
 log() { printf '[%s] [%s] %s\n' "$(date '+%F %T')" "$WORKER_ID" "$*" >&2; }
 
@@ -200,20 +342,173 @@ stop_scope() { # why this worker is stopping: global|personal|none
 	else echo none; fi
 }
 
-# Host-local ownership locks. Abandoned locks require explicit operator recovery.
+# Host-local ownership locks with verifiable worker identity.
+# Layout per lock dir: pid, host, worker, created (epoch), proc_start.
+# Legacy locks contain only pid. Partial writes (crash between mkdir and
+# metadata) contain a subset. Policy: fail closed — a lock is reclaimed
+# only when it is provably abandoned (owner PID dead, or PID reused by a
+# different process as proven by proc_start mismatch on a same-host lock
+# with full metadata). Anything else (live owner, missing/unverifiable
+# metadata with a live PID, cross-host lock, or a young lock still being
+# written) is kept.
 TASK_LOCK=""
 REPO_LOCK=""
+# Grace period before a lock is even considered for reclamation: covers a
+# creator still writing metadata and concurrent acquire-vs-cleanup races.
+drain_lock_grace_sec() {
+	local v="${DRAIN_LOCK_GRACE_SEC:-10}"
+	[[ "$v" =~ ^[0-9]+$ ]] || v=10
+	printf '%s\n' "$v"
+}
+# Start time of a PID as a stable identity string (survives PID reuse
+# detection: a reused PID has a different start time). Empty when unknown.
+proc_start_time() { # $1 = pid
+	local pid="$1" out=""
+	[[ "$pid" =~ ^[0-9]+$ ]] || return 0
+	out=$(ps -o lstart= -p "$pid" 2>/dev/null || true)
+	printf '%s' "$out" | sed 's/^ *//;s/ *$//'
+}
+# Command line of a PID (empty when unknown/dead).
+proc_command() { # $1 = pid
+	local pid="$1"
+	[[ "$pid" =~ ^[0-9]+$ ]] || return 0
+	ps -o command= -p "$pid" 2>/dev/null || true
+}
+# mtime of a path (epoch). Prints now on failure so callers treat
+# unreadable paths as young (fail closed).
+path_mtime() { # $1 = path
+	local now mtime
+	now=$(date +%s)
+	mtime=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo "$now")
+	[[ "$mtime" =~ ^[0-9]+$ ]] || mtime=$now
+	printf '%s\n' "$mtime"
+}
 acquire_lock() {
 	mkdir -p "$HOME/.task-drain/locks"
 	mkdir "$1" 2>/dev/null || return 1
 	printf '%s\n' "$$" >"$1/pid"
+	printf '%s\n' "$(hostname -s 2>/dev/null || hostname)" >"$1/host"
+	printf '%s\n' "${WORKER_ID:-drain-$(hostname -s)-$$}" >"$1/worker"
+	printf '%s\n' "$(date +%s)" >"$1/created"
+	printf '%s\n' "$(proc_start_time $$)" >"$1/proc_start"
+}
+# lock_owner_live PATH: return 0 = live/keep (fail closed), 1 = provably
+# abandoned and safe to reclaim. Never signals anyone; read-only check.
+lock_owner_live() { # $1 = lock dir; rc 0 = keep, 1 = stale
+	local lock="$1" pid host now mtime age grace
+	[ -d "$lock" ] || return 1
+	pid=$(cat "$lock/pid" 2>/dev/null | tr -d ' \t\n' || true)
+	# No usable PID: cannot establish ownership -> fail closed, unless the
+	# directory itself is old enough to be an abandoned partial write with
+	# no writer left. Even then, only reclaim when old beyond grace AND no
+	# pid file at all (a present-but-garbage pid file stays fail-closed).
+	if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+		if [ ! -f "$lock/pid" ]; then
+			now=$(date +%s)
+			mtime=$(path_mtime "$lock")
+			grace=$(drain_lock_grace_sec)
+			age=$((now - mtime))
+			if [ "$age" -gt "$grace" ]; then return 1; fi
+		fi
+		return 0
+	fi
+	# Our own lock is always live.
+	if [ "$pid" = "$$" ]; then return 0; fi
+	# Cross-host locks are never reclaimed here: this guard is host-local.
+	host=$(cat "$lock/host" 2>/dev/null | tr -d ' \t\n' || true)
+	if [ -n "$host" ]; then
+		local me
+		me=$(hostname -s 2>/dev/null || hostname)
+		if [ "$host" != "$me" ]; then return 0; fi
+	fi
+	# Dead PID: no reuse in progress right now -> safe to reclaim.
+	if ! kill -0 "$pid" 2>/dev/null; then return 1; fi
+	# PID alive: verify identity to defeat PID reuse. New-format locks
+	# carry the owner's process start time; a mismatch proves reuse.
+	local recorded current
+	recorded=$(cat "$lock/proc_start" 2>/dev/null || true)
+	if [ -n "$recorded" ]; then
+		current=$(proc_start_time "$pid")
+		if [ -n "$current" ]; then
+			if [ "$recorded" != "$current" ]; then return 1; fi
+			return 0
+		fi
+		# Cannot read current start time -> fail closed.
+		return 0
+	fi
+	# Legacy lock (pid only) with a live PID: fail closed. Additionally,
+	# when the live PID's command line is available and clearly not a
+	# drain worker, treat PID reuse as proven — but only for locks old
+	# enough that the creator cannot still be writing metadata.
+	local cmd
+	cmd=$(proc_command "$pid")
+	if [ -n "$cmd" ]; then
+		case "$cmd" in
+		*task-drain.sh*) return 0 ;;
+		*)
+			now=$(date +%s)
+			mtime=$(path_mtime "$lock")
+			grace=$(drain_lock_grace_sec)
+			age=$((now - mtime))
+			if [ "$age" -gt "$grace" ]; then return 1; fi
+			return 0
+			;;
+		esac
+	fi
+	return 0
+}
+# try_reclaim_lock PATH: remove the lock dir only when provably abandoned
+# (see lock_owner_live) and older than the grace period. Returns 0 when the
+# path is free (absent or reclaimed), 1 when it must be kept.
+try_reclaim_lock() { # $1 = lock dir
+	local lock="$1" now mtime age grace before
+	[ -d "$lock" ] || return 0
+	now=$(date +%s)
+	mtime=$(path_mtime "$lock")
+	grace=$(drain_lock_grace_sec)
+	age=$((now - mtime))
+	if [ "$age" -le "$grace" ]; then return 1; fi
+	if lock_owner_live "$lock"; then return 1; fi
+	# Re-verify the pid file is unchanged before removing, to narrow the
+	# concurrent cleanup-vs-acquire race (best effort on a local FS).
+	before=$(cat "$lock/pid" 2>/dev/null || true)
+	if [ "$(cat "$lock/pid" 2>/dev/null || true)" != "$before" ]; then return 1; fi
+	rm -rf "$lock" 2>/dev/null || true
+	[ -d "$lock" ] && return 1
+	return 0
+}
+# acquire_lock_with_recovery PATH: acquire, else attempt one safe reclaim
+# of a stale holder and retry once. Returns 0 on ownership, 1 otherwise.
+acquire_lock_with_recovery() { # $1 = lock dir
+	if acquire_lock "$1"; then return 0; fi
+	if try_reclaim_lock "$1"; then
+		if acquire_lock "$1"; then return 0; fi
+	fi
+	return 1
+}
+# Sweep all stale lock dirs under the lock root. Only removes provably
+# abandoned locks; live, unverifiable, cross-host, and young locks are
+# kept. Safe to call from worker startup and each loop iteration.
+reclaim_abandoned_locks() {
+	local root="$HOME/.task-drain/locks" lock
+	[ -d "$root" ] || return 0
+	for lock in "$root"/*; do
+		[ -d "$lock" ] || continue
+		case "$lock" in
+		*/history) continue ;; # history lock is short-lived; handled inline
+		esac
+		if try_reclaim_lock "$lock"; then
+			[ "$lock" != "$root/*" ] && log "reclaimed abandoned lock: $lock"
+		fi
+	done
+	return 0
 }
 release_locks() {
 	local path
 	for path in "${TASK_LOCK:-}" "${REPO_LOCK:-}"; do
 		[ -n "$path" ] || continue
 		[ "$(cat "$path/pid" 2>/dev/null)" = "$$" ] || continue
-		rm -f "$path/pid"
+		rm -f "$path/pid" "$path/host" "$path/worker" "$path/created" "$path/proc_start"
 		rmdir "$path" 2>/dev/null || true
 	done
 	TASK_LOCK=""
@@ -263,6 +558,7 @@ terminate_tree() {
 }
 on_signal() {
 	log "signal received; stopping worker and child ${CHILD_PID:-none}"
+	[ -z "${SYNC_PID:-}" ] || kill "$SYNC_PID" 2>/dev/null || true
 	if [ -n "$CHILD_PID" ]; then
 		terminate_tree "$CHILD_PID"
 		wait "$CHILD_PID" 2>/dev/null || true
@@ -601,16 +897,16 @@ run_one() { # $1 = task export JSON
 	repo=$(cd "$repo" && pwd -P)
 	TASK_LOCK="$HOME/.task-drain/locks/$uuid"
 	REPO_LOCK="$HOME/.task-drain/locks/repo-$(printf '%s' "$repo" | cksum | awk '{print $1}')"
-	if ! acquire_lock "$TASK_LOCK"; then
+	if ! acquire_lock_with_recovery "$TASK_LOCK"; then
 		TASK_LOCK=""
 		REPO_LOCK=""
-		sleep 1
+		_interruptible_sleep 1
 		return 1
 	fi
-	if ! acquire_lock "$REPO_LOCK"; then
+	if ! acquire_lock_with_recovery "$REPO_LOCK"; then
 		REPO_LOCK=""
 		release_locks
-		sleep 1
+		_interruptible_sleep 1
 		return 1
 	fi
 
@@ -730,6 +1026,11 @@ run_one() { # $1 = task export JSON
 history_record() { # $1=uuid $2=project $3=description $4=result $5=duration_sec $6=worker_id
 	local desc history_lock="$HOME/.task-drain/locks/history" tries=0
 	while ! acquire_lock "$history_lock"; do
+		# A SIGKILLed holder leaves this short-lived lock behind; reclaim
+		# it when provably abandoned, then retry. Respects the grace
+		# period so a live holder is never disturbed.
+		try_reclaim_lock "$history_lock" 2>/dev/null || true
+		if acquire_lock "$history_lock" 2>/dev/null; then break; fi
 		tries=$((tries + 1))
 		[ "$tries" -lt 100 ] || {
 			log "history lock unavailable"
@@ -742,11 +1043,14 @@ history_record() { # $1=uuid $2=project $3=description $4=result $5=duration_sec
 		"$(date -u '+%FT%TZ')" "$1" "$2" "$desc" "$4" "$5" "${6:-$WORKER_ID}" >>"$HISTORY_FILE"
 	# Prune to rolling window
 	tail -n "$HISTORY_LIMIT" "$HISTORY_FILE" >"$HISTORY_FILE.tmp.$$" && mv "$HISTORY_FILE.tmp.$$" "$HISTORY_FILE"
-	rm -f "$history_lock/pid"
+	rm -f "$history_lock/pid" "$history_lock/host" "$history_lock/worker" "$history_lock/created" "$history_lock/proc_start"
 	rmdir "$history_lock"
 }
 
 run_worker() {
+	if ! check_primary_host "worker"; then
+		exit 1
+	fi
 	case "$DRAIN_AGENT" in
 	opencode) _agent_bin="$OPENCODE_BIN" ;;
 	claude) _agent_bin="$CLAUDE_BIN" ;;
@@ -773,9 +1077,12 @@ run_worker() {
 	fi
 	log "worker starting (filter: ${PROJECT_FILTER:-all projects})"
 	sync_with_retry || {
-		log "ERROR: initial sync failed after 3 attempts -- aborting, never work offline"
+		log "ERROR: initial sync failed after bounded retries -- aborting, never work offline"
 		exit 1
 	}
+	# Recover locks abandoned by SIGKILLed workers from a prior run. Only
+	# provably stale locks are removed; live and unverifiable locks are kept.
+	reclaim_abandoned_locks || true
 
 	# Retry mode: snapshot the failed set once; each task gets at most one
 	# retry per run, so a task that fails again can't loop forever.
@@ -810,6 +1117,7 @@ run_worker() {
 			return 1
 		}
 		reclaim_stale
+		reclaim_abandoned_locks || true
 		task_json=$(pick_task) || task_json=""
 		if [ -z "$task_json" ]; then
 			sync_with_retry >/dev/null 2>&1 || true
@@ -1677,6 +1985,9 @@ scoped_worker_pids() {
 	return 0
 }
 autoscale_supervisor() {
+	if ! check_primary_host "supervisor"; then
+		exit 1
+	fi
 	: "${DRAIN_SCRIPT:=$0}"
 	: "${LOG_DIR:=$HOME/.task-drain/logs}"
 	mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -1704,8 +2015,47 @@ autoscale_supervisor() {
 	_supervisor_on_signal() {
 		log "autoscaler stopping"
 		[ -z "${SLEEP_PID:-}" ] || kill "$SLEEP_PID" 2>/dev/null || true
+		_supervisor_reap_workers || true
 		_supervisor_release_state
 		exit 0
+	}
+	# Reap terminated supervisor-spawned workers. The supervisor launches
+	# workers with `&` and otherwise never waits on them, so each exited
+	# worker lingers as a zombie (visible in ps, inflating worker counts)
+	# until the supervisor reaps it. This only waits on PIDs the
+	# supervisor itself spawned; it never signals or waits on unrelated
+	# processes. Exited PIDs are dropped from the list; live ones are kept.
+	_SUPERVISOR_CHILDREN=""
+	_supervisor_track_child() { # $1 = pid
+		_SUPERVISOR_CHILDREN="$_SUPERVISOR_CHILDREN $1"
+	}
+	_supervisor_reap_workers() {
+		local alive="" pid
+		for pid in $_SUPERVISOR_CHILDREN; do
+			[ -n "$pid" ] || continue
+			if kill -0 "$pid" 2>/dev/null; then
+				alive="$alive $pid"
+			else
+				wait "$pid" 2>/dev/null || true
+			fi
+		done
+		_SUPERVISOR_CHILDREN="$alive"
+		# Also reap any other completed background jobs owned by this
+		# shell (e.g. staggered-spawn sleeps) without blocking.
+		while true; do
+			local _done=""
+			_done=$(jobs -pr 2>/dev/null || true)
+			[ -n "$_done" ] || break
+			local _reaped=0 _j
+			for _j in $_done; do
+				if ! kill -0 "$_j" 2>/dev/null; then
+					wait "$_j" 2>/dev/null || true
+					_reaped=1
+				fi
+			done
+			[ "$_reaped" = 1 ] || break
+		done
+		return 0
 	}
 	# tq: task query helper (mirrors cmd_status's local one; not in scope here)
 	tq() {
@@ -1736,6 +2086,9 @@ autoscale_supervisor() {
 
 		# Sync and count eligible tasks
 		sync_with_retry >/dev/null 2>&1 || log "autoscaler: sync failed, using local state"
+		# Reap exited workers before counting, so zombies never inflate
+		# the running count and registrations stay accurate.
+		_supervisor_reap_workers || true
 		local eligible
 		eligible=$(queue_json 2>/dev/null | jq length 2>/dev/null || echo 0)
 		[[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
@@ -1760,7 +2113,9 @@ autoscale_supervisor() {
 			for _i in $(seq 1 "$to_start"); do
 				local logf="$LOG_DIR/worker-$(date '+%Y%m%d-%H%M%S')-autoscale-$_i.log"
 				nohup bash "$DRAIN_SCRIPT" >>"$logf" 2>&1 &
+				_supervisor_track_child $!
 				_supervisor_sleep 5 # stagger spawns: concurrent initial syncs overwhelm taskserver
+				_supervisor_reap_workers || true
 			done
 		elif [ "$desired" -lt "$running" ]; then
 			local to_stop=$((running - desired))

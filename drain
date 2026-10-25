@@ -135,6 +135,21 @@ fi
 
 need_script() { [ -f "$DRAIN_SCRIPT" ] || die "worker script not found: $DRAIN_SCRIPT"; }
 
+# Fail-closed single-host guard for the CLI. When worker.primary_host (or
+# DRAIN_PRIMARY_HOST) is configured, `drain start` and `drain autoscale`
+# refuse on other hosts unless DRAIN_ALLOW_OTHER_HOST=1. Unset = no
+# enforcement (see docs/architecture.md: true cross-host prevention needs
+# an external coordination primitive).
+check_cli_primary_host() { # $1 = command name
+  local primary me
+  primary="${DRAIN_PRIMARY_HOST:-$(config_get worker.primary_host "")}"
+  [ -n "$primary" ] || return 0
+  me=$(hostname -s 2>/dev/null || hostname)
+  if [ "$me" != "$primary" ] && [ "${DRAIN_ALLOW_OTHER_HOST:-0}" != "1" ]; then
+    die "$1 refused on $me: primary autonomous host is $primary (set DRAIN_ALLOW_OTHER_HOST=1 to override explicitly)"
+  fi
+}
+
 worker_pids() {
   # Use shared worker detection from lib/worker-detect.sh
   drain_worker_pids
@@ -184,6 +199,7 @@ cmd_status() { # [project] [-w|--watch] [--workers] [--verbose]
 
 cmd_start() { # [N] [project|all] [--failed] [--persist] [--autonomous]
   need_script
+  check_cli_primary_host "drain start"
   local n="" project="" retry=0 persist=0 autonomous=0 running i logf a
   for a in "$@"; do
     case "$a" in
@@ -266,6 +282,7 @@ cmd_unfail() { # [project] [--dry-run]
 cmd_autoscale() { # [project] [--min N] [--max N]
   # Supervisor daemon: watches queue depth and scales workers up/down.
   need_script
+  check_cli_primary_host "drain autoscale"
   local project="" min_w="" max_w=""
   while [ $# -gt 0 ]; do
     case "$1" in
