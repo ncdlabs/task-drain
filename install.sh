@@ -295,6 +295,26 @@ for script in task-drain.sh drain; do
 done
 mkdir -p "$HOME/.task-drain/logs"
 ok "$HOME/.task-drain/logs ready"
+# Provision a default YAML template for new installations only.
+# Never overwrites, never enables autonomous execution, never invents a
+# primary hostname, never writes secrets. Existing installs are untouched.
+if [ ! -f "$HOME/.task-drain/config.yaml" ]; then
+	if command -v python3 >/dev/null 2>&1 && [ -f "$REPO_DIR/lib/drain-config.py" ]; then
+		python3 "$REPO_DIR/lib/drain-config.py" template >"$HOME/.task-drain/config.yaml.tmp.$$"
+		chmod 600 "$HOME/.task-drain/config.yaml.tmp.$$"
+		mv "$HOME/.task-drain/config.yaml.tmp.$$" "$HOME/.task-drain/config.yaml"
+		chmod 600 "$HOME/.task-drain/config.yaml"
+		ok "created ~/.task-drain/config.yaml (mode 600; edit worker.primary_host only on the designated executor)"
+	else
+		warn "python3 not found; skipping config template (run: drain config init)"
+	fi
+else
+	if python3 "$REPO_DIR/lib/drain-config.py" validate >/dev/null 2>&1; then
+		ok "existing ~/.task-drain/config.yaml is valid"
+	else
+		warn "existing ~/.task-drain/config.yaml is INVALID (run: drain config validate); leaving it untouched"
+	fi
+fi
 
 # ---------------------------------------------------------------- plugin
 if [ "$SKIP_PLUGIN" != "1" ]; then
