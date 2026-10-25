@@ -1,0 +1,52 @@
+# full valid config: every schema setting exercised with non-default values.
+worker:
+  primary_host: llama
+  agent: claude
+  model: "test-model-1"
+  owner: "Test Owner"
+  skip_permissions: true
+  autonomous: true
+  retry_failed: true
+  persist: true
+  persist_poll_seconds: 11
+  allow_home: true
+  allow_sudo: false
+  task_timeout_seconds: 3600
+  stale_after_seconds: 7200
+supervisor:
+  min_workers: 2
+  max_workers: 6
+  interval_seconds: 15
+  tasks_per_worker: 3
+  startup_lock_max_age_seconds: 60
+sync:
+  timeout_seconds: 20
+  retries: 5
+  retry_delay_seconds: 2
+locks:
+  grace_seconds: 5
+history:
+  limit: 50
+display:
+  watch_interval_seconds: 10
+  verbose: true
+logging:
+  level: debug
+paths:
+  git_root: "/tmp/drain-test-git"
+  task_bin: "/bin/echo"
+  opencode_bin: "opencode-test"
+  claude_bin: "claude-test"
+  codex_bin: "codex-test"
+task:
+  taskrc: "/tmp/drain-test-taskrc"
+  auto_sync: false
+repos:
+  myproject:
+    path: "/tmp/drain-test-repo"
+    url: "https://example.com/myproject.git"
+remotes:
+  llama:
+    ssh: "ssh llama"
+    git_root: "/Users/lou/git"
+default_remote: ""

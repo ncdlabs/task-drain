@@ -1,0 +1,3 @@
+# invalid: out of range (retries max 10).
+sync:
+  retries: 99

@@ -1199,7 +1199,7 @@ STUB
     export DRAIN_MIN_WORKERS=0
     export DRAIN_MAX_WORKERS=1
     export DRAIN_AUTOSCALE_INTERVAL=1
-    export DRAIN_SYNC_RETRY_DELAY=0
+    export DRAIN_SYNC_RETRY_DELAY=1
     # Empty queue from the mock task + min 0 => desired 0: no workers spawn,
     # so this exercises the real supervisor loop with zero side effects.
     bash "$SCRIPT_DIR/task-drain.sh" autoscale </dev/null >>"$BATS_TEST_TMPDIR/sup.log" 2>&1 &
@@ -1389,7 +1389,7 @@ STUB
     export DRAIN_MIN_WORKERS=0
     export DRAIN_MAX_WORKERS=1
     export DRAIN_AUTOSCALE_INTERVAL=1
-    export DRAIN_SYNC_RETRY_DELAY=0
+    export DRAIN_SYNC_RETRY_DELAY=1
     # Mock task exports an empty queue and min is 0, so desired workers is
     # 0: the real supervisor starts, idles, and spawns nothing.
     run "$SCRIPT_DIR/drain" autoscale --min 0 --max 1
@@ -1676,7 +1676,7 @@ HANG
     export DRAIN_MIN_WORKERS=1
     export DRAIN_MAX_WORKERS=1
     export DRAIN_AUTOSCALE_INTERVAL=1
-    export DRAIN_SYNC_RETRY_DELAY=0
+    export DRAIN_SYNC_RETRY_DELAY=1
     # Force spawned workers to exit immediately (missing agent binary) so
     # the supervisor has exited children to reap. The mock task exports an
     # empty queue, so nothing else spawns.

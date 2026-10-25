@@ -1,0 +1,4 @@
+# invalid: unknown top-level and nested keys must be rejected.
+worker:
+  primary_host: llama
+  nonexistent_setting: true

@@ -1,0 +1,4 @@
+# malformed YAML: bad indentation / missing colon value structure.
+worker
+  primary_host llama
+	allow_home: true

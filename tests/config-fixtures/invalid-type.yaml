@@ -1,0 +1,3 @@
+# invalid: wrong type (string where int expected).
+sync:
+  retries: "many"

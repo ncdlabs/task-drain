@@ -1,0 +1,3 @@
+# minimal valid config: only the safety-critical host key.
+worker:
+  primary_host: llama
