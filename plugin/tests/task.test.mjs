@@ -22,6 +22,7 @@ import {
   getInstallInstructions,
   getTask,
   hasTag,
+  isDrainClaimed,
   lastClaimActor,
   normalizeTag,
   normalizeTags,
@@ -197,6 +198,26 @@ describe("guards", () => {
 
   it("claimGuard allows fresh tasks", () => {
     claimGuard(task(), "opencode");
+  });
+
+  it("claimGuard rejects drain-claimed takeover without explicit override", () => {
+    const t = task({ tags: ["drain-claimed"] });
+    assert.ok(isDrainClaimed(t));
+    assert.throws(() => claimGuard(t, "bob"), /already in review/);
+    assert.throws(() => claimGuard(t, "bob", { force: true }), /overrideDrainClaim/);
+    assert.throws(
+      () => claimGuard(t, "bob", { force: true, overrideDrainClaim: true }),
+      /overrideReason/,
+    );
+    claimGuard(t, "admin", { force: true, overrideDrainClaim: true, overrideReason: "host retired" });
+    claimGuard(t, "admin", { overrideDrainClaim: true, overrideReason: "host retired" });
+  });
+
+  it("startGuard rejects active drain claims without explicit override", () => {
+    const t = task({ tags: ["drain-claimed"], start: "20261007T100000Z" });
+    assert.throws(() => startGuard(t), /already started/);
+    assert.throws(() => startGuard(t, { force: true }), /overrideDrainClaim/);
+    startGuard(t, { force: true, overrideDrainClaim: true, overrideReason: "recovery" });
   });
 
   it("startGuard blocks already-started tasks", () => {

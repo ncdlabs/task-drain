@@ -238,10 +238,41 @@ export function assertActionable(task, { force = false } = {}) {
   }
 }
 
+/** True when a shell drain worker owns the task (host-local drain protocol). */
+export function isDrainClaimed(task) {
+  return hasTag(task, "drain-claimed");
+}
+
+/**
+ * Require an explicit, auditable administrative override before touching a
+ * task owned by an active drain worker. `force:true` alone is NOT enough:
+ * callers must pass overrideDrainClaim:true plus a non-empty overrideReason
+ * (recorded in an annotation by the tool layer). Throws otherwise.
+ */
+export function requireDrainOverride(task, { force = false, overrideDrainClaim = false, overrideReason = "" } = {}) {
+  if (!isDrainClaimed(task)) return;
+  if (overrideDrainClaim === true) {
+    if (typeof overrideReason !== "string" || overrideReason.trim().length === 0) {
+      throw new Error(
+        "Overriding an active drain claim requires a non-empty overrideReason (recorded for audit).",
+      );
+    }
+    return;
+  }
+  if (force === true) {
+    throw new Error(
+      "Task is owned by an active drain worker (drain-claimed); force:true cannot take it over. Retry with overrideDrainClaim:true plus an overrideReason for an auditable administrative recovery.",
+    );
+  }
+  throw new Error("Task is already in review and cannot be claimed");
+}
+
 /** Guard for claim_task. Throws on violation unless force is set. */
-export function claimGuard(task, actor, { force = false } = {}) {
+export function claimGuard(task, actor, { force = false, overrideDrainClaim = false, overrideReason = "" } = {}) {
   assertActionable(task, { force });
-  if (!force && (hasTag(task, "ready-for-review") || hasTag(task, "review") || hasTag(task, "drain-claimed"))) {
+  if (isDrainClaimed(task)) {
+    requireDrainOverride(task, { force, overrideDrainClaim, overrideReason });
+  } else if (!force && (hasTag(task, "ready-for-review") || hasTag(task, "review"))) {
     throw new Error("Task is already in review and cannot be claimed");
   }
   if (tagsOf(task).includes("claimed") && !force) {
@@ -254,8 +285,16 @@ export function claimGuard(task, actor, { force = false } = {}) {
 }
 
 /** Guard for start. Taskwarrior tracks active work via the `start` field. */
-export function startGuard(task, { force = false } = {}) {
+export function startGuard(task, { force = false, overrideDrainClaim = false, overrideReason = "" } = {}) {
   assertActionable(task, { force });
+  if (isDrainClaimed(task) && task.start && !overrideDrainClaim) {
+    if (force === true) {
+      throw new Error(
+        "Task is actively worked by a drain worker (drain-claimed + started); force:true cannot take it over. Retry with overrideDrainClaim:true plus an overrideReason for an auditable administrative recovery.",
+      );
+    }
+    throw new Error("Task is already started; stop it first or retry with force:true");
+  }
   if (task.start && !force) {
     throw new Error("Task is already started; stop it first or retry with force:true");
   }

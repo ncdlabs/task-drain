@@ -39,6 +39,7 @@ import {
   generateSetupScript,
   getTask,
   hasTag,
+  isDrainClaimed,
   lastClaimActor,
   normalizeTags,
   parseListing,
@@ -383,12 +384,14 @@ export function createTools(config: TaskConfig): ToolDef[] {
       tools.push({
         name: "claim",
         description:
-          "Claim a task for an actor before starting work. Fails if in review or already claimed by someone else (unless force).",
+          "Claim a task for an actor before starting work. Fails if in review or already claimed by someone else (unless force). Tasks owned by an active drain worker (drain-claimed) are never taken over by force alone: pass overrideDrainClaim:true with an overrideReason for an auditable administrative recovery.",
         input: objectSchema(
           {
             uuid: UUID_SCHEMA,
             actor: ACTOR_SCHEMA,
             force: { type: "boolean", description: "Steal an existing claim." },
+            overrideDrainClaim: { type: "boolean", description: "Explicit administrative override of an active drain-claimed task. Requires overrideReason." },
+            overrideReason: { type: "string", description: "Auditable reason recorded when overriding a drain claim." },
           },
           ["uuid", "actor"],
         ),
@@ -400,7 +403,8 @@ export function createTools(config: TaskConfig): ToolDef[] {
               const task = (await getTask(config, input.uuid, {
                 signal: context.signal,
               })) as Task;
-              claimGuard(task, input.actor, { force: input.force === true });
+              claimGuard(task, input.actor, { force: input.force === true, overrideDrainClaim: input.overrideDrainClaim === true, overrideReason: input.overrideReason ?? "" });
+              const wasDrainClaimed = isDrainClaimed(task);
               await runTask(config, [input.uuid, "modify", "+claimed"], {
                 signal: context.signal,
               });
@@ -409,6 +413,13 @@ export function createTools(config: TaskConfig): ToolDef[] {
                 [input.uuid, "annotate", formatAnnotation(input.actor, "claimed", "claimed for implementation")],
                 { signal: context.signal },
               );
+              if (wasDrainClaimed && input.overrideDrainClaim === true) {
+                await runTask(
+                  config,
+                  [input.uuid, "annotate", formatAnnotation(input.actor, "drain-override", String(input.overrideReason))],
+                  { signal: context.signal },
+                );
+              }
               return await getTask(config, input.uuid, {
                 signal: context.signal,
               });
@@ -461,12 +472,14 @@ export function createTools(config: TaskConfig): ToolDef[] {
 
       tools.push({
         name: "start",
-        description: "Mark a claimed task as actively being worked (task start).",
+        description: "Mark a claimed task as actively being worked (task start). Tasks actively worked by a drain worker require overrideDrainClaim:true with an overrideReason instead of force alone.",
         input: objectSchema(
           {
             uuid: UUID_SCHEMA,
             actor: ACTOR_SCHEMA,
             force: { type: "boolean" },
+            overrideDrainClaim: { type: "boolean", description: "Explicit administrative override of an active drain-claimed task. Requires overrideReason." },
+            overrideReason: { type: "string", description: "Auditable reason recorded when overriding a drain claim." },
           },
           ["uuid", "actor"],
         ),
@@ -477,7 +490,8 @@ export function createTools(config: TaskConfig): ToolDef[] {
               const task = (await getTask(config, input.uuid, {
                 signal: context.signal,
               })) as Task;
-              startGuard(task, { force: input.force === true });
+              startGuard(task, { force: input.force === true, overrideDrainClaim: input.overrideDrainClaim === true, overrideReason: input.overrideReason ?? "" });
+              const wasDrainClaimed = isDrainClaimed(task);
               await runTask(config, [input.uuid, "start"], {
                 signal: context.signal,
               });
@@ -486,6 +500,13 @@ export function createTools(config: TaskConfig): ToolDef[] {
                 [input.uuid, "annotate", formatAnnotation(input.actor, "started", "implementation underway")],
                 { signal: context.signal },
               );
+              if (wasDrainClaimed && input.overrideDrainClaim === true) {
+                await runTask(
+                  config,
+                  [input.uuid, "annotate", formatAnnotation(input.actor, "drain-override", String(input.overrideReason))],
+                  { signal: context.signal },
+                );
+              }
               return await getTask(config, input.uuid, {
                 signal: context.signal,
               });

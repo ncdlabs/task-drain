@@ -13,10 +13,25 @@ test('review alone cannot complete and force requires a reason',()=>fixture(asyn
  await assert.rejects(()=>t('complete').execute({uuid,actor:'a',force:true},{}),/requires a note/);
  assert.equal(f.getCalls().filter(c=>c.includes('done')).length,0);
 }));
-test('claim allows drain-claimed tasks with force',()=>fixture(async(f,t)=>{
+test('claim rejects drain-claimed takeover with force alone, allows explicit override',()=>fixture(async(f,t)=>{
   f.setResponses([{match:'export',stdout:JSON.stringify({uuid,status:'pending',tags:['drain-claimed']})+'\n'}]);
-  const r=await t('claim').execute({uuid,actor:'a',force:true},{});
+  await assert.rejects(()=>t('claim').execute({uuid,actor:'a',force:true},{}),/overrideDrainClaim/);
+  const taskData=JSON.stringify({uuid,status:'pending',tags:['drain-claimed']})+'\n';
+  f.setResponses([
+    {match:'export',stdout:taskData},
+    {match:'modify',stdout:'Modified.\n'},
+    {match:'annotate',stdout:'Annotation added.\n'},
+    {match:'annotate',stdout:'Annotation added.\n'},
+    {match:'export',stdout:taskData},
+  ]);
+  const r=await t('claim').execute({uuid,actor:'a',force:true,overrideDrainClaim:true,overrideReason:'admin recovery: worker host retired'},{});
   assert.ok(r.content.includes(uuid));
+  assert.ok(f.getCalls().some(c=>JSON.stringify(c).includes('drain-override')));
+}));
+test('claim override without a reason is rejected',()=>fixture(async(f,t)=>{
+  f.setResponses([{match:'export',stdout:JSON.stringify({uuid,status:'pending',tags:['drain-claimed']})+'\n'}]);
+  await assert.rejects(()=>t('claim').execute({uuid,actor:'a',force:true,overrideDrainClaim:true},{}),/overrideReason/);
+  await assert.rejects(()=>t('claim').execute({uuid,actor:'a',overrideDrainClaim:true,overrideReason:'  '},{}),/overrideReason/);
 }));
 test('claim allows same-actor reclaim without force',()=>fixture(async(f,t)=>{
   const taskData=JSON.stringify({uuid,status:'pending',tags:['claimed'],annotations:[{description:'claimed by a'}]})+'\n';
