@@ -37,9 +37,9 @@
     "directory": "plugin"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp ../lib/config-schema.json ./src/config-schema.json && cp ../lib/config-schema.json ./dist/config-schema.json",
     "prepare": "npm run build",
-    "test": "npm run build && node --test tests/task.test.mjs tests/tools.test.mjs tests/regressions.test.mjs",
+    "test": "npm run build && node --test tests/task.test.mjs tests/tools.test.mjs tests/regressions.test.mjs tests/drain-config.test.mjs",
     "test:integration": "npm run build && node --test --test-concurrency=1 tests/integration.test.mjs tests/handlers.integration.test.mjs",
     "test:all": "npm run test && npm run test:integration",
     "typecheck": "tsc --noEmit"

@@ -45,14 +45,41 @@ function defaultTaskBin() {
   return existsSync(DEFAULT_TASK_BIN) ? DEFAULT_TASK_BIN : "task";
 }
 
-/** Resolve the task binary / taskrc from plugin options, env, then defaults. */
+/** Resolve the task binary / taskrc from plugin options, env, then defaults.
+ *
+ * Canonical contract: task-related settings are authoritatively defined in
+ * config-schema.json (paths.task_bin, task.taskrc, task.auto_sync) and
+ * resolved with the same precedence/validation as the shell resolver
+ * (see ./drain-config.mjs). Explicit options win (CLI layer), then
+ * environment, then YAML, then schema defaults. Invalid configuration
+ * throws (fail closed) instead of falling back silently.
+ */
 export function resolveConfig(options = {}) {
-  const bin =
-    options.taskBin || process.env.TASK_BIN || defaultTaskBin();
-  const taskrc = options.taskrc || process.env.TASKRC || undefined;
-  let autoSync = true;
-  if (options.autoSync !== undefined) autoSync = Boolean(options.autoSync);
-  else if (process.env.TASK_AUTO_SYNC === "0") autoSync = false;
+  try {
+    const cli = {};
+    if (options.taskBin !== undefined) cli["paths.task_bin"] = options.taskBin;
+    if (options.taskrc !== undefined) cli["task.taskrc"] = options.taskrc;
+    if (options.autoSync !== undefined) cli["task.auto_sync"] = options.autoSync;
+    // Lazy import avoids a static cycle and keeps task.mjs dependency-free
+    // for existing unit tests that stub the filesystem.
+    const cfg = resolveConfigCanonical(cli);
+    return cfg;
+  } catch (e) {
+    throw new Error(`Invalid task-drain configuration: ${e.message}`);
+  }
+}
+
+// Canonical resolution for the plugin's task settings. Separated for
+// testability; uses the shared schema + YAML + env contract.
+import { resolveDrainConfig as _resolveDrainConfig } from "./drain-config.mjs";
+function resolveConfigCanonical(cli = {}) {
+  const { values } = _resolveDrainConfig({ cli });
+  let bin = values["paths.task_bin"];
+  // Dynamic default: schema says "task"; prefer the Homebrew path when the
+  // schema default is in effect and the binary exists (matches legacy).
+  if (bin === "task" && existsSync(DEFAULT_TASK_BIN)) bin = DEFAULT_TASK_BIN;
+  const taskrc = values["task.taskrc"] ?? undefined;
+  const autoSync = values["task.auto_sync"];
   return { bin, taskrc, autoSync };
 }
 
