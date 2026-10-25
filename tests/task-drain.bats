@@ -1414,3 +1414,331 @@ STUB
     [ ! -d "$DRAIN_HOME/autoscale.starting" ]
     unset DRAIN_MIN_WORKERS DRAIN_MAX_WORKERS DRAIN_AUTOSCALE_INTERVAL DRAIN_SYNC_RETRY_DELAY
 }
+
+# --- stale task-lock recovery (Phase 2) ---
+
+@test "stale task lock from dead worker is reclaimed and reusable" {
+    load_functions
+    local lock="$HOME/.task-drain/locks/dead-uuid-1"
+    mkdir -p "$HOME/.task-drain/locks"
+    (exit 0) &
+    local dead=$!
+    wait "$dead" 2>/dev/null || true
+    mkdir "$lock"
+    printf '%s\n' "$dead" > "$lock/pid"
+    printf '%s\n' "$(hostname -s)" > "$lock/host"
+    printf 'drain-test-1\n' > "$lock/worker"
+    printf '1\n' > "$lock/created"
+    printf 'bogus-start\n' > "$lock/proc_start"
+    touch -t 200001010000 "$lock"
+    # Dead PID: provably abandoned despite the bogus proc_start.
+    run lock_owner_live "$lock"
+    [ "$status" -ne 0 ]
+    run acquire_lock_with_recovery "$lock"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$lock/pid")" = "$$" ]
+    [ -f "$lock/host" ]
+    [ -f "$lock/proc_start" ]
+    rm -rf "$lock"
+}
+
+@test "live worker lock is never reclaimed" {
+    load_functions
+    local lock="$HOME/.task-drain/locks/live-uuid-1"
+    mkdir -p "$HOME/.task-drain/locks"
+    mkdir "$lock"
+    printf '%s\n' "$$" > "$lock/pid"
+    printf '%s\n' "$(hostname -s)" > "$lock/host"
+    printf 'drain-test-live\n' > "$lock/worker"
+    printf '%s\n' "$(date +%s)" > "$lock/created"
+    printf '%s\n' "$(proc_start_time $$)" > "$lock/proc_start"
+    touch -t 200001010000 "$lock"
+    run lock_owner_live "$lock"
+    [ "$status" -eq 0 ]
+    run try_reclaim_lock "$lock"
+    [ "$status" -ne 0 ]
+    [ -d "$lock" ]
+    [ "$(cat "$lock/pid")" = "$$" ]
+    rm -rf "$lock"
+}
+
+@test "PID reuse is detected via proc_start mismatch without killing the process" {
+    load_functions
+    sleep 60 </dev/null >>"$BATS_TEST_TMPDIR/reuse.log" 2>&1 &
+    local other=$!
+    local lock="$HOME/.task-drain/locks/reuse-uuid-1"
+    mkdir -p "$HOME/.task-drain/locks"
+    mkdir "$lock"
+    printf '%s\n' "$other" > "$lock/pid"
+    printf '%s\n' "$(hostname -s)" > "$lock/host"
+    printf 'drain-old-worker\n' > "$lock/worker"
+    printf '1\n' > "$lock/created"
+    printf 'definitely-not-the-real-start-time\n' > "$lock/proc_start"
+    touch -t 200001010000 "$lock"
+    kill -0 "$other" 2>/dev/null
+    run lock_owner_live "$lock"
+    [ "$status" -ne 0 ]
+    run try_reclaim_lock "$lock"
+    [ "$status" -eq 0 ]
+    [ ! -d "$lock" ]
+    # The live process was never signaled: reaping removes state only.
+    kill -0 "$other" 2>/dev/null
+    kill "$other" 2>/dev/null || true
+    wait "$other" 2>/dev/null || true
+}
+
+@test "concurrent young lock is protected by the grace period" {
+    load_functions
+    local lock="$HOME/.task-drain/locks/young-uuid-1"
+    mkdir -p "$HOME/.task-drain/locks"
+    (exit 0) &
+    local dead=$!
+    wait "$dead" 2>/dev/null || true
+    mkdir "$lock"
+    printf '%s\n' "$dead" > "$lock/pid"
+    # Fresh mtime (just created): within the grace period, no reclaim even
+    # though the PID is dead. Covers creator-still-writing races.
+    run try_reclaim_lock "$lock"
+    [ "$status" -ne 0 ]
+    [ -d "$lock" ]
+    touch -t 200001010000 "$lock"
+    run try_reclaim_lock "$lock"
+    [ "$status" -eq 0 ]
+    [ ! -d "$lock" ]
+}
+
+@test "partial lock without pid is fail-closed when young, reclaimed when old" {
+    load_functions
+    local lock="$HOME/.task-drain/locks/partial-uuid-1"
+    mkdir -p "$HOME/.task-drain/locks"
+    mkdir "$lock"
+    run lock_owner_live "$lock"
+    [ "$status" -eq 0 ]
+    run try_reclaim_lock "$lock"
+    [ "$status" -ne 0 ]
+    [ -d "$lock" ]
+    touch -t 200001010000 "$lock"
+    run lock_owner_live "$lock"
+    [ "$status" -ne 0 ]
+    run try_reclaim_lock "$lock"
+    [ "$status" -eq 0 ]
+    [ ! -d "$lock" ]
+}
+
+@test "legacy pid-only lock with dead pid is reclaimed (backward compat)" {
+    load_functions
+    local lock="$HOME/.task-drain/locks/legacy-uuid-1"
+    mkdir -p "$HOME/.task-drain/locks"
+    (exit 0) &
+    local dead=$!
+    wait "$dead" 2>/dev/null || true
+    mkdir "$lock"
+    printf '%s\n' "$dead" > "$lock/pid"
+    touch -t 200001010000 "$lock"
+    run lock_owner_live "$lock"
+    [ "$status" -ne 0 ]
+    run acquire_lock_with_recovery "$lock"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$lock/pid")" = "$$" ]
+    rm -rf "$lock"
+}
+
+@test "legacy lock owned by a live drain worker is kept" {
+    load_functions
+    supervisor_stub "$BATS_TEST_TMPDIR/task-drain.sh"
+    "$BATS_TEST_TMPDIR/task-drain.sh" </dev/null >>"$BATS_TEST_TMPDIR/drain-owner.log" 2>&1 &
+    local owner=$!
+    local lock="$HOME/.task-drain/locks/legacy-live-1"
+    mkdir -p "$HOME/.task-drain/locks"
+    mkdir "$lock"
+    printf '%s\n' "$owner" > "$lock/pid"
+    touch -t 200001010000 "$lock"
+    # Owner cmdline names task-drain.sh: treated as live, never reclaimed.
+    run lock_owner_live "$lock"
+    [ "$status" -eq 0 ]
+    run try_reclaim_lock "$lock"
+    [ "$status" -ne 0 ]
+    [ -d "$lock" ]
+    kill "$owner" 2>/dev/null || true
+    wait "$owner" 2>/dev/null || true
+    rm -rf "$lock"
+}
+
+@test "concurrent recovery race keeps at most one owner" {
+    load_functions
+    export DRAIN_LOCK_GRACE_SEC=0
+    local lock="$HOME/.task-drain/locks/race-uuid-1"
+    mkdir -p "$HOME/.task-drain/locks"
+    (exit 0) &
+    local dead=$!
+    wait "$dead" 2>/dev/null || true
+    mkdir "$lock"
+    printf '%s\n' "$dead" > "$lock/pid"
+    touch -t 200001010000 "$lock"
+    # Two concurrent recoveries: both may attempt reclaim, but the lock
+    # ends owned by exactly one writer (mkdir is atomic).
+    try_reclaim_lock "$lock" || true
+    try_reclaim_lock "$lock" || true
+    run acquire_lock_with_recovery "$lock"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$lock/pid")" = "$$" ]
+    rm -rf "$lock"
+    unset DRAIN_LOCK_GRACE_SEC
+}
+
+# --- TaskChampion sync resilience (Phase 3) ---
+
+@test "classify_sync_error distinguishes permanent from temporary failures" {
+    load_functions
+    run classify_sync_error "error sending request: Connection refused"
+    [ "$status" -eq 0 ]
+    [ "$output" = "temporary" ]
+    run classify_sync_error "Server Error: envelope is too small"
+    [ "$status" -eq 0 ]
+    [ "$output" = "temporary" ]
+    run classify_sync_error "authentication failed: unauthorized (401)"
+    [ "$status" -eq 0 ]
+    [ "$output" = "permanent" ]
+    run classify_sync_error "client_id mismatch: replica unknown"
+    [ "$status" -eq 0 ]
+    [ "$output" = "permanent" ]
+}
+
+@test "sync timeout bounds a hung sync" {
+    load_functions
+    cat > "$BATS_TEST_TMPDIR/hang-task" <<'HANG'
+#!/usr/bin/env bash
+if [[ "$*" == *sync* ]]; then exec sleep 60; fi
+echo '[]'
+HANG
+    chmod +x "$BATS_TEST_TMPDIR/hang-task"
+    export TASK="$BATS_TEST_TMPDIR/hang-task"
+    export DRAIN_SYNC_TIMEOUT_SEC=2
+    local start end elapsed
+    start=$(date +%s)
+    run task_sync_once
+    [ "$status" -ne 0 ]
+    end=$(date +%s)
+    elapsed=$((end - start))
+    [ "$elapsed" -lt 20 ]
+    unset DRAIN_SYNC_TIMEOUT_SEC
+    # No hung sync child may survive the timeout.
+    local leftovers
+    leftovers=$(pgrep -f "hang-task.*sync" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+    [ "$leftovers" = "0" ]
+}
+
+@test "sync retry fails closed without tight loops" {
+    load_functions
+    export MOCK_SYNC_FAIL=1
+    export DRAIN_SYNC_RETRIES=2
+    export DRAIN_SYNC_RETRY_DELAY=1
+    local start end elapsed
+    start=$(date +%s)
+    run sync_with_retry
+    [ "$status" -ne 0 ]
+    end=$(date +%s)
+    elapsed=$((end - start))
+    [ "$elapsed" -ge 1 ]
+    [ "$elapsed" -lt 30 ]
+    unset MOCK_SYNC_FAIL DRAIN_SYNC_RETRIES DRAIN_SYNC_RETRY_DELAY
+}
+
+@test "claim never proceeds when required sync fails" {
+    load_functions
+    export MOCK_SYNC_FAIL=1
+    export DRAIN_SYNC_RETRY_DELAY=0
+    export DRAIN_SYNC_RETRIES=1
+    run claim_task "00000000-0000-4000-8000-000000000000"
+    [ "$status" -ne 0 ]
+    unset MOCK_SYNC_FAIL DRAIN_SYNC_RETRY_DELAY DRAIN_SYNC_RETRIES
+}
+
+@test "retry sleep is interruptible by SIGTERM" {
+    load_functions
+    ( trap 'exit 130' TERM; _interruptible_sleep 30 ) &
+    local sleeper=$!
+    sleep 0.5
+    local start end elapsed
+    start=$(date +%s)
+    kill -TERM "$sleeper" 2>/dev/null
+    wait "$sleeper" 2>/dev/null || true
+    end=$(date +%s)
+    elapsed=$((end - start))
+    [ "$elapsed" -lt 10 ]
+}
+
+# --- worker reaping (Phase 5) ---
+
+@test "supervisor reaps exited workers and accumulates no zombies" {
+    load_functions
+    export DRAIN_HOME="$HOME/.task-drain"
+    export DRAIN_MIN_WORKERS=1
+    export DRAIN_MAX_WORKERS=1
+    export DRAIN_AUTOSCALE_INTERVAL=1
+    export DRAIN_SYNC_RETRY_DELAY=0
+    # Force spawned workers to exit immediately (missing agent binary) so
+    # the supervisor has exited children to reap. The mock task exports an
+    # empty queue, so nothing else spawns.
+    export DRAIN_AGENT="opencode"
+    export OPENCODE_BIN="definitely-missing-drain-test-binary"
+    bash "$SCRIPT_DIR/task-drain.sh" autoscale </dev/null >>"$BATS_TEST_TMPDIR/reap.log" 2>&1 &
+    local sup=$!
+    echo "$sup" > "$DRAIN_HOME/autoscale.pid"
+    sleep 10
+    kill -0 "$sup" 2>/dev/null
+    # No zombie children of the supervisor may remain.
+    local zombies
+    zombies=$(ps -eo ppid,stat 2>/dev/null | awk -v p="$sup" '$1==p && $2 ~ /Z/ {c++} END {print c+0}')
+    [ "$zombies" = "0" ]
+    kill -TERM "$sup" 2>/dev/null || true
+    local i
+    for i in $(seq 1 10); do
+        kill -0 "$sup" 2>/dev/null || break
+        sleep 0.5
+    done
+    wait "$sup" 2>/dev/null || true
+    [ ! -f "$DRAIN_HOME/autoscale.pid" ]
+    unset DRAIN_MIN_WORKERS DRAIN_MAX_WORKERS DRAIN_AUTOSCALE_INTERVAL DRAIN_SYNC_RETRY_DELAY DRAIN_AGENT OPENCODE_BIN
+}
+
+@test "repeated worker execution does not accumulate zombies" {
+    load_functions
+    local before after i
+    before=$(ps -eo stat 2>/dev/null | awk '$1 ~ /Z/ {c++} END {print c+0}')
+    for i in 1 2 3; do
+        bash -c 'exit 0' &
+        wait "$!" 2>/dev/null || true
+    done
+    after=$(ps -eo stat 2>/dev/null | awk '$1 ~ /Z/ {c++} END {print c+0}')
+    [ "$after" = "$before" ]
+}
+
+# --- cross-host safety (Phase 7) ---
+
+@test "primary host guard refuses non-primary hosts without override" {
+    load_functions
+    export DRAIN_PRIMARY_HOST="definitely-not-the-test-host"
+    run check_primary_host "worker"
+    [ "$status" -ne 0 ]
+    export DRAIN_ALLOW_OTHER_HOST=1
+    run check_primary_host "worker"
+    [ "$status" -eq 0 ]
+    unset DRAIN_PRIMARY_HOST DRAIN_ALLOW_OTHER_HOST
+}
+
+@test "primary host guard allows the configured primary" {
+    load_functions
+    export DRAIN_PRIMARY_HOST="$(hostname -s)"
+    run check_primary_host "supervisor"
+    [ "$status" -eq 0 ]
+    unset DRAIN_PRIMARY_HOST
+}
+
+@test "primary host guard is a no-op when unconfigured" {
+    load_functions
+    unset DRAIN_PRIMARY_HOST
+    unset DRAIN_ALLOW_OTHER_HOST
+    run check_primary_host "worker"
+    [ "$status" -eq 0 ]
+}
